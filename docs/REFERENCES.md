@@ -101,6 +101,21 @@ it gave us. Empty notes are useless — say *why* this is here.
   are usually released; we'll need them for visualization.
 - AprilTag 36h11 family — FRC's tag dialect. <https://april.eecs.umich.edu/software/apriltag>
 
+## JSON
+
+- nlohmann/json — <https://github.com/nlohmann/json>
+  Header-only C++ JSON library. Used by the robot description loader.
+  v3.12.0 pinned via FetchContent.
+- RFC 8259 (The JavaScript Object Notation Data Interchange Format) —
+  <https://www.rfc-editor.org/rfc/rfc8259>
+  Used by the loader for type-strictness rules: integer-vs-float
+  literal asymmetry pinned per
+  `.claude/skills/robot-description-loader.md` decisions #5 and #6.
+- RFC 6901 (JavaScript Object Notation (JSON) Pointer) —
+  <https://www.rfc-editor.org/rfc/rfc6901>
+  Used by `load_error.json_pointer` to locate the offending field in
+  the input file.
+
 ---
 
 When you add something, prefer linking the canonical source (vendor docs,

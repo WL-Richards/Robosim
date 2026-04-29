@@ -36,13 +36,17 @@ enough."
   determinism, tiers, protocol, language, physics, robot description)
 - `docs/OPEN_QUESTIONS.md` — open and decided design questions
 - `docs/REFERENCES.md` — external sources, datasheets, prior art
-- `.claude/skills/` — per-feature actionable knowledge
+- `.claude/skills/` — per-feature actionable knowledge:
+  - `code-style.md`, `tdd-workflow.md`, `adding-a-feature.md` — process
+  - `layer-1-robot-code.md` … `layer-5-world-physics.md` — per-layer
+  - `robot-description-loader.md` — `descriptions/<robot>.json` loader
 - `.claude/agents/test-reviewer.md` — TDD test-design gatekeeper
 
 ## Status
 
-Foundational design complete; all v0-gating questions decided. No
-code yet. Start at `docs/V0_PLAN.md`.
+Phase A scaffold landed. Phase B (the robot description loader) is
+implemented and 83-test green; see `tests/description/TEST_PLAN.md`
+for the approved plan and `.claude/skills/robot-description-loader.md`
+for the working knowledge. Layer 2/3/4/5 work has not started.
 
-Repo: `git@github.com:WL-Richards/Robosim.git` (not yet initialized
-locally; first task in V0_PLAN).
+Repo: `git@github.com:WL-Richards/Robosim.git`.

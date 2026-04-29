@@ -206,6 +206,18 @@ nlohmann/json as the parser. v0 file:
 `descriptions/v0-arm.json`. Authoring GUI / CAD-import tool
 deferred (see OQ-11).
 
+**Loader status (2026-04-29):** the description loader is implemented
+and 83-test green; see `.claude/skills/robot-description-loader.md`
+for the working knowledge. Layer 5's MJCF generator consumes the
+`robot_description` struct (POD types in `src/description/schema.h`)
+— *not* the raw JSON. The contract from the loader's side: every
+geometry/joint/inertia/actuator field that v0 cares about is
+present, type-checked, range-checked, and reference-resolved before
+the struct is handed off. Layer 5 can rely on the struct being
+internally consistent (no dangling references, no inverted joint
+limits, no negative masses). The MJCF transpiler is a Layer 5
+feature with its own skill and test plan when it lands.
+
 ## Cross-references
 
 - `layer-4-physical-models.md` — torques in, sensor state out.
