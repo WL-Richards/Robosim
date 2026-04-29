@@ -1,0 +1,5 @@
+{
+  "_comment": "Phase A placeholder. Replaced with the real v0 single-DOF arm description in Phase B (see docs/V0_PLAN.md), keyed against the loader's happy-path test. Schema is versioned; v0 covers links, joints, motors, sensors. See docs/ARCHITECTURE.md 'Robot description format'.",
+  "schema_version": 0,
+  "name": "v0-arm-placeholder"
+}
