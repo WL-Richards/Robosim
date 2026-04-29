@@ -1,0 +1,69 @@
+# Build artifacts
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+compile_commands.json
+
+# Compiled outputs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Profiling / sanitizer outputs
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
+core
+core.*
+vgcore.*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+.ccls-cache/
+.clangd/
+
+# Python (build/dev scripts)
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+
+# Java / Gradle (tools/rio-bench/)
+.gradle/
+*.class
+bin/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Logs / runtime outputs
+*.log
+*.wpilog
