@@ -85,7 +85,10 @@ jobs:
           ASAN_OPTIONS:  "detect_leaks=0:abort_on_error=1:halt_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
           TSAN_OPTIONS:  "halt_on_error=1"
-        run: ctest --output-on-failure --parallel
+        # --no-tests=ignore: empty test suite is expected during the
+        # scaffold phase before the first test lands. Drop the flag once
+        # any test exists.
+        run: ctest --output-on-failure --parallel --no-tests=ignore
 
   # -------------------------------------------------------------------
   # Style + tidy gate.
