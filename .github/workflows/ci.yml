@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned versions so CI matches local dev.
+  CLANG_VERSION: "18"
+  GCC_VERSION:   "13"
+  CMAKE_VERSION: "3.28.3"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Build + test matrix.
+  #
+  # Sanitizers TSAN and ASAN/UBSAN are mutually exclusive (TSAN doesn't
+  # play with ASAN). Each sanitizer combo is a separate build to keep
+  # failures attributable.
+  # -------------------------------------------------------------------
+  build-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang, gcc]
+        sanitizer: [none, asan-ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y --no-install-recommends \
+              clang-${CLANG_VERSION} \
+              libc++-${CLANG_VERSION}-dev \
+              libc++abi-${CLANG_VERSION}-dev
+            echo "CC=clang-${CLANG_VERSION}"   >> "$GITHUB_ENV"
+            echo "CXX=clang++-${CLANG_VERSION}" >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y --no-install-recommends \
+              gcc-${GCC_VERSION} g++-${GCC_VERSION}
+            echo "CC=gcc-${GCC_VERSION}"   >> "$GITHUB_ENV"
+            echo "CXX=g++-${GCC_VERSION}"  >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ matrix.compiler }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: |
+          SAN_FLAGS=""
+          case "${{ matrix.sanitizer }}" in
+            none)        ;;
+            asan-ubsan)  SAN_FLAGS="-DROBOSIM_ENABLE_ASAN=ON -DROBOSIM_ENABLE_UBSAN=ON" ;;
+            tsan)        SAN_FLAGS="-DROBOSIM_ENABLE_TSAN=ON" ;;
+          esac
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            $SAN_FLAGS
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        env:
+          # ASan + LSan have spurious leak reports in dynamic-linker
+          # paths under some glibc versions; suppress until we have a
+          # real leak suppression file.
+          ASAN_OPTIONS:  "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS:  "halt_on_error=1"
+        run: ctest --output-on-failure --parallel
+
+  # -------------------------------------------------------------------
+  # Style + tidy gate.
+  # -------------------------------------------------------------------
+  lint:
+    name: clang-format + clang-tidy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need history so scripts/lint.sh can diff against origin/main.
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-${CLANG_VERSION} clang-format-${CLANG_VERSION} \
+            clang-tidy-${CLANG_VERSION} \
+            cmake ninja-build
+          sudo update-alternatives --install /usr/bin/clang-format clang-format \
+            /usr/bin/clang-format-${CLANG_VERSION} 100
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy \
+            /usr/bin/clang-tidy-${CLANG_VERSION} 100
+
+      - name: Configure (for compile_commands.json)
+        run: |
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++-${CLANG_VERSION} \
+            -DCMAKE_C_COMPILER=clang-${CLANG_VERSION}
+
+      - name: Run lint
+        env:
+          ROBOSIM_LINT_BASE: origin/main
+        run: scripts/lint.sh --all
+
+  # -------------------------------------------------------------------
+  # ARM cross-compile build (no test execution; just verify it builds).
+  # Full tier-2 testing requires qemu-user, added in a later session.
+  # -------------------------------------------------------------------
+  arm-cross:
+    name: arm cross-compile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+      - name: Configure (ARM)
+        run: |
+          cmake -B build-arm -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/arm-rio.cmake
+
+      - name: Build (ARM)
+        run: cmake --build build-arm --parallel
