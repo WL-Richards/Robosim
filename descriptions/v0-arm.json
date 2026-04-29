@@ -1,5 +1,44 @@
 {
-  "_comment": "Phase A placeholder. Replaced with the real v0 single-DOF arm description in Phase B (see docs/V0_PLAN.md), keyed against the loader's happy-path test. Schema is versioned; v0 covers links, joints, motors, sensors. See docs/ARCHITECTURE.md 'Robot description format'.",
-  "schema_version": 0,
-  "name": "v0-arm-placeholder"
+  "schema_version": 1,
+  "name": "v0-arm",
+  "links": [
+    {
+      "name": "arm",
+      "mass_kg": 2.0,
+      "length_m": 0.5,
+      "inertia_kgm2": 0.166
+    }
+  ],
+  "joints": [
+    {
+      "name": "shoulder",
+      "type": "revolute",
+      "parent": "world",
+      "child": "arm",
+      "axis": [0.0, 1.0, 0.0],
+      "limit_lower_rad": -1.5708,
+      "limit_upper_rad": 1.5708,
+      "viscous_friction_nm_per_rad_per_s": 0.1
+    }
+  ],
+  "motors": [
+    {
+      "name": "shoulder_motor",
+      "motor_model": "kraken_x60",
+      "controller": "talon_fx",
+      "controller_can_id": 1,
+      "controller_firmware_version": "TBD-pinned-at-v0-ship",
+      "joint": "shoulder",
+      "gear_ratio": 100.0
+    }
+  ],
+  "sensors": [
+    {
+      "name": "shoulder_encoder",
+      "sensor_model": "cancoder",
+      "controller_can_id": 2,
+      "controller_firmware_version": "TBD-pinned-at-v0-ship",
+      "joint": "shoulder"
+    }
+  ]
 }

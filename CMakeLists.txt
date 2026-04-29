@@ -10,9 +10,11 @@ project(robosim
 # Language standard
 # ---------------------------------------------------------------------------
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# C++23 chosen over the C++20 floor because the loader's public API uses
+# std::expected (C++23). Clang 18 and GCC 13 both ship it in libstdc++.
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE)
 
@@ -62,6 +64,18 @@ target_compile_options(robosim_warnings INTERFACE
   -Wconversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast
   -Wcast-align -Wunused -Woverloaded-virtual -Wdouble-promotion
   -Wformat=2 -Wimplicit-fallthrough)
+
+# Clang 18 + libstdc++ 13 mismatch: libstdc++'s <expected> is gated on
+# __cpp_concepts >= 202002L, but Clang 18 reports __cpp_concepts ==
+# 201907L (the C++20 baseline) even though its concept implementation is
+# enough to satisfy libstdc++'s requirements. Without this nudge,
+# `std::expected` is invisible under Clang. The redefine warning is
+# suppressed; harmless on Clang 19+ that already reports 202002L.
+if(ROBOSIM_COMPILER_CLANG)
+  target_compile_options(robosim_warnings INTERFACE
+    -D__cpp_concepts=202002L
+    -Wno-builtin-macro-redefined)
+endif()
 
 add_library(robosim_sanitizers INTERFACE)
 if(ROBOSIM_ENABLE_ASAN)
