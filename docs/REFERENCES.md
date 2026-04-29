@@ -101,6 +101,22 @@ it gave us. Empty notes are useless — say *why* this is here.
   are usually released; we'll need them for visualization.
 - AprilTag 36h11 family — FRC's tag dialect. <https://april.eecs.umich.edu/software/apriltag>
 
+## WPILib HAL byte-parity baseline
+
+The HAL ↔ Sim Core protocol schema mirrors a handful of WPILib HAL
+struct layouts byte-for-byte so the future shim's "memcpy through"
+contract holds (see `.claude/skills/protocol-schema.md` decisions
+#8, #9, #11, #21). The baseline is recorded as `kWpilibParitySha`
+in `tests/backend/common/wpilib_mirror.h`:
+
+- WPILib v2026.2.2 (`1fd159938f65ee9d0b22c8a369030b68e0efa82c`).
+  Verified parity for: `HAL_JoystickAxes`, `HAL_JoystickButtons`,
+  `HAL_JoystickPOVs`, `HAL_JoystickDescriptor`, `HAL_ControlWord`
+  (LSB-first GCC/Clang ABI), `HAL_AllianceStationID`, `HAL_MatchType`
+  (int32 backing), `HAL_MatchInfo`, `HAL_CANStreamMessage`. If WPILib
+  bumps and changes a layout, the parity tests fail and the developer
+  re-transcribes + bumps `kProtocolVersion`, or pins the older SHA.
+
 ## JSON
 
 - nlohmann/json — <https://github.com/nlohmann/json>

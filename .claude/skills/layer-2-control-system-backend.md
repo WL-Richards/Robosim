@@ -205,12 +205,46 @@ Native tier loads it at startup for loop-overrun fidelity. Estimated
 values until real-RIO access is available; user has stated access
 will be available later.
 
+## Implementation status
+
+The **protocol schema** — the foundation this layer's shim, sync
+layer, and transport will all consume — is implemented and 106-test
+green. See `.claude/skills/protocol-schema.md` for the working
+knowledge: 32-byte sync envelope, 9 closed payload schemas (clock,
+power, ds_state, can_frame_batch, can_status, notifier_state,
+notifier_alarm_batch, error_message_batch, boot_descriptor), pure
+stateless validator with closed-enum gates and kind ↔ schema
+mapping, pure truncation helpers, WPILib byte-parity baselined at
+v2026.2.2 (`kWpilibParitySha`).
+
+The **protocol session** — the stateful wrapper around the schema
+validator — is implemented and 16-test green. See
+`.claude/skills/protocol-session.md` for the working knowledge:
+per-direction send/receive sequence counters, validator-first
+mutation discipline, direction-specific `boot` / `boot_ack` ordering,
+single-flight on-demand request/reply pairing, and shutdown terminal
+receive state.
+
+Still ahead, each its own TDD cycle:
+- HAL shim (the in-process `libhal.so` replacement that produces /
+  consumes the schema).
+- Transport: T1 shared-memory + atomic sync; T2 socket framing +
+  reconnect.
+- LD_PRELOAD libc shim for `clock_gettime` / `nanosleep` / etc.
+- `tools/rio-bench/` HAL-cost fixture.
+
 ## Cross-references
 
 - `layer-1-robot-code.md` — what loads on top of us.
 - `layer-3-device-bus-vendor-firmware.md` — what we route to.
 - `layer-4-physical-models.md` — where battery / brownout state
   comes from.
+- `protocol-schema.md` — wire-format POD structs + validator +
+  truncation helpers; the foundation this layer extends.
+- `protocol-session.md` — stateful validator wrapper for handshake,
+  counters, request/reply pairing, and shutdown receive state.
+- `robot-description-loader.md` — what we read to enumerate CAN IDs
+  and pin firmware versions.
 - `docs/ARCHITECTURE.md` — process model, HAL boundary protocol,
   time discipline, v0 scope.
 - `docs/REFERENCES.md` — frcture FPGA register reference, DS
