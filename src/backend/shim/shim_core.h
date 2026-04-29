@@ -1,7 +1,11 @@
 #pragma once
 
 #include "boot_descriptor.h"
+#include "can_frame.h"
+#include "can_status.h"
 #include "clock_state.h"
+#include "ds_state.h"
+#include "power_state.h"
 #include "protocol_session.h"
 #include "shared_memory_transport.h"
 
@@ -49,6 +53,10 @@ class shim_core {
   [[nodiscard]] bool is_connected() const;
   [[nodiscard]] bool is_shutting_down() const;
   [[nodiscard]] const std::optional<clock_state>& latest_clock_state() const;
+  [[nodiscard]] const std::optional<power_state>& latest_power_state() const;
+  [[nodiscard]] const std::optional<ds_state>& latest_ds_state() const;
+  [[nodiscard]] const std::optional<can_frame_batch>& latest_can_frame_batch() const;
+  [[nodiscard]] const std::optional<can_status>& latest_can_status() const;
 
   shim_core(const shim_core&) = delete;
   shim_core& operator=(const shim_core&) = delete;
@@ -62,6 +70,10 @@ class shim_core {
   bool connected_ = false;
   bool shutdown_observed_ = false;
   std::optional<clock_state> latest_clock_state_;
+  std::optional<power_state> latest_power_state_;
+  std::optional<ds_state> latest_ds_state_;
+  std::optional<can_frame_batch> latest_can_frame_batch_;
+  std::optional<can_status> latest_can_status_;
 };
 
 }  // namespace robosim::backend::shim

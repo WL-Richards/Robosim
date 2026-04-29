@@ -50,7 +50,7 @@ enough."
   - `tier1-shared-memory-transport.md` — native shared-memory transport:
     fixed region, endpoint wrapper, memfd/mmap lifecycle
   - `hal-shim.md` — in-process HAL shim core: boot handshake,
-    inbound state cache, dispatch by `(envelope_kind, schema_id)`
+    inbound state caches, dispatch by `(envelope_kind, schema_id)`
   - `visualizer.md` — `src/viz/` 3D viewer (Edit / Live / Replay)
 - `.claude/agents/test-reviewer.md` — TDD test-design gatekeeper
 
@@ -71,30 +71,52 @@ transport (fixed two-lane region, nonblocking endpoint,
 protocol-session integration, Linux memfd/mmap lifecycle) is
 implemented and adds 24 targeted tests; see
 `.claude/skills/tier1-shared-memory-transport.md`. The HAL shim core
-cycle 1 (boot handshake, inbound `clock_state` cache slot, shutdown
-terminal receive path; single-threaded `poll()`-driven; cycle-1
-explicit reject for the eight schemas not yet wired) is implemented
-and adds 14 targeted tests; see `.claude/skills/hal-shim.md` and
-`tests/backend/shim/TEST_PLAN.md`. Total suite is now 243 tests green
-under both clang Debug and GCC Debug + ASan + UBSan. The remaining
-HAL shim cycles (additional inbound schemas, outbound traffic past
-boot, exported C HAL ABI surfaces, threading), T1
-wait/reset/named-discovery work, T2 socket transport, and LD_PRELOAD
-libc shim each remain as future TDD cycles. Layer 3/4/5 work has not
-started.
+through cycle 5 (boot handshake; inbound `clock_state`, `power_state`,
+`ds_state`, `can_frame_batch`, and `can_status` cache slots, each
+independently maintained with latest-wins replacement;
+`can_frame_batch` uses variable-size active-prefix memcpy with
+zero-init-before-write so a shrinking batch leaves unused frame
+slots byte-zero; shutdown terminal receive path; single-threaded
+`poll()`-driven; loud reject for the three schemas not yet wired
+with session-counter advance through dispatch; padding-byte
+determinism for both `ds_state` and `can_frame_batch` pinned by
+direct `std::memcmp`) is implemented and the suite covers 50 shim
+tests; see `.claude/skills/hal-shim.md`,
+`tests/backend/shim/TEST_PLAN.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE2.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE3.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE4.md`, and
+`tests/backend/shim/TEST_PLAN_CYCLE5.md`. Cycle-6 (inbound
+`notifier_state` — variable-size with `offsetof(notifier_state,
+slots) == 8`) is the next TDD cycle. CAN RX queueing semantics are
+deferred per D-C4-LATEST-WINS until the cycle that wires
+`HAL_CAN_ReadStreamSession`. The remaining HAL shim work (additional
+inbound schemas, outbound traffic past boot, exported C HAL ABI
+surfaces, threading), T1 wait/reset/named-discovery work, T2 socket
+transport, and LD_PRELOAD libc shim each remain as future TDD
+cycles. Layer 3/4/5 work has not started.
 
 In parallel, the visualizer subsystem (`src/viz/`,
 `ROBOSIM_BUILD_VIZ=ON` opt-in) has Phase VA scaffold + Phase VB
-read-side landed: scene-snapshot seam, edit-mode builder, orbit
-camera, ray-vs-primitive picking, OpenGL primitive renderer, ImGui
-panels, and a working `robosim-viz` CLI. Cylinder/arrow primitives
-anchor at the proximal cap (TEST_PLAN rev 4) so a link's local
-origin lands at its parent-joint attachment. ImGuizmo manipulation
-of `world_from_local` is wired through main but writes only to the
-in-memory snapshot — Phase VC (schema v1→v2 with `link.visual_origin`
-/ `joint.origin` fields, plus `description::save_to_file`) has not
-landed and is the next gating step before save round-trips. 49
-viz-side tests green; see `.claude/skills/visualizer.md` and
-`tests/viz/TEST_PLAN.md`.
+read-side + Phase VC schema-v2/serializer + Phase VD gizmo persistence
+all landed: scene-snapshot seam, edit-mode builder honoring v2
+origins via the kinematic-vs-visual frame distinction (descendants
+compose against parent kinematic, never parent visual), orbit camera,
+ray-vs-primitive picking, OpenGL primitive renderer, ImGui panels,
+ImGuizmo translate/rotate routed through `viz::apply_gizmo_target`
+(pure logic) into the description's `joint.origin` /
+`link.visual_origin`, `viz::edit_session` driving load/save/reload
+with a dirty bit, File menu (Save / Save As / Reload-from-disk with
+Discard-changes confirmation; Ctrl+S hotkey), and a working
+`robosim-viz` CLI. Cylinder/arrow primitives anchor at the proximal
+cap (TEST_PLAN rev 4) so a link's local origin lands at its
+parent-joint attachment. `description::decompose_origin` provides the
+algebraic inverse of `compose_origin` (URDF intrinsic-Z-Y′-X″, with
+a gimbal-pole branch that pins yaw=0 and absorbs the residual into
+roll while preserving the composed transform). 457/457 viz +
+description tests green across the build matrix. v0 visualizer Edit
+mode is functionally complete. See `.claude/skills/visualizer.md`,
+`.claude/skills/robot-description-loader.md`, `tests/viz/TEST_PLAN.md`,
+`tests/description/TEST_PLAN_VC.md`, and `tests/viz/TEST_PLAN_VD.md`.
 
 Repo: `git@github.com:WL-Richards/Robosim.git`.

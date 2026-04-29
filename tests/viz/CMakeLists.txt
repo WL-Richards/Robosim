@@ -11,21 +11,28 @@ endif()
 
 add_executable(robosim_viz_test
   camera_test.cpp
+  edit_mode_apply_test.cpp
   edit_mode_builder_test.cpp
+  edit_mode_builder_v2_test.cpp
+  edit_session_test.cpp
   fixtures.cpp
   picking_test.cpp
   scene_snapshot_test.cpp
+  vd_e2e_test.cpp
 )
 
 target_link_libraries(robosim_viz_test
   PRIVATE
     robosim_viz_core
+    robosim_viz_edit_apply
     robosim_viz_edit_builder
+    robosim_viz_edit_session
     robosim_description
     robosim_baseline
     GTest::gtest
     GTest::gmock
     GTest::gtest_main
+    nlohmann_json::nlohmann_json
 )
 
 target_compile_definitions(robosim_viz_test PRIVATE

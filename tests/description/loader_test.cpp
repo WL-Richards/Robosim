@@ -160,7 +160,7 @@ TEST(RobotDescriptionLoader, A1_loads_minimal_valid_v0_arm) {
   ASSERT_TRUE(result.has_value()) << "load failed: " << (result ? "" : result.error().message);
 
   const auto& d = *result;
-  EXPECT_EQ(d.schema_version, 1);
+  EXPECT_EQ(d.schema_version, 2);  // production fixture bumped to v2 (Phase VC)
   EXPECT_EQ(d.name, "v0-arm");
 
   ASSERT_EQ(d.links.size(), 1U);

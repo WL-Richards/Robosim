@@ -24,8 +24,12 @@
 function(robosim_viz_check_renderer_isolation)
   set(_viz_dir "${CMAKE_SOURCE_DIR}/src/viz")
   set(_allow_list
+    "${_viz_dir}/edit_mode_apply.cpp"
+    "${_viz_dir}/edit_mode_apply.h"
     "${_viz_dir}/edit_mode_builder.cpp"
     "${_viz_dir}/edit_mode_builder.h"
+    "${_viz_dir}/edit_session.cpp"
+    "${_viz_dir}/edit_session.h"
     "${_viz_dir}/panels.cpp"
     "${_viz_dir}/panels.h"
     "${_viz_dir}/main.cpp"

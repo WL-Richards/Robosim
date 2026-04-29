@@ -1,9 +1,15 @@
 #include "fixtures.h"
 
+#include "viz/scene_snapshot.h"
+
 #include "description/schema.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
+#include <string_view>
+
+#include <gtest/gtest.h>
 
 namespace robosim::viz::testing {
 
@@ -11,7 +17,7 @@ namespace desc = robosim::description;
 
 desc::robot_description make_v0_arm_description() {
   desc::robot_description d;
-  d.schema_version = 1;
+  d.schema_version = 2;
   d.name = "v0-arm";
   d.links = {
       desc::link{"arm", 2.0, 0.5, 0.166},
@@ -56,7 +62,7 @@ desc::robot_description make_two_joint_chain_description(
 
 desc::robot_description make_long_named_description() {
   desc::robot_description d;
-  d.schema_version = 1;
+  d.schema_version = 2;
   d.name = "v0-arm-with-thirty-two-character-name";  // 36 chars
   const std::string long_link_name =
       "arm_link_with_thirty_two_character_name";  // 39
@@ -88,6 +94,53 @@ desc::robot_description make_long_named_description() {
       },
   };
   return d;
+}
+
+desc::robot_description make_v0_arm_with_joint_origin(
+    const desc::origin_pose& joint_origin) {
+  desc::robot_description d = make_v0_arm_description();
+  d.joints[0].origin = joint_origin;
+  return d;
+}
+
+desc::robot_description make_two_joint_chain_with_origins(
+    const desc::origin_pose& shoulder_origin,
+    const desc::origin_pose& elbow_origin,
+    const desc::origin_pose& arm_visual,
+    const desc::origin_pose& forearm_visual) {
+  desc::robot_description d = make_two_joint_chain_description();
+  // make_two_joint_chain_description appends elbow at the end, so
+  // joints[0] = shoulder, joints[1] = elbow; links[0] = arm,
+  // links[1] = forearm.
+  d.joints[0].origin = shoulder_origin;
+  d.joints[1].origin = elbow_origin;
+  d.links[0].visual_origin = arm_visual;
+  d.links[1].visual_origin = forearm_visual;
+  return d;
+}
+
+const scene_node& find_node(
+    const scene_snapshot& s, node_kind kind, std::string_view name) {
+  for (const auto& node : s.nodes) {
+    if (node.kind == kind && node.entity_name == name) {
+      return node;
+    }
+  }
+  ADD_FAILURE() << "find_node: no matching node (kind="
+                << static_cast<int>(kind) << ", name=" << name << ")";
+  return s.nodes.front();
+}
+
+std::size_t find_node_index(
+    const scene_snapshot& s, node_kind kind, std::string_view name) {
+  for (std::size_t i = 0; i < s.nodes.size(); ++i) {
+    if (s.nodes[i].kind == kind && s.nodes[i].entity_name == name) {
+      return i;
+    }
+  }
+  ADD_FAILURE() << "find_node_index: no matching node (kind="
+                << static_cast<int>(kind) << ", name=" << name << ")";
+  return 0;
 }
 
 }  // namespace robosim::viz::testing

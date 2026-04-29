@@ -113,6 +113,40 @@ target_link_libraries(robosim_viz_edit_builder
 )
 
 # ---------------------------------------------------------------------------
+# robosim_viz_edit_apply — apply_gizmo_target. Pure logic for writing a
+# gizmo target back to the description's origin fields. Depends on the
+# loader (uses compose_origin / decompose_origin) and on scene_snapshot
+# (uses node_kind / entity_name lookup).
+# ---------------------------------------------------------------------------
+
+add_library(robosim_viz_edit_apply STATIC
+  edit_mode_apply.cpp
+)
+
+target_link_libraries(robosim_viz_edit_apply
+  PUBLIC robosim_viz_core robosim_description
+  PRIVATE robosim_baseline
+)
+
+# ---------------------------------------------------------------------------
+# robosim_viz_edit_session — load/save/reload wrapper around
+# robot_description with a dirty bit.
+# ---------------------------------------------------------------------------
+
+add_library(robosim_viz_edit_session STATIC
+  edit_session.cpp
+)
+
+target_include_directories(robosim_viz_edit_session PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
+target_link_libraries(robosim_viz_edit_session
+  PUBLIC robosim_description
+  PRIVATE robosim_baseline
+)
+
+# ---------------------------------------------------------------------------
 # robosim_viz_renderer — OpenGL primitive renderer. Reads scene_snapshot
 # only. The T1 isolation check asserts it does not transitively link
 # robosim_description.
@@ -168,6 +202,8 @@ target_link_libraries(robosim-viz
   PRIVATE
     robosim_viz_core
     robosim_viz_edit_builder
+    robosim_viz_edit_apply
+    robosim_viz_edit_session
     robosim_viz_renderer
     robosim_viz_panels
     robosim_viz_imgui

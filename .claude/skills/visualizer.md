@@ -25,18 +25,25 @@ knowledge for implementers; the architecture doc is the contract.
 ## Scope
 
 **In (v0 — Edit mode):**
-- Load via `description::load_from_file`.
+- Load via `description::load_from_file` wrapped in `viz::edit_session`
+  (carries the loaded description, source path, and a dirty bit).
 - Render the kinematic tree using primitive shapes (link = cylinder
-  along its `length_m`, joint axis drawn as an arrow).
+  along its `length_m`, joint axis drawn as an arrow). Schema-v2
+  origins (`joint.origin`, `link.visual_origin`) are composed by the
+  builder per the kinematic-vs-visual frame rule below.
 - Orbit camera (rotate / pan / zoom around a pivot, frame-fit hotkey).
 - Inspect every entity from the scene tree (left panel) and an
   inspector panel (right) showing schema fields read-only.
 - Pick entities by clicking in the 3D viewport.
 - Manipulate the selected link's visual origin and the selected
   joint's origin with Unreal-style ImGuizmo handles (translate /
-  rotate, world / local toggle, W / E hotkeys).
-- Save back to JSON via the `description::save_to_file` serializer
-  (Phase VC4).
+  rotate, world / local toggle, W / E hotkeys). The gizmo target
+  flows through `viz::apply_gizmo_target` (pure logic) into the
+  description's `joint.origin` / `link.visual_origin`; the snapshot
+  rebuilds on each apply.
+- Save / Save As / Reload via the File menu, backed by
+  `viz::save_session` and `viz::reload_session`. The serializer is
+  `description::save_to_file` (Phase VC4).
 
 **Out of v0 (deferred, tracked but not blocking):**
 - **Live and Replay modes.** The architectural seam (the renderer reads
@@ -62,12 +69,13 @@ knowledge for implementers; the architecture doc is the contract.
 | Mode argument                   | `--mode=edit` (default in v0). `--mode=live` / `replay` reserved. |
 | Window title                    | `robosim-viz — <robot.name> [<mode>]`                         |
 | Panels                          | left: scene tree; right: inspector; bottom: status bar (loader errors). |
-| Viewport hotkeys                | `F` frame-fit selection (or whole scene if no selection); `W` translate gizmo; `E` rotate gizmo; `X` toggle world / local space; `Esc` clear selection. |
+| Viewport hotkeys                | `F` frame-fit selection (or whole scene if no selection); `W` translate gizmo; `E` rotate gizmo; `X` toggle world / local space; `S` toggle snap (without Ctrl); `Ctrl+S` save; `Esc` clear selection. |
 | Mouse — orbit camera            | MMB-drag rotates around pivot.                                |
 | Mouse — pan camera              | RMB-drag pans.                                                |
 | Mouse — zoom camera             | Wheel zooms.                                                  |
 | Mouse — pick                    | LMB-click on a primitive selects the corresponding entity.    |
-| File menu (Phase VD)            | Save (writes back to loaded path); Save As; Reload from disk (with confirmation if there are unsaved edits). |
+| File menu                       | Save (writes back to `session.source_path`); Save As (text-input modal — no native file dialog in v0); Reload from disk (with "Discard unsaved changes?" modal when `session.dirty`). |
+| Internal headers (VD)           | `viz/edit_mode_apply.h` (`apply_gizmo_target`); `viz/edit_session.h` (`edit_session`, `load_session`, `save_session`, `reload_session`). |
 
 The CLI / hotkeys / panel layout are the **stable public surface** for
 the visualizer. Internal headers (`scene_snapshot.h`,
@@ -118,6 +126,32 @@ matrix. glad's loader generation runs at configure time and needs
 - **Process model** — standalone GUI app. No IPC with sim core in v0.
   Live mode (post-v0) connects via the same WPILOG / NetworkTables
   stream that AdvantageScope reads — no custom IPC.
+
+## Kinematic vs. visual frame (Phase VD)
+
+Each link / joint has two distinct frames in the snapshot builder's
+bookkeeping. The renderer cares about one; descendants compose
+against the other.
+
+- **Kinematic frame.** The chained frame used as the composition base
+  for descendants.
+  - For a joint: `parent_link_kinematic * compose_origin(joint.origin)`.
+  - For a link: equals its parent joint's kinematic frame (a link
+    does not move relative to its parent joint in Edit mode — joint
+    motion is a Live-mode concern).
+- **Visual frame.** The frame the renderer draws the primitive in.
+  - For a joint: equals its kinematic frame.
+  - For a link: `link_kinematic * compose_origin(link.visual_origin)`.
+
+`scene_node::world_from_local` carries the **visual frame** (what the
+renderer needs). Descendants compose against the parent's *kinematic*
+frame, not the parent's *visual* frame. The distinction matters: a
+link's `visual_origin` is purely cosmetic — it offsets where the
+cylinder is drawn but does not drag descendant joints along with it.
+Pinned by `tests/viz/TEST_PLAN_VD.md` B5; the inverse direction (write
+path) is honored by `apply_gizmo_target` walking the kinematic chain
+from the description directly, never from the snapshot's
+`world_from_local`.
 
 ## Determinism exception
 
@@ -229,6 +263,22 @@ hidden from sim-core review.
   Aligning the arrow to `joint_axis_local` is a follow-up; for the
   v0-arm the axis happens to be `[0, 1, 0]` so the arrow is
   visually misleading until that lands.
+- **Gimbal-pole rpy_rad is underdetermined.** When the user drags
+  the gizmo to a pose with `pitch == ±π/2`, `apply_gizmo_target`
+  preserves the *composed transform* (the rebuilt snapshot matches
+  the user's gizmo within `1e-9`) but the saved `rpy_rad`
+  components may not match component-wise — at the pole, yaw and
+  roll fold into a single residual. The output is always finite
+  (no NaN poisoning); see `tests/viz/TEST_PLAN_VD.md` convention
+  #16 + D-VD-4 + A8/O5.
+- **Save As uses a single-line ImGui text input, not a native OS
+  file dialog.** Native dialogs are a v1+ concern (would require a
+  cross-platform dialog dep like `nfd`).
+- **No undo / redo.** Users discard unsaved edits via Reload from
+  disk (with confirmation modal). Single-step undo would warrant
+  its own design pass on what "undo" means at the description level.
+- **Single-node gizmo manipulation only.** v0 manipulates one
+  selected node at a time; multi-select is a follow-up.
 
 ## Open follow-ups
 

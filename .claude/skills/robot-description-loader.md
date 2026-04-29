@@ -43,8 +43,10 @@ layers consume the struct, never the JSON directly.
 | Header                         | Contains                                                    |
 |--------------------------------|-------------------------------------------------------------|
 | `src/description/loader.h`     | `load_from_file(path) -> std::expected<robot_description, load_error>` |
-| `src/description/schema.h`     | `link`, `joint`, `motor`, `sensor`, `robot_description`, `joint_type`. All POD with `operator== = default`. |
+| `src/description/schema.h`     | `link`, `joint`, `motor`, `sensor`, `robot_description`, `joint_type`, `origin_pose`. All POD with `operator== = default`. |
 | `src/description/error.h`      | `load_error`, `load_error_kind` (six-kind enum: `file_not_found`, `parse_error`, `schema_error`, `domain_error`, `reference_error`, `conflict_error`). |
+| `src/description/origin_pose.h` | `compose_origin(const origin_pose&) -> transform_4x4` — compose raw `xyz_m + rpy_rad` into a 4×4 column-major transform (intrinsic-Z-Y′-X″, URDF order). `decompose_origin(transform_4x4) -> origin_pose` — algebraic inverse (Phase VD); returns one valid solution at the gimbal pole (yaw = 0, residual absorbed into roll). `validate_finite_xyz(xyz, base_ptr)` / `validate_finite_rpy(rpy, base_ptr)` — return `domain_error` on the first non-finite element, or `std::nullopt`. These are the loader's **sole** non-finite-rejection mechanism (D-VC-3 seam). |
+| `src/description/serializer.h` | `save_to_file(const robot_description&, path) -> std::expected<void, save_error>`. `save_error_kind::io_error` only (no unreachable `serialization_error`). |
 
 Internal helpers in `src/description/loader.cpp` are not public API
 and may be refactored without semver impact.
@@ -111,8 +113,21 @@ listed here is what implementers and consumers need to internalize.
 
 ## Schema evolution
 
-Schema version is pinned at the root with `schema_version: 1`. The
-gate fires before any field-level validation:
+Schema versions 1 and 2 are accepted. The gate fires before any
+field-level validation. Version 3+ produces a `schema_error` at
+`/schema_version` with the offending number in the message.
+
+**schema_version 2 adds optional `link.visual_origin` and
+`joint.origin`** (each `{xyz_m: [...], rpy_rad: [...]}`, intrinsic-Z-Y′-X″
+Euler, URDF order). Stored raw on the in-memory struct (`origin_pose`);
+composition into a 4×4 transform happens at the snapshot-builder
+use-site (D-VC-5a/5b). Both default to `origin_pose{}` (identity) when
+absent in the JSON. Under schema_version 1, these keys are rejected as
+unknown fields (v1 decision #8 applies unconditionally).
+
+**Version 1 (current default):**
+
+Schema version 1 gate behavior:
 
 - Missing `schema_version` → `schema_error` at `/schema_version`.
 - Unsupported version (anything other than `1`) → `schema_error` at
@@ -141,12 +156,18 @@ code. Drift between approved-plan and shipped-test defeats the gate.
 
 ## Known limits
 
+- **Save flow is non-atomic in v0.** `save_to_file` writes in-place via
+  `std::ofstream` + close. A partial write on disk-full leaves a corrupted
+  file. See D-VC-11 in `tests/description/TEST_PLAN_VC.md`. Atomic save
+  (write-to-temp + rename) is a v1+ concern; it will land with a positive
+  test of the new contract.
 - **NaN / Infinity in numeric fields.** Strict JSON has no `NaN` /
   `Infinity` literals; the loader uses `nlohmann/json`'s default
-  strict parser, so these aren't reachable from a JSON file. If a
-  future use case constructs a `nlohmann::json` value in memory and
-  passes it through a hypothetical `load_from_json` overload, NaN/Inf
-  handling needs to be specified.
+  strict parser, so these aren't reachable from a JSON file. The
+  `validate_finite_xyz` / `validate_finite_rpy` helpers are the loader's
+  sole non-finite guard (D-VC-3); they exist as a defensive seam for any
+  future in-process path (e.g. visualizer gizmo flow) that might write
+  a non-finite value into an `origin_pose`.
 - **Very large numbers.** `mass_kg: 1e308` parses fine; downstream
   MuJoCo would explode. The loader does not cap upper bounds. Add
   range upper-bounds when a real failure mode demands them.
@@ -183,10 +204,11 @@ code. Drift between approved-plan and shipped-test defeats the gate.
 
 ## Cross-references
 
-- `tests/description/TEST_PLAN.md` — the approved test plan.
+- `tests/description/TEST_PLAN.md` — v1 approved test plan (83 tests).
+- `tests/description/TEST_PLAN_VC.md` — v2 + serializer approved test plan (Phase VC).
 - `docs/V0_PLAN.md` Phase B — the implementation plan.
 - `docs/ARCHITECTURE.md` "Robot description format" — the schema
-  sketch.
+  sketch (now showing v2 form).
 - `.claude/skills/layer-5-world-physics.md` — downstream consumer
   (geometry → MJCF).
 - `.claude/skills/layer-2-control-system-backend.md` — downstream

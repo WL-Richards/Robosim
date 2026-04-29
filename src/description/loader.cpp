@@ -1,6 +1,7 @@
 #include "loader.h"
 
 #include "error.h"
+#include "origin_pose.h"
 #include "schema.h"
 
 #include <nlohmann/json.hpp>
@@ -230,20 +231,33 @@ std::expected<void, load_error> check_can_id(int value,
 }
 
 // ---------------------------------------------------------------------------
-// Per-entity loaders.
+// Per-entity allowed key sets (version-specific).
 // ---------------------------------------------------------------------------
 
-constexpr std::array<std::string_view, 4> k_link_keys = {
+constexpr std::array<std::string_view, 4> k_link_keys_v1 = {
     "name", "mass_kg", "length_m", "inertia_kgm2"};
 
-constexpr std::array<std::string_view, 8> k_joint_keys = {"name",
-                                                          "type",
-                                                          "parent",
-                                                          "child",
-                                                          "axis",
-                                                          "limit_lower_rad",
-                                                          "limit_upper_rad",
-                                                          "viscous_friction_nm_per_rad_per_s"};
+constexpr std::array<std::string_view, 5> k_link_keys_v2 = {
+    "name", "mass_kg", "length_m", "inertia_kgm2", "visual_origin"};
+
+constexpr std::array<std::string_view, 8> k_joint_keys_v1 = {"name",
+                                                              "type",
+                                                              "parent",
+                                                              "child",
+                                                              "axis",
+                                                              "limit_lower_rad",
+                                                              "limit_upper_rad",
+                                                              "viscous_friction_nm_per_rad_per_s"};
+
+constexpr std::array<std::string_view, 9> k_joint_keys_v2 = {"name",
+                                                              "type",
+                                                              "parent",
+                                                              "child",
+                                                              "axis",
+                                                              "limit_lower_rad",
+                                                              "limit_upper_rad",
+                                                              "viscous_friction_nm_per_rad_per_s",
+                                                              "origin"};
 
 constexpr std::array<std::string_view, 7> k_motor_keys = {"name",
                                                           "motor_model",
@@ -259,9 +273,119 @@ constexpr std::array<std::string_view, 5> k_sensor_keys = {
 constexpr std::array<std::string_view, 6> k_root_keys = {
     "schema_version", "name", "links", "joints", "motors", "sensors"};
 
+// Origin sub-object keys (xyz_m + rpy_rad only).
+constexpr std::array<std::string_view, 2> k_origin_keys = {"xyz_m", "rpy_rad"};
+
+// ---------------------------------------------------------------------------
+// v2 origin helpers — parse + validate a 3-element numeric array.
+// D-VC-1b: per-element type mismatch → element pointer; whole-container
+// shape error → array pointer.
+// ---------------------------------------------------------------------------
+
+// Parse a 3-element numeric array at `field_ptr`. Returns the triple
+// or a schema_error. Per-element type mismatch uses the element index
+// in the pointer (D-VC-1b).
+std::expected<std::array<double, 3>, load_error> parse_triple(
+    const json& arr_val,
+    std::string_view key,
+    const fs::path& path,
+    const std::string& field_ptr) {
+  // Whole-container shape errors: not an array or wrong arity.
+  if (!arr_val.is_array() || arr_val.size() != 3) {
+    return std::unexpected(mkerr(load_error_kind::schema_error,
+                                 path,
+                                 field_ptr,
+                                 "field " + std::string(key) + " must be an array of 3 numbers"));
+  }
+  // Per-element type check (D-VC-1b: per-element → element pointer).
+  std::array<double, 3> out{};
+  for (std::size_t i = 0; i < 3; ++i) {
+    if (!arr_val[i].is_number_integer() && !arr_val[i].is_number_float()) {
+      return std::unexpected(mkerr(load_error_kind::schema_error,
+                                   path,
+                                   ptr_index(field_ptr, i),
+                                   "field " + std::string(key) + " element " +
+                                       std::to_string(i) + " must be a number"));
+    }
+    out[i] = arr_val[i].get<double>();
+  }
+  return out;
+}
+
+// Parse an origin sub-object ({"xyz_m": [...], "rpy_rad": [...]}).
+// `origin_val` is the JSON value for the key; `field_name` is the key
+// name ("origin" or "visual_origin") for use in error messages.
+// `origin_ptr` is the RFC-6901 pointer of the sub-object itself.
+std::expected<origin_pose, load_error> parse_origin(
+    const json& origin_val,
+    std::string_view field_name,
+    const fs::path& path,
+    const std::string& origin_ptr) {
+  // Must be an object (null, arrays, scalars are wrong-shape per D-VC-2).
+  if (!origin_val.is_object()) {
+    return std::unexpected(mkerr(load_error_kind::schema_error,
+                                 path,
+                                 origin_ptr,
+                                 "field " + std::string(field_name) + " must be an object"));
+  }
+
+  origin_pose out{};
+
+  // xyz_m — required, declaration-first per D-VC-4 tiebreaker.
+  {
+    auto present = require_present(origin_val, "xyz_m", path, origin_ptr);
+    if (!present) return std::unexpected(present.error());
+    const std::string xyz_ptr = ptr_join(origin_ptr, "xyz_m");
+    auto val = parse_triple(**present, "xyz_m", path, xyz_ptr);
+    if (!val) return std::unexpected(val.error());
+    out.xyz_m = *val;
+  }
+
+  // rpy_rad — required.
+  {
+    auto present = require_present(origin_val, "rpy_rad", path, origin_ptr);
+    if (!present) return std::unexpected(present.error());
+    const std::string rpy_ptr = ptr_join(origin_ptr, "rpy_rad");
+    auto val = parse_triple(**present, "rpy_rad", path, rpy_ptr);
+    if (!val) return std::unexpected(val.error());
+    out.rpy_rad = *val;
+  }
+
+  // Unknown-field rejection inside the origin sub-object (decision #8).
+  if (auto r = check_no_unknown_keys(origin_val, k_origin_keys, path, origin_ptr); !r) {
+    return std::unexpected(r.error());
+  }
+
+  // Finite validation via the seam helpers (D-VC-3). The loader's only
+  // non-finite-rejection mechanism; enforced by lint_loader_finite_seam.
+  {
+    const std::string xyz_ptr = ptr_join(origin_ptr, "xyz_m");
+    if (auto err = validate_finite_xyz(out.xyz_m, xyz_ptr)) {
+      auto e = *err;
+      e.file_path = path;
+      return std::unexpected(e);
+    }
+  }
+  {
+    const std::string rpy_ptr = ptr_join(origin_ptr, "rpy_rad");
+    if (auto err = validate_finite_rpy(out.rpy_rad, rpy_ptr)) {
+      auto e = *err;
+      e.file_path = path;
+      return std::unexpected(e);
+    }
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Per-entity loaders.
+// ---------------------------------------------------------------------------
+
 std::expected<link, load_error> load_link(const json& obj,
                                           std::size_t index,
-                                          const fs::path& path) {
+                                          const fs::path& path,
+                                          int schema_version) {
   const std::string ptr = ptr_index("/links", index);
   link out;
   if (auto r = require_string(obj, "name", path, ptr); r) {
@@ -284,8 +408,15 @@ std::expected<link, load_error> load_link(const json& obj,
   } else {
     return std::unexpected(r.error());
   }
-  if (auto r = check_no_unknown_keys(obj, k_link_keys, path, ptr); !r) {
-    return std::unexpected(r.error());
+  // Unknown-field rejection uses the version-appropriate key set.
+  if (schema_version >= 2) {
+    if (auto r = check_no_unknown_keys(obj, k_link_keys_v2, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
+  } else {
+    if (auto r = check_no_unknown_keys(obj, k_link_keys_v1, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
   }
   if (auto r = check_positive(out.mass_kg, "mass_kg", path, ptr_join(ptr, "mass_kg")); !r) {
     return std::unexpected(r.error());
@@ -297,6 +428,15 @@ std::expected<link, load_error> load_link(const json& obj,
   }
   if (auto r = check_non_negative(out.length_m, "length_m", path, ptr_join(ptr, "length_m")); !r) {
     return std::unexpected(r.error());
+  }
+  // Optional v2 field: visual_origin.
+  if (schema_version >= 2) {
+    if (auto it = obj.find("visual_origin"); it != obj.end()) {
+      const std::string vo_ptr = ptr_join(ptr, "visual_origin");
+      auto val = parse_origin(*it, "visual_origin", path, vo_ptr);
+      if (!val) return std::unexpected(val.error());
+      out.visual_origin = *val;
+    }
   }
   return out;
 }
@@ -313,7 +453,8 @@ std::expected<joint_type, load_error> parse_joint_type(const std::string& s,
 
 std::expected<joint, load_error> load_joint(const json& obj,
                                             std::size_t index,
-                                            const fs::path& path) {
+                                            const fs::path& path,
+                                            int schema_version) {
   const std::string ptr = ptr_index("/joints", index);
   joint out;
   if (auto r = require_string(obj, "name", path, ptr); r) {
@@ -357,8 +498,15 @@ std::expected<joint, load_error> load_joint(const json& obj,
   } else {
     return std::unexpected(r.error());
   }
-  if (auto r = check_no_unknown_keys(obj, k_joint_keys, path, ptr); !r) {
-    return std::unexpected(r.error());
+  // Unknown-field rejection uses the version-appropriate key set.
+  if (schema_version >= 2) {
+    if (auto r = check_no_unknown_keys(obj, k_joint_keys_v2, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
+  } else {
+    if (auto r = check_no_unknown_keys(obj, k_joint_keys_v1, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
   }
   // Enum strictness (L1/L2). Done after presence + type checks.
   if (auto r = parse_joint_type(type_str, path, ptr_join(ptr, "type")); r) {
@@ -374,6 +522,15 @@ std::expected<joint, load_error> load_joint(const json& obj,
               path,
               ptr_join(ptr, "limit_upper_rad"),
               "joint " + out.name + ": limit_upper_rad must be >= limit_lower_rad"));
+  }
+  // Optional v2 field: origin.
+  if (schema_version >= 2) {
+    if (auto it = obj.find("origin"); it != obj.end()) {
+      const std::string o_ptr = ptr_join(ptr, "origin");
+      auto val = parse_origin(*it, "origin", path, o_ptr);
+      if (!val) return std::unexpected(val.error());
+      out.origin = *val;
+    }
   }
   return out;
 }
@@ -631,7 +788,7 @@ std::expected<root_basics, load_error> validate_root_shape(const json& root, con
   } else {
     return std::unexpected(r.error());
   }
-  if (out.schema_version != 1) {
+  if (out.schema_version != 1 && out.schema_version != 2) {
     return std::unexpected(
         mkerr(load_error_kind::schema_error,
               path,
@@ -714,12 +871,22 @@ std::expected<robot_description, load_error> validate_and_build(const json& root
   out.schema_version = basics->schema_version;
   out.name = std::move(basics->name);
 
-  if (auto r = load_array<link>(*basics->links_arr, "/links", path, load_link); r) {
+  const int ver = basics->schema_version;
+
+  if (auto r = load_array<link>(*basics->links_arr, "/links", path,
+                                [ver](const json& obj, std::size_t i, const fs::path& p) {
+                                  return load_link(obj, i, p, ver);
+                                });
+      r) {
     out.links = std::move(*r);
   } else {
     return std::unexpected(r.error());
   }
-  if (auto r = load_array<joint>(*basics->joints_arr, "/joints", path, load_joint); r) {
+  if (auto r = load_array<joint>(*basics->joints_arr, "/joints", path,
+                                 [ver](const json& obj, std::size_t i, const fs::path& p) {
+                                   return load_joint(obj, i, p, ver);
+                                 });
+      r) {
     out.joints = std::move(*r);
   } else {
     return std::unexpected(r.error());

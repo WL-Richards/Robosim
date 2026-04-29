@@ -380,7 +380,7 @@ defined in `src/description/schema.h` at implementation time):
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "v0-arm",
   "links": [
     { "name": "arm",
@@ -411,6 +411,20 @@ defined in `src/description/schema.h` at implementation time):
   ]
 }
 ```
+
+**Schema version 2 additions (Phase VC).** Both `link.visual_origin`
+and `joint.origin` are now optional sub-objects:
+
+```json
+"visual_origin": { "xyz_m": [0.1, 0.0, 0.0], "rpy_rad": [0.0, 0.0, 0.0] }
+"origin":         { "xyz_m": [0.0, 0.0, 0.5], "rpy_rad": [0.0, 1.5708, 0.0] }
+```
+
+Both default to identity when absent; `xyz_m` is in metres,
+`rpy_rad` uses URDF intrinsic-Z-Y′-X″ order (`[roll, pitch, yaw]`).
+Composition into a 4×4 transform happens at the snapshot-builder
+use-site, not in the loader struct. The loader and serializer test
+contracts are in `tests/description/TEST_PLAN_VC.md`.
 
 A future authoring GUI / CAD-import tool is tracked as OQ-11
 (deferred until the schema stabilizes).

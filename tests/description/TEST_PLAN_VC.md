@@ -1,11 +1,13 @@
 # Robot description schema v1 → v2 (Phase VC) — draft test plan
 
-**Status:** **`rev 3 / draft`** — addresses test-reviewer rev-2
-findings (three new blockers: V5 case B math was wrong, V7/V7b's
-parser mechanic was empirically false on the pinned nlohmann v3.12,
-rpy element order was unpinned; plus three minor changes). Awaiting
-next test-reviewer cycle. Do not write test code from this document
-yet.
+**Status:** **`ready-to-implement`** per the test-reviewer agent
+(rev-4 review, with five non-blocking tightenings applied in this
+revision per the reviewer's "no further test-reviewer cycle is
+required if applied in the same patch" guidance). Implement the
+tests and supporting deliverables in this document as specified;
+if substantive deviation is needed during implementation, re-run
+the test-reviewer cycle on the change rather than drifting silently.
+See `.claude/skills/tdd-workflow.md` step 6.
 
 **Review history:**
 - rev 1 → `not-ready`. Three blockers (D-VC-5 storage drift, V5 not
@@ -33,7 +35,101 @@ yet.
     V5's prose treated the array as `[yaw, pitch, roll]`. Without
     a pin, V5 case B's correct expected vector flips sign (and
     case A's prose reads wrong).
-- rev 3 → this revision. All three rev-2 blockers addressed:
+- rev 4 → `ready-to-implement` with five non-blocking tightenings
+  the reviewer asked to be folded into the implementation patch
+  rather than another review cycle:
+  - **Lint tokenset extended** to
+    `isfinite | isnan | isinf | isnormal | fpclassify` (the latter
+    two close the most likely accidental drift; `isnormal` would
+    silently break V9 if invoked, so V9 + the lint form a
+    closure-tight pair against accidental drift).
+  - **Lint grep scope broadened** to every TU under
+    `src/description/` other than the helper's defining TU, so an
+    implementer who splits the parser across `loader.cpp` +
+    `parse_origin.cpp` can't sidestep the lint by accident.
+  - **Lint posture explicit:** the script is a tripwire against
+    accidental drift, with V9 as the runtime backstop. Determined
+    evasion (bit-cast finite-checks, third-TU wrapper functions)
+    is out of scope — that's what `code-style.md`'s "no shortcuts"
+    non-negotiable handles culturally. The plan now states this
+    explicitly so a future maintainer doesn't read the lint as a
+    closure-tight static analysis.
+  - **V0b parameterized** over four representative v1-required
+    leaves (`links[0].mass_kg`,
+    `joints[0].viscous_friction_nm_per_rad_per_s`,
+    `motors[0].controller_can_id`, the root `motors` key) — the
+    asymmetric-relaxation bug class spans more than one leaf, and
+    a single-leaf V0b was a thin sample.
+  - **V8 wrong-element-type row added** (`xyz_m: [0, "x", 0]`) and
+    D-VC-1b refined to distinguish "uniform shape error" (array
+    pointer) from "per-element type mismatch" (element pointer).
+    Mirrors the per-element vs. per-array distinction the decision
+    already pins for `domain_error`.
+  - **D-VC-2 amended** with a short paragraph stating that JSON
+    `null` is treated as wrong-shape (not as absent), with the
+    rationale (forecloses a future drift toward
+    `null`-as-identity). Lifted from V8's notes so the decision
+    is discoverable at the decision pin.
+  - **Lint runs on every configure** confirmed: configure-time
+    invocation from the top-level `CMakeLists.txt`, unconditional
+    on `ROBOSIM_BUILD_VIZ`, so headless / loader-only CI matrices
+    hit it the same as the viz matrix. Stated explicitly in the
+    deliverables checklist.
+
+- rev 3 → `not-ready, but barely`. V5 math verified case-by-case;
+  V8 outer-non-object pointer convention approved; nlohmann v3.12
+  NaN rejection empirically reconfirmed; D-VC-5a/5b/1b decisions
+  and `serialization_error` removal all approved. Two required
+  follow-ups: (a) the V7/V7b helper-seam needs to pin that the
+  loader's parse path *actually calls* the helper (otherwise
+  `loader.cpp` could carry a parallel inline `isfinite` check
+  that nothing tests — "no half-finished implementations"); (b)
+  the D-VC-11 redirection to the loader skill must track the
+  skill update as part of the VC patch (CLAUDE.md non-negotiable
+  on "Updating the skill is part of every feature change"). Three
+  suggested polish items (D-VC-4 wording, S5 row clarity, two
+  small coverage corners).
+- rev 4 → this revision. The two required rev-3 follow-ups are
+  addressed:
+  - **V7/V7b seam call-site pin.** D-VC-3 and the V7 "Mechanic"
+    subsection now require the loader to call
+    `validate_finite_xyz` / `validate_finite_rpy` as its **only**
+    non-finite-rejection mechanism. Enforced by a CMake-level
+    lint check (`cmake/lint_loader_finite_seam.cmake`, modeled on
+    the existing `lint_renderer_isolation.cmake`) that fails
+    configure if `loader.cpp` contains a bare `std::isfinite`
+    outside the helper. Plan tracks the lint script as a VC3
+    deliverable.
+  - **D-VC-11 skill-update checklist.** A new "VC patch deliverables
+    outside the test plan" subsection at the end of the VC4 section
+    enumerates the loader-skill update (add `save_to_file` to
+    Public surface; add non-atomicity to Known limits with
+    cross-reference to D-VC-11), the lint-script deliverable, and
+    the v0-arm fixture migration. The plan's promise of skill
+    documentation is no longer passive prose — it is a tracked
+    deliverable.
+
+  Plus rev-4 polish (all three rev-3 suggestions applied):
+  - **D-VC-4 wording.** "First-offender" terminology dropped in
+    favor of "schema-declaration-order tiebreaker" (V6c). Avoids
+    confusion with v1 decision #2's "second-offender" rule, which
+    is about a different problem (temporal collisions in a name
+    table).
+  - **S5 row clarity.** `1.0 - 1e-16` replaced with
+    `std::nextafter(1.0, 0.0)` so the adversarial intent
+    (smallest distinguishable-from-1 from below) is explicit and
+    rounding-mode-independent. Mirrors the existing
+    `nextafter(1.0, 2.0)` row.
+  - **Two small coverage corners** added: V8 gains an
+    `origin: null` row (pinning that null is treated as wrong-
+    shape, not as "absent"), and a new V0b case
+    (`v2_missing_required_v1_leaf_is_schema_error`) pins that v2
+    did not relax v1's required-field rules.
+
+  All three rev-1 open questions remain closed (intrinsic-Z-Y'-X'',
+  raw-only in-memory storage, nlohmann SHA pin).
+
+- rev 3 → previous revision. All three rev-2 blockers addressed:
   - **rpy order pinned to URDF: `[roll, pitch, yaw]`.**
     `rpy_rad[0] = roll`, `rpy_rad[1] = pitch`, `rpy_rad[2] = yaw`.
     Stated as a discrete bullet in D-VC-5a so it can't be
@@ -222,18 +318,41 @@ pinned" carry forward unchanged. Plus:
   `origin` key" *and* the case "v2 file with hypothetical v3-era
   key." The tests V1 / V1b are special-cases of v1 M1, kept in this
   plan for explicit version-gating coverage.
-- **D-VC-1b** (new convention). For per-element domain errors inside
-  a JSON array, `json_pointer` includes the **element index**
-  (e.g. `/joints/0/origin/xyz_m/2` for a NaN at slot 2). For
-  *shape* errors against an array (wrong arity, wrong element type
-  uniformly, missing array entirely), the pointer is the array's
-  path (e.g. `/joints/0/origin/xyz_m`), matching v1 D1's existing
-  posture. Per-element vs. per-array distinction is by error kind:
-  `domain_error` → element pointer; `schema_error` → array pointer.
+- **D-VC-1b** (new convention). Pointer convention for errors
+  inside an array depends on whether the error is *positional* or
+  *whole-container*:
+  - **Per-element error** (the element's value is wrong but the
+    container's shape is fine): pointer includes the **element
+    index** (e.g. `/joints/0/origin/xyz_m/2`). Applies to
+    `domain_error` on a finite-but-out-of-range scalar (none in
+    VC, but the convention extends to v1 D2/D5-class follow-ups)
+    *and* to `schema_error` on per-element type mismatch
+    (`xyz_m: [0, "x", 0]` → pointer at slot 1, not at the array).
+  - **Whole-container error** (the container's shape, arity, or
+    type is wrong): pointer is the **array's path**
+    (e.g. `/joints/0/origin/xyz_m`). Applies to wrong arity
+    (`xyz_m: [0, 0]`), uniform wrong type (`xyz_m: ["a", "b", "c"]`
+    — every element is wrong, the *array as a whole* is the wrong
+    shape), missing array entirely, and a non-array value where
+    an array is expected (`xyz_m: 5`).
+  - The split is by *locator precision*: when the user can act on
+    a specific slot, point at the slot; when the problem is the
+    container itself, point at the container. v1 D1's
+    "string-where-array-expected at `/joints/0/axis`" is the
+    whole-container side of this rule.
 - **D-VC-2.** When `origin` is absent in a `schema_version: 2` file,
   the in-memory `origin_pose` has `xyz_m = {0,0,0}` and
   `rpy_rad = {0,0,0}` (i.e. equals `origin_pose{}`). No
   `std::optional` tristate.
+
+  **JSON `null` is wrong-shape, not absent.** A literal
+  `"origin": null` (or `"visual_origin": null`) is rejected as
+  `schema_error` (V8). nlohmann's `ordered_json` distinguishes
+  *missing key* from *present-key-with-null-value*; the loader
+  does too. Treating `null` as a synonym for "absent" would
+  forfeit the ability to ever pin `null` as a meaningful value
+  in a future schema (e.g., a tristate "explicitly cleared" vs.
+  "never set"), so v0 keeps `null` an error and the door open.
 - **D-VC-3.** Non-finite floats (`NaN`, `±Inf`) inside `xyz_m` or
   `rpy_rad` are a `domain_error` with a json_pointer to the
   offending scalar (per D-VC-1b). The contract is pinned at the
@@ -252,14 +371,61 @@ pinned" carry forward unchanged. Plus:
   half-finished implementations," that guard must still be
   pinned by a test, hence V7/V7b — but the test exercises the
   validator helper directly, not via the parser.
+
+  **Seam call-site pin (rev 4).** To prevent the helper from
+  becoming a paper test of code the loader doesn't actually use,
+  the loader's parse path must call `validate_finite_xyz` /
+  `validate_finite_rpy` as its **only** non-finite-rejection
+  mechanism. The constraint is enforced mechanically by a
+  configure-time CMake lint script
+  `cmake/lint_loader_finite_seam.cmake` (modeled on the existing
+  `cmake/lint_renderer_isolation.cmake` for the visualizer T1
+  isolation rule).
+  - **Banned tokenset**: `isfinite | isnan | isinf | isnormal |
+    fpclassify`. The first three are the direct intents (a
+    `std::isfinite` / `std::isnan` / `std::isinf` call line);
+    `isnormal` and `fpclassify` close the most likely
+    *accidental* drift — `isnormal` would silently break V9
+    (subnormals) if invoked, and `fpclassify` is the next most
+    plausible "I'll write my own finite-check" reach.
+  - **Allow-list scope**: every `*.{h,cpp}` under
+    `src/description/` *except* the helper's defining TU
+    (`src/description/origin_pose.cpp` per the deliverables
+    checklist; or the file the implementer chooses, listed
+    explicitly in the lint script). An implementer who splits
+    the parser across `loader.cpp` + `parse_origin.cpp` can't
+    sidestep the lint by accident — every loader-side TU is
+    grepped.
+  - **Failure mode**: CMake configure fails with a message
+    citing this decision, the offending file path, and the line
+    of the banned token. Same posture as `scripts/lint.sh`'s
+    banned-clock check in the determinism rules.
+  - **Posture**: this is a tripwire against accidental drift,
+    backed by V9 at runtime (which catches `isnormal` even if
+    the lint missed it). It is **not** closure-tight against
+    deliberate evasion (bit-cast finite-checks, third-TU wrapper
+    functions, templated indirections). Deliberate evasion is
+    handled culturally by `code-style.md`'s "no shortcuts"
+    non-negotiable, not by the lint. A future maintainer reading
+    the lint script should not extend the tokenset to chase
+    every plausible workaround — V9 + the cultural rule is
+    sufficient.
+
+  Without this pin, V7/V7b can pass against the helper while the
+  loader carries an inline check that no test exercises — exactly
+  the bug class `code-style.md`'s "no shortcuts" non-negotiable
+  forbids.
 - **D-VC-4.** Missing `xyz_m` or missing `rpy_rad` inside a present
   `origin` object is a `schema_error` at the missing key's pointer
   (consistent with v1 D1). An entirely empty `origin: {}` is also
-  a `schema_error`; the *first-offender* sub-field by declaration
-  order (`xyz_m`) is reported as missing, mirroring v1's
-  deterministic-second-offender rule (decision #2) but flipped to
-  first-offender because both are missing simultaneously and the
-  rule must be deterministic.
+  a `schema_error`; the **schema-declaration-order tiebreaker**
+  selects which missing sub-field is reported (declaration order
+  in `schema.h`, so `xyz_m` is reported first when both are
+  missing). This is a different rule from v1 decision #2's
+  "deterministic second-offender" rule (which is about temporal
+  collisions in a name table — wholly unrelated). The shared goal
+  is the same: error reporting must be deterministic; the
+  mechanism here is just "ordering by declaration."
 - **D-VC-5a.** Euler convention for `rpy_rad`:
   **intrinsic-Z-Y'-X''**, same as URDF.
   - **Array element order**: `rpy_rad[0] = roll`,
@@ -360,6 +526,37 @@ Carries over the v1 plan's pattern (TEST_PLAN.md lines 140–153):
   fixture path indirectly. V0 explicitly pins "v2 loader, v1 input,
   unchanged output" as a single failing-fast test rather than relying
   on whole-suite green.
+
+#### V0b. `RobotDescriptionLoader.v2_missing_required_v1_leaf_is_schema_error` (parameterized)
+
+- Layer / contract: v1's required-field rules survive untouched
+  under `schema_version: 2`. Catches a v2 path that silently
+  relaxes a v1 constraint.
+- Bug class: a v2 branch that wraps v1 leaf-validation in
+  "if v1 only" and drops the requirement on v2 inputs.
+- Parameter table — four representative v1-required leaves picked
+  to span the leaf-types most likely to drift on a v2 refactor:
+
+  | Field removed                                          | Pointer                                          | Why representative |
+  |--------------------------------------------------------|--------------------------------------------------|--------------------|
+  | `links[0].mass_kg`                                     | `/links/0/mass_kg`                               | classic numeric leaf in a sub-array element |
+  | `joints[0].viscous_friction_nm_per_rad_per_s`          | `/joints/0/viscous_friction_nm_per_rad_per_s`    | v1 decision #3 explicitly forbids defaulting; specifically tempting to default on a v2 refactor |
+  | `motors[0].controller_can_id`                          | `/motors/0/controller_can_id`                    | integer leaf with its own v1 decisions (#5 / #10); pins that v2 doesn't pre-validate via a different route that bypasses v1 |
+  | `motors` (root key)                                    | `/motors`                                        | root-level required key (v1 decision #4); pins that v2 doesn't relax the no-defaults rule one level up |
+- Procedure (each row): start from v0-arm v2 in-memory
+  `ordered_json`; `erase` the listed pointer's leaf; dump to a
+  temp file; load.
+- Expected: `schema_error` at the listed pointer, message contains
+  the leaf field name (or root-key name).
+- Notes: V0 catches the *equality* regression (v1 input + v2
+  loader → unchanged struct), but a loader that asymmetrically
+  *relaxed* a v1 constraint while still accepting v1 inputs
+  unchanged would pass V0. V0b catches that. Four cases is a
+  representative sweep across (numeric leaf, pinned-no-default
+  leaf, int leaf with its own v1 decisions, root-level required
+  key) — not exhaustive, but enough to fail loudly on the
+  asymmetric-relaxation bug class. Full per-leaf coverage is
+  what the v1 C/D-suites already provide for v1 inputs.
 
 ### New v2 schema tests
 
@@ -518,34 +715,45 @@ Carries over the v1 plan's pattern (TEST_PLAN.md lines 140–153):
 
 - Symmetric: missing `rpy_rad`.
 
-#### V6c. `RobotDescriptionLoader.empty_origin_object_is_schema_error_at_xyz`
+#### V6c. `RobotDescriptionLoader.empty_origin_object_is_schema_error_at_declaration_first_field`
 
-- Pins D-VC-4's first-offender rule for a doubly-empty `origin: {}`.
+- Pins D-VC-4's schema-declaration-order tiebreaker for a
+  doubly-empty `origin: {}`.
 - Bug class: the validator reports an arbitrary one of the two
   missing fields, making the error pointer non-deterministic.
 - Input: v0-arm v2 with `joints[0].origin = {}`.
 - Expected: `schema_error`,
-  `json_pointer == "/joints/0/origin/xyz_m"` (declaration order:
-  `xyz_m` first, so it's the first-offender). Message contains
+  `json_pointer == "/joints/0/origin/xyz_m"` (`xyz_m` is declared
+  before `rpy_rad` in `schema.h`'s `origin_pose` struct, so it's
+  the deterministically-reported missing field). Message contains
   `"xyz_m"`.
 
 #### V7. `RobotDescriptionLoader.non_finite_xyz_component_is_domain_error` (parameterized)
 
 - Pins D-VC-3 + D-VC-1b (per-element pointer convention).
-- **Mechanic** (rev-3 change): tests call the loader's exposed
-  per-scalar validator helper directly, not via JSON text.
-  Specifically, the loader's parsing path factors out
+- **Mechanic** (rev-3 change, seam call-site pinned in rev 4):
+  tests call the loader's exposed per-scalar validator helper
+  directly, not via JSON text. Specifically, the loader's parsing
+  path factors out
   `description::validate_finite_xyz(const std::array<double, 3>& xyz,
   std::string_view base_pointer) -> std::optional<load_error>` (and
   symmetrically `validate_finite_rpy(...)`). The seam exists for
-  this test and to keep the production parsing-loop free of
-  inlined `isfinite` checks. The tests pass an `xyz` array with a
-  non-finite value at the offending slot and assert the helper
-  returns `load_error{kind: domain_error, json_pointer: <expected>,
+  this test and to keep the production parsing path free of inlined
+  `isfinite` checks. The tests pass an `xyz` array with a non-finite
+  value at the offending slot and assert the helper returns
+  `load_error{kind: domain_error, json_pointer: <expected>,
   message: <name-substring>}`. **The full `load_from_file`
   integration path is not exercised** for this contract — see the
   D-VC-3 explanation above for why JSON-text injection is not
   viable on pinned nlohmann v3.12.
+
+  **Seam call-site enforcement** (D-VC-3, rev 4): the helper is the
+  loader's only non-finite-rejection mechanism. Enforced by
+  `cmake/lint_loader_finite_seam.cmake` at configure time, not by
+  a runtime test. Without that lint, V7/V7b would be a paper test
+  of a helper whose call-site nobody verifies — the
+  `code-style.md` "no shortcuts" non-negotiable specifically
+  forbids that shape.
 - 9 parameter combinations: `{NaN, +Inf, -Inf}` × `{slot 0, slot 1,
   slot 2}`.
 - Expected: returns `load_error`,
@@ -578,19 +786,28 @@ Carries over the v1 plan's pattern (TEST_PLAN.md lines 140–153):
   | `xyz_m`          | `[0, 0]`          | `/joints/0/origin/xyz_m`         |
   | `xyz_m`          | `[0, 0, 0, 0]`    | `/joints/0/origin/xyz_m`         |
   | `xyz_m`          | `[]`              | `/joints/0/origin/xyz_m`         |
+  | `xyz_m`          | `[0, "x", 0]`     | `/joints/0/origin/xyz_m/1`       |
   | `rpy_rad`        | `[0, 0]`          | `/joints/0/origin/rpy_rad`       |
   | `rpy_rad`        | `[0, 0, 0, 0]`    | `/joints/0/origin/rpy_rad`       |
   | `rpy_rad`        | `[]`              | `/joints/0/origin/rpy_rad`       |
   | `joints[0].origin` | `5` (number)    | `/joints/0/origin`               |
   | `joints[0].origin` | `"identity"`    | `/joints/0/origin`               |
   | `joints[0].origin` | `[1, 2, 3]`     | `/joints/0/origin`               |
+  | `joints[0].origin` | `null`          | `/joints/0/origin`               |
   | `links[0].visual_origin` | `5`       | `/links/0/visual_origin`         |
 - Expected: `schema_error` at the listed pointer, message contains
   the offending field name (`"xyz_m"` / `"rpy_rad"` / `"origin"` /
   `"visual_origin"` as appropriate).
-- Notes: rev-2 covered only the two inner-array shape cases. rev-3
-  adds outer-non-object cases per reviewer feedback — a JSON value
-  that is a number/string/array where the schema expects an object.
+- Notes: rev-2 covered only the two inner-array shape cases.
+  rev-3 added outer-non-object cases. rev-4 adds `origin: null`
+  (`null` is treated as wrong-shape per D-VC-2's rev-4 paragraph,
+  not as "absent") and the per-element type-mismatch row
+  `xyz_m: [0, "x", 0]` → `/joints/0/origin/xyz_m/1`. The
+  per-element row's pointer follows D-VC-1b's "per-element error
+  → element pointer" half: the array's *shape* is correct (3
+  elements, named field present), but slot 1's *type* is wrong,
+  so the locator points at slot 1 — that's the actionable
+  position for the user.
 
 #### V9. `RobotDescriptionLoader.accepts_subnormal_finite_xyz_value`
 
@@ -656,10 +873,16 @@ deserialize-into-mutable-struct API that bypasses the loader's
   serializer's output shape.
 - **D-VC-11.** v0 serializer is **non-atomic**: writes in-place via
   `std::ofstream` + close. A partial write on disk-full leaves a
-  corrupted file. Documented as a known limit in the visualizer
-  skill; revisited in v1 if the gizmo-save flow exposes the corrupted-
-  file failure mode in the field. The plan does not test atomicity
-  in v0; it tests that disk-full produces `io_error` (S6).
+  corrupted file. **No test pins this property** — it is the
+  *absence* of a contract, and pinning the absence with a skipped
+  test adds no value (rev-2 reviewer flagged the rev-2 S7 as a
+  paper exercise; dropped in rev 3). The non-atomicity limit is
+  instead documented in `.claude/skills/robot-description-loader.md`
+  alongside the existing loader limits, with this decision pin as
+  the cross-reference. If a future change introduces atomicity
+  (write-to-temp + rename), it lands with its own positive test
+  of the new contract — the right time to write a test of "saves
+  atomically" is when atomic save is implemented, not now.
 
 ### New tests
 
@@ -736,13 +959,15 @@ deserialize-into-mutable-struct API that bypasses the loader's
   | Value                                                      | Why adversarial |
   |------------------------------------------------------------|-----------------|
   | `std::numeric_limits<double>::denorm_min()`                | smallest positive subnormal — formatters that drop to fixed-precision short-form lose it |
+  | `std::numeric_limits<double>::min()`                       | smallest *normal* positive (≈ `2.2250738585072014e-308`) — sits at the normal/subnormal boundary, where some formatters change precision behavior |
+  | `std::numeric_limits<double>::max()`                       | largest finite (≈ `1.7976931348623157e+308`) — `%g` with insufficient precision can round to `Infinity` on re-parse |
   | `std::nextafter(1.0, 2.0)`                                 | smallest distinguishable-from-1 — short-form formatters round it back to 1.0 |
   | `0.1`                                                      | classic non-representable; tests bit-pattern round-trip |
   | `1e-300`                                                   | very small but normal; tests exponent precision |
   | `1e+300`                                                   | very large; tests exponent + mantissa precision |
   | `-0.0`                                                     | signed zero — does the formatter preserve the sign bit? |
   | `M_PI`                                                     | transcendental; classic round-trip test value |
-  | `1.0 - 1e-16`                                              | boundary of distinguishability from 1.0 |
+  | `std::nextafter(1.0, 0.0)`                                 | smallest distinguishable-from-1 from below — short-form formatters round it back to 1.0; mirrors the `nextafter(1.0, 2.0)` row above |
 
 - Procedure (each case): build a v0-arm v2 description with the
   bad-value injected; `save_to_file` to a temp path; `load_from_file`;
@@ -764,22 +989,16 @@ deserialize-into-mutable-struct API that bypasses the loader's
 - **Skip on platforms where chmod is a no-op** (none in v0; Linux
   and macOS only). Document inline.
 
-#### S7. `Serializer.partial_write_on_disk_full_corrupts_file_documenting_v0_limit`
+#### S7. *(dropped in rev 3)*
 
-- Pins D-VC-11 (no atomicity in v0). This is a **negative test of an
-  intentionally-accepted limit**: it exists so a future change that
-  adds atomicity (write-to-temp + rename) breaks the test, forcing a
-  deliberate decision to re-verify the failure-mode contract.
-- Procedure: redirect `save_to_file` to a small (`mkfifo`-backed?
-  truncated tmpfs?) target where the second write fails partway
-  through. Verify the on-disk file is corrupt-or-empty (not a
-  complete valid JSON), and that the function returns `io_error`.
-- **Implementation note**: this test is platform-specific and
-  fiddly. If it cannot be made deterministic on Linux (no portable
-  way to fail-mid-write reliably), demote to a skipped-with-comment
-  test that documents the limit. Demoted form is acceptable in v0
-  because the **contract** is "no atomicity"; the test exists as
-  documentation more than verification.
+The rev-2 S7 attempted to pin "no atomicity in v0" as a negative
+test against a hypothetical future atomic-save change. The rev-2
+reviewer flagged it as a paper exercise: a `GTEST_SKIP`'d test
+nobody ever runs, "verifying" the absence of a property. rev 3
+drops it entirely. The non-atomicity limit is documented in
+`.claude/skills/robot-description-loader.md` and pinned by D-VC-11.
+If a future change introduces atomic save, it lands with a positive
+test of the new contract.
 
 #### S8. `Serializer.nlohmann_dump_byte_format_matches_pinned_sha`
 
@@ -802,6 +1021,99 @@ deserialize-into-mutable-struct API that bypasses the loader's
 
 ---
 
+## VC patch deliverables outside the test plan
+
+The VC patch is more than the failing-tests-then-implementation
+sequence below. The following are part of the same patch and are
+tracked here so an implementer can't ship VC code without them.
+
+### Production code deliverables
+
+- **`src/description/schema.h`**: append `origin_pose` POD struct
+  (`std::array<double, 3> xyz_m`, `std::array<double, 3> rpy_rad`,
+  defaulted `operator==`). Append `visual_origin` to `link` and
+  `origin` to `joint`, both as plain `origin_pose` members
+  (no `std::optional`; absent JSON → identity instance per D-VC-2).
+- **`src/description/loader.cpp`**: schema_version=2 path; calls to
+  `validate_finite_xyz` / `validate_finite_rpy` for non-finite
+  rejection (D-VC-3 + lint).
+- **`src/description/loader.h`** (or a new
+  `src/description/origin_pose.h`): expose
+  `validate_finite_xyz(...)`, `validate_finite_rpy(...)`, and
+  `compose_origin(const origin_pose&) -> std::array<std::array<double, 4>, 4>`
+  on the loader's public API. The compose helper is required for
+  V5; the validators are required for V7/V7b.
+- **`src/description/serializer.{h,cpp}`** (new files):
+  `save_to_file(const robot_description&, const std::filesystem::path&)
+  -> std::expected<void, save_error>`. Uses `nlohmann::ordered_json`
+  per D-VC-8. Omits identity origins per D-VC-9.
+
+### Schema fixture deliverables
+
+- **`descriptions/v0-arm.json`**: bump `schema_version` to `2`. No
+  origin keys added (production fixture remains identity-only).
+- **`tests/description/fixtures/v0_arm_v1.json`** (new file):
+  byte-identical copy of the pre-VC `descriptions/v0-arm.json`
+  (schema_version 1). Used by V0.
+- **`tests/viz/fixtures.cpp`** updates: bump the three viz fixture
+  helpers (`make_v0_arm_description`, `make_two_joint_chain_description`,
+  `make_long_named_description`) to set `schema_version = 2` with
+  identity origins. Existing viz tests must remain green
+  unchanged.
+
+### Lint / build deliverables
+
+- **`cmake/lint_loader_finite_seam.cmake`** (new file): enforces
+  D-VC-3's seam call-site pin. Greps **every `*.{h,cpp}` under
+  `src/description/` except the helper's defining TU** for the
+  banned tokenset
+  `isfinite | isnan | isinf | isnormal | fpclassify`; fails
+  configure if any are found. Modeled on
+  `cmake/lint_renderer_isolation.cmake`.
+- **Top-level `CMakeLists.txt`**: `include()` and invoke the new
+  lint script **unconditionally** (not gated on
+  `ROBOSIM_BUILD_VIZ` or any other option), so headless /
+  loader-only CI matrices hit the lint on every configure exactly
+  the same as the viz matrix. The loader is a non-optional target;
+  its lint is a non-optional check.
+- **`CMakeLists.txt` nlohmann pin**: stays at v3.12 SHA
+  `55f93686c01528224f448c19128836e7df245f72` (the version against
+  which V7/V7b's parser-reject claim and S8's SHA constant are
+  baselined). Any change to this SHA must update both S8's pinned
+  digest and re-verify the V7/V7b posture.
+
+### Documentation deliverables
+
+- **`docs/ARCHITECTURE.md`** "Robot description format" sketch
+  (lines ~378–410): update the example arm to show
+  `schema_version: 2` and add a paragraph noting the v2 additions
+  with a pointer to this plan.
+- **`.claude/skills/robot-description-loader.md`** updates (D-VC-11
+  cross-reference home):
+  - Public surface: append `save_to_file`, `compose_origin`,
+    `validate_finite_xyz`, `validate_finite_rpy`.
+  - Known limits: append "Save flow is non-atomic in v0 — partial
+    writes on disk-full leave a corrupted file. See D-VC-11 in
+    `tests/description/TEST_PLAN_VC.md`. Atomic save is a v1+
+    concern."
+  - Schema decisions: append "schema_version 2 adds optional
+    `link.visual_origin` and `joint.origin` (each `xyz_m` +
+    `rpy_rad`, intrinsic-Z-Y'-X'' Euler, URDF order). Stored raw
+    on the in-memory struct; composition at the snapshot-builder
+    use-site (D-VC-5a/5b)."
+  - Cross-references: append a pointer to `TEST_PLAN_VC.md`.
+- **`docs/VISUALIZER_V0_PLAN.md`** Phase VC section: mark VC1–VC4
+  as landed; reference this plan and the lint script.
+- **`CLAUDE.md`** status: append a sentence noting that schema v2
+  + serializer landed, the loader skill is updated, and Phase VD
+  (gizmo persistence) is now unblocked.
+
+Per CLAUDE.md non-negotiable on "Updating the skill is part of
+every feature change," none of these are optional. The patch
+without the skill update is incomplete.
+
+---
+
 ## What this plan does NOT cover
 
 - **Phase VD test plan** (gizmo + save-flow integration). Lives
@@ -819,7 +1131,7 @@ deserialize-into-mutable-struct API that bypasses the loader's
 
 ---
 
-## Open questions (rev 1 → rev 2 status)
+## Open questions (rev 1 → rev 4 status)
 
 The three rev-1 open questions are all closed:
 
@@ -829,5 +1141,8 @@ The three rev-1 open questions are all closed:
    alternative documented inline.
 3. **nlohmann pin** → yes, with the S8 SHA-guard test (D-VC-10).
 
-No open questions remain in rev 2. If reviewer disagrees on any of
-the three closures, push back and the discussion reopens.
+No open questions remain in rev 4. If reviewer disagrees on any of
+the three closures or the rev-2/3/4 derived choices (rpy element
+order = `[roll, pitch, yaw]`; V7/V7b unit-seam + lint enforcement;
+S7 dropped + non-atomicity in skill), push back and the discussion
+reopens.

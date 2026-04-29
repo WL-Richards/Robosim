@@ -1,24 +1,12 @@
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "name": "v0-arm",
   "links": [
     {
       "name": "arm",
       "mass_kg": 2.0,
       "length_m": 0.5,
-      "inertia_kgm2": 0.166,
-      "visual_origin": {
-        "xyz_m": [
-          0.005277387797832489,
-          0.0,
-          0.1998530849814415
-        ],
-        "rpy_rad": [
-          0.0,
-          0.0,
-          0.0
-        ]
-      }
+      "inertia_kgm2": 0.166
     }
   ],
   "joints": [
@@ -27,26 +15,10 @@
       "type": "revolute",
       "parent": "world",
       "child": "arm",
-      "axis": [
-        0.0,
-        1.0,
-        0.0
-      ],
+      "axis": [0.0, 1.0, 0.0],
       "limit_lower_rad": -1.5708,
       "limit_upper_rad": 1.5708,
-      "viscous_friction_nm_per_rad_per_s": 0.1,
-      "origin": {
-        "xyz_m": [
-          0.017362132668495178,
-          0.0,
-          -0.007599376142024994
-        ],
-        "rpy_rad": [
-          5.361833158643104e-16,
-          1.5569381436880647,
-          5.360093138439675e-16
-        ]
-      }
+      "viscous_friction_nm_per_rad_per_s": 0.1
     }
   ],
   "motors": [

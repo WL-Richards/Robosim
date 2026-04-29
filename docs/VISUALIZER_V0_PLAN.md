@@ -216,49 +216,59 @@ Commit boundary: snapshot + edit-mode builder + camera + picking (and
 their tests) one commit; renderer + panels one commit; CLI + skill
 update one commit.
 
-### Phase VC — Schema extension: origin transforms
+### Phase VC — Schema extension: origin transforms ✓ LANDED
 
-**Blocker for VD.** The current schema (v1) has no link visual origin
-or joint origin — everything is implicitly at world origin. That's fine
-for the single-DOF arm rendered by Phase VB, but gizmo manipulation
-needs fields to write into.
+**VC1–VC4 are complete.** See `tests/description/TEST_PLAN_VC.md` for
+the full test contracts (rev-4 reviewer-approved, 63+89 = 152 tests
+green across clang/gcc Debug + ASan + UBSan).
 
-1. **VC1. Schema design write-up.** Propose:
-   - `link.visual_origin`: `{ xyz_m: [x, y, z], rpy_rad: [r, p, y] }`,
-     **optional**, defaults to identity.
-   - `joint.origin`: `{ xyz_m: [x, y, z], rpy_rad: [r, p, y] }`,
-     **optional**, defaults to identity. Expressed in the parent
-     link's frame.
-   - Bump `schema_version` from 1 to 2. Loader accepts both; for v1
-     files the optional fields default to identity (no behavioral
-     change for the existing v0-arm).
-   - Update `descriptions/v0-arm.json` to v2 explicitly (origins still
-     identity).
-   - Update `docs/ARCHITECTURE.md` "Robot description format" sketch.
-2. **VC2. Test plan + test-reviewer.** Loader tests for the new
-   optional fields: present-and-valid, present-and-malformed (each
-   sub-field), absent (defaults), v1→v2 forward compatibility, both
-   versions produce equivalent struct when origins are identity.
-3. **VC3. Loader implementation** — extend
-   `src/description/{schema.h,loader.cpp}`. Existing 83-test loader
-   suite must not need changes (defaults preserve behavior).
-4. **VC4. Serializer** — `src/description/serializer.{h,cpp}` exposing
-   `save_to_file(robot_description, path) -> std::expected<void, save_error>`.
-   Serializer test plan + test-reviewer gate. Round-trip property test:
-   `load_from_file(p)` → `save_to_file(d, p')` → `load_from_file(p')`
-   yields a struct equal to the first load. Also: serialized JSON is
-   byte-stable for the same input (canonical key ordering, fixed float
-   formatting), so diff-review of GUI edits is sane.
+1. **VC1. Schema design write-up.** ✓ Done. `origin_pose` POD added to
+   `src/description/schema.h`; `link.visual_origin` and `joint.origin`
+   added as optional fields (default identity per D-VC-2).
+   `descriptions/v0-arm.json` bumped to schema_version 2 (no origin
+   keys — identity is the v0-arm's intent). `docs/ARCHITECTURE.md`
+   updated to show the v2 form.
+2. **VC2. Test plan + test-reviewer.** ✓ Done. `tests/description/
+   TEST_PLAN_VC.md` (rev-4, `ready-to-implement`). Covers V0–V10
+   (loader) and S1a/S1/S2/S3/S4/S5/S6/S8 (serializer).
+3. **VC3. Loader implementation.** ✓ Done. `src/description/loader.cpp`
+   extended for schema_version 2. `src/description/origin_pose.{h,cpp}`
+   expose `compose_origin`, `validate_finite_xyz`, `validate_finite_rpy`.
+   Configure-time lint `cmake/lint_loader_finite_seam.cmake` enforces
+   the D-VC-3 seam call-site pin (no bare `isfinite` etc. in non-helper
+   TUs). 152 tests green.
+4. **VC4. Serializer.** ✓ Done. `src/description/serializer.{h,cpp}`
+   implement `save_to_file` using `nlohmann::ordered_json` (key order
+   per D-VC-8, identity origins omitted per D-VC-9, `dump(2)` per
+   D-VC-10). S8 SHA guard pins `73fd52187ceb...` against pinned
+   nlohmann v3.12 SHA. Non-atomicity documented in
+   `.claude/skills/robot-description-loader.md` (D-VC-11).
 
-Commit boundary: schema + loader extension one commit; serializer one
-commit.
+**VD is now unblocked** — gizmo persistence can write `joint.origin`
+and `link.visual_origin` to disk via `save_to_file`.
 
-**This phase modifies sim-core surfaces** (the loader and schema). It
-goes through the same TDD discipline as V0_PLAN Phase B and the same
-review gates. It is **not** "visualizer work" hidden from sim-core
-review.
+### Phase VD — Gizmo manipulation ✓ LANDED
 
-### Phase VD — Gizmo manipulation
+VD1–VD6 are complete. See `tests/viz/TEST_PLAN_VD.md` (rev-2
+reviewer-approved, `ready-to-implement`) for the full test contract.
+The patch:
+
+- Extended `viz::build_edit_mode_snapshot` to honor schema-v2 origins
+  with the kinematic-vs-visual frame distinction (B section).
+- Added `description::decompose_origin` as the algebraic inverse of
+  `compose_origin` (O section).
+- Added `viz::apply_gizmo_target` (`src/viz/edit_mode_apply.{h,cpp}`)
+  — pure logic for writing gizmo targets back to the description's
+  `joint.origin` / `link.visual_origin` (A section).
+- Added `viz::edit_session` + `load_session` / `save_session` /
+  `reload_session` (`src/viz/edit_session.{h,cpp}`) — load/save/reload
+  state machine with a dirty bit (D section).
+- Wired the above into `src/viz/main.cpp`: gizmo apply route, File
+  menu (Save, Save As text-input modal, Reload-from-disk with
+  Discard-changes confirmation), `Ctrl+S` hotkey.
+- 70+ new tests added, 457/457 viz + description suite green.
+
+Original VD plan retained below for reference:
 
 1. **VD1. Test plan.** Pure logic only here; the rest is ImGuizmo
    integration tested via the smoke test.

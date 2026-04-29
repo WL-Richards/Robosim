@@ -13,8 +13,12 @@
 
 #define GLFW_INCLUDE_NONE
 #include "camera.h"
+#include "description/error.h"
 #include "description/loader.h"
+#include "description/serializer.h"
+#include "edit_mode_apply.h"
 #include "edit_mode_builder.h"
+#include "edit_session.h"
 #include "panels.h"
 #include "picking.h"
 #include "renderer.h"
@@ -25,14 +29,18 @@
 #include <backends/imgui_impl_opengl3.h>
 
 #include <ImGuizmo.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <imgui.h>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -193,7 +201,7 @@ void handle_camera_input(robosim::viz::orbit_camera& camera,
     if (ImGui::IsKeyPressed(ImGuiKey_X)) {
       gizmo.mode = gizmo.mode == ImGuizmo::WORLD ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_S)) {
+    if (ImGui::IsKeyPressed(ImGuiKey_S) && !io.KeyCtrl) {
       gizmo.snap_enabled = !gizmo.snap_enabled;
     }
   }
@@ -230,14 +238,20 @@ void handle_camera_input(robosim::viz::orbit_camera& camera,
   }
 }
 
-void draw_selected_gizmo(const robosim::viz::orbit_camera& camera,
-                         robosim::viz::scene_snapshot& snapshot,
-                         const gizmo_state& gizmo) {
+// Returns true if the gizmo was used this frame; the caller is
+// responsible for calling apply_gizmo_target with `out_target` and
+// rebuilding the snapshot. Splitting the gizmo's UI from the
+// description mutation keeps `apply_gizmo_target` pure (testable) and
+// avoids smearing description-write logic across the input loop.
+bool draw_selected_gizmo(const robosim::viz::orbit_camera& camera,
+                         const robosim::viz::scene_snapshot& snapshot,
+                         const gizmo_state& gizmo,
+                         robosim::viz::transform& out_target) {
   if (!snapshot.selected_index.has_value() || *snapshot.selected_index >= snapshot.nodes.size()) {
-    return;
+    return false;
   }
 
-  auto& selected = snapshot.nodes[*snapshot.selected_index];
+  const auto& selected = snapshot.nodes[*snapshot.selected_index];
   auto view = to_imguizmo_matrix(camera.view_matrix());
   auto projection = to_imguizmo_matrix(camera.projection_matrix());
   auto model = to_imguizmo_matrix(selected.world_from_local.m);
@@ -265,7 +279,145 @@ void draw_selected_gizmo(const robosim::viz::orbit_camera& camera,
                            model.data(),
                            nullptr,
                            snap)) {
-    copy_from_imguizmo_matrix(model, selected.world_from_local);
+    copy_from_imguizmo_matrix(model, out_target);
+    return true;
+  }
+  return false;
+}
+
+struct file_menu_state {
+  // Save As text input buffer. ImGui needs a stable storage slot.
+  std::array<char, 1024> save_as_buffer{};
+  // Reload modal: deferred until the user confirms when dirty.
+  bool wants_reload = false;
+  // Save As modal: open when user clicks Save As.
+  bool wants_save_as = false;
+};
+
+void rebuild_snapshot_from_session(robosim::viz::edit_session& session,
+                                   robosim::viz::scene_snapshot& snapshot) {
+  const auto previous_selection = snapshot.selected_index;
+  snapshot = robosim::viz::build_edit_mode_snapshot(session.description);
+  if (previous_selection.has_value() &&
+      *previous_selection < snapshot.nodes.size()) {
+    snapshot.selected_index = previous_selection;
+  }
+}
+
+void try_save(robosim::viz::edit_session& session,
+              std::string& save_error_message) {
+  auto result = robosim::viz::save_session(session);
+  if (!result.has_value()) {
+    save_error_message = result.error().file_path.string() + ": " +
+                         result.error().message;
+  } else {
+    save_error_message.clear();
+  }
+}
+
+void try_reload(robosim::viz::edit_session& session,
+                robosim::viz::scene_snapshot& snapshot,
+                robosim::viz::panels_state& panels,
+                std::string& save_error_message) {
+  auto result = robosim::viz::reload_session(session);
+  if (!result.has_value()) {
+    panels.load_error_message = load_error_to_string(result.error());
+    return;
+  }
+  panels.load_error_message.clear();
+  save_error_message.clear();
+  rebuild_snapshot_from_session(session, snapshot);
+}
+
+void draw_file_menu(robosim::viz::edit_session& session,
+                    robosim::viz::scene_snapshot& snapshot,
+                    robosim::viz::panels_state& panels,
+                    file_menu_state& menu,
+                    std::string& save_error_message) {
+  if (ImGui::BeginMainMenuBar()) {
+    if (ImGui::BeginMenu("File")) {
+      const bool has_session = !session.source_path.empty() ||
+                               !session.description.name.empty();
+      if (ImGui::MenuItem("Save", "Ctrl+S", false, has_session)) {
+        try_save(session, save_error_message);
+      }
+      if (ImGui::MenuItem("Save As...", nullptr, false, has_session)) {
+        const std::string current = session.source_path.string();
+        const std::size_t copy_len =
+            std::min(current.size(), menu.save_as_buffer.size() - 1);
+        std::copy_n(current.begin(), copy_len, menu.save_as_buffer.begin());
+        menu.save_as_buffer[copy_len] = '\0';
+        menu.wants_save_as = true;
+      }
+      if (ImGui::MenuItem("Reload from disk", nullptr, false, has_session)) {
+        menu.wants_reload = true;
+      }
+      ImGui::EndMenu();
+    }
+    if (session.dirty) {
+      ImGui::Text("  [unsaved changes]");
+    }
+    if (!save_error_message.empty()) {
+      ImGui::TextColored(ImVec4(1.0F, 0.4F, 0.4F, 1.0F),
+                         "  save error: %s",
+                         save_error_message.c_str());
+    }
+    ImGui::EndMainMenuBar();
+  }
+
+  // Save As modal.
+  if (menu.wants_save_as) {
+    ImGui::OpenPopup("Save As");
+    menu.wants_save_as = false;
+  }
+  if (ImGui::BeginPopupModal("Save As", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::Text("Path:");
+    ImGui::SetNextItemWidth(500.0F);
+    ImGui::InputText("##save_as_path",
+                     menu.save_as_buffer.data(),
+                     menu.save_as_buffer.size());
+    if (ImGui::Button("Save")) {
+      session.source_path = menu.save_as_buffer.data();
+      try_save(session, save_error_message);
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
+
+  // Reload-with-confirmation flow.
+  if (menu.wants_reload) {
+    if (session.dirty) {
+      ImGui::OpenPopup("Discard unsaved changes?");
+    } else {
+      try_reload(session, snapshot, panels, save_error_message);
+    }
+    menu.wants_reload = false;
+  }
+  if (ImGui::BeginPopupModal("Discard unsaved changes?",
+                             nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::Text("Reload will discard your unsaved edits. Continue?");
+    if (ImGui::Button("Discard and reload")) {
+      try_reload(session, snapshot, panels, save_error_message);
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
+
+  // Ctrl+S hotkey for Save (only when no popup is consuming input).
+  ImGuiIO& io = ImGui::GetIO();
+  if (!io.WantCaptureKeyboard && io.KeyCtrl &&
+      ImGui::IsKeyPressed(ImGuiKey_S, false) &&
+      (!session.source_path.empty() || !session.description.name.empty())) {
+    try_save(session, save_error_message);
   }
 }
 
@@ -315,13 +467,18 @@ int main(int argc, char** argv) {
   robosim::viz::scene_snapshot snapshot;
   robosim::viz::orbit_camera camera;
   gizmo_state gizmo;
+  robosim::viz::edit_session session;
+  file_menu_state file_menu;
+  std::string save_error_message;
+  bool session_loaded = false;
 
   if (!cli->description_path.empty()) {
     panels.source_path_display = cli->description_path.string();
-    auto loaded = robosim::description::load_from_file(cli->description_path);
+    auto loaded = robosim::viz::load_session(cli->description_path);
     if (loaded.has_value()) {
-      panels.description = *loaded;
-      snapshot = robosim::viz::build_edit_mode_snapshot(*panels.description);
+      session = std::move(*loaded);
+      session_loaded = true;
+      snapshot = robosim::viz::build_edit_mode_snapshot(session.description);
       robosim::viz::frame_fit(camera, robosim::viz::compute_world_aabb(snapshot));
     } else {
       panels.load_error_message = load_error_to_string(loaded.error());
@@ -380,8 +537,8 @@ int main(int argc, char** argv) {
   //   ~renderer → ImGui_ImplOpenGL3_Shutdown → glfwDestroyWindow.
   {
     robosim::viz::renderer scene_renderer;
-    if (panels.description.has_value()) {
-      const std::string title = "robosim-viz - " + panels.description->name + " [edit]";
+    if (session_loaded) {
+      const std::string title = "robosim-viz - " + session.description.name + " [edit]";
       glfwSetWindowTitle(window, title.c_str());
     }
 
@@ -410,9 +567,31 @@ int main(int argc, char** argv) {
 
       ImGui::DockSpaceOverViewport(
           0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+
+      // Sync the panels' inspector data each frame from the session
+      // (cheap; description is small).
+      panels.description =
+          session_loaded ? std::optional{session.description} : std::nullopt;
+      panels.source_path_display = session.source_path.string();
+
+      if (session_loaded) {
+        draw_file_menu(session, snapshot, panels, file_menu, save_error_message);
+      }
       robosim::viz::draw_panels(panels, snapshot);
       draw_gizmo_controls(gizmo);
-      draw_selected_gizmo(camera, snapshot, gizmo);
+
+      // Gizmo apply: capture the new world transform into target,
+      // route through pure apply_gizmo_target, rebuild snapshot.
+      robosim::viz::transform target = snapshot.selected_index.has_value()
+          ? snapshot.nodes[*snapshot.selected_index].world_from_local
+          : robosim::viz::transform::identity();
+      if (draw_selected_gizmo(camera, snapshot, gizmo, target) &&
+          session_loaded && snapshot.selected_index.has_value()) {
+        session.description = robosim::viz::apply_gizmo_target(
+            session.description, snapshot, *snapshot.selected_index, target);
+        session.dirty = true;
+        rebuild_snapshot_from_session(session, snapshot);
+      }
 
       ImGui::Render();
       ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

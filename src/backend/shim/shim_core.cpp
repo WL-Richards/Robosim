@@ -74,10 +74,38 @@ std::expected<void, shim_error> shim_core::poll() {
         latest_clock_state_ = state;
         return {};
       }
+      if (env.payload_schema == schema_id::power_state) {
+        power_state state{};
+        std::memcpy(&state, received->payload.data(), sizeof(power_state));
+        latest_power_state_ = state;
+        return {};
+      }
+      if (env.payload_schema == schema_id::ds_state) {
+        ds_state state{};
+        std::memcpy(&state, received->payload.data(), sizeof(ds_state));
+        latest_ds_state_ = state;
+        return {};
+      }
+      if (env.payload_schema == schema_id::can_frame_batch) {
+        // Variable-size schema: copy received->payload.size() bytes (the
+        // active prefix), not sizeof(can_frame_batch). The state{} zero-
+        // init covers per-frame padding bytes and unused frames[count..63]
+        // (D-C4-2 / D-C4-PADDING).
+        can_frame_batch state{};
+        std::memcpy(&state, received->payload.data(), received->payload.size());
+        latest_can_frame_batch_ = state;
+        return {};
+      }
+      if (env.payload_schema == schema_id::can_status) {
+        can_status state{};
+        std::memcpy(&state, received->payload.data(), sizeof(can_status));
+        latest_can_status_ = state;
+        return {};
+      }
       return std::unexpected(shim_error{shim_error_kind::unsupported_payload_schema,
                                         std::nullopt,
                                         "payload_schema",
-                                        "shim cycle 1 only handles clock_state under tick_boundary"});
+                                        "shim does not yet handle this schema under tick_boundary"});
 
     case envelope_kind::shutdown:
       shutdown_observed_ = true;
@@ -101,6 +129,22 @@ bool shim_core::is_shutting_down() const {
 
 const std::optional<clock_state>& shim_core::latest_clock_state() const {
   return latest_clock_state_;
+}
+
+const std::optional<power_state>& shim_core::latest_power_state() const {
+  return latest_power_state_;
+}
+
+const std::optional<ds_state>& shim_core::latest_ds_state() const {
+  return latest_ds_state_;
+}
+
+const std::optional<can_frame_batch>& shim_core::latest_can_frame_batch() const {
+  return latest_can_frame_batch_;
+}
+
+const std::optional<can_status>& shim_core::latest_can_status() const {
+  return latest_can_status_;
 }
 
 }  // namespace robosim::backend::shim
