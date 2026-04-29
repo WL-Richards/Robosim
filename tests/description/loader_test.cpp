@@ -1,5 +1,6 @@
-#include "error.h"
 #include "loader.h"
+
+#include "error.h"
 #include "schema.h"
 
 #include <gmock/gmock.h>
@@ -29,7 +30,7 @@ using ::testing::HasSubstr;
 #error "ROBOSIM_V0_ARM_FIXTURE_PATH not defined; CMake target setup is broken."
 #endif
 
-constexpr const char* kV0ArmFixturePath = ROBOSIM_V0_ARM_FIXTURE_PATH;
+constexpr const char* v0_arm_fixture_path = ROBOSIM_V0_ARM_FIXTURE_PATH;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,13 +99,12 @@ void set_at(json& j, std::string_view pointer, const json& value) {
 }
 
 // Per-test temp dir, RAII-cleaned. All "modified fixture" tests write here.
-class LoaderTest : public ::testing::Test {
+class loader_test : public ::testing::Test {
  protected:
   void SetUp() override {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
     tmp_dir_ = fs::temp_directory_path() /
-               (std::string("robosim_loader_test_") + info->test_suite_name() +
-                "_" + info->name());
+               (std::string("robosim_loader_test_") + info->test_suite_name() + "_" + info->name());
     fs::remove_all(tmp_dir_);
     fs::create_directories(tmp_dir_);
   }
@@ -117,7 +117,7 @@ class LoaderTest : public ::testing::Test {
   // Serialize j to a temp file and load it. Returns the result so the test
   // can assert on the success/error shape.
   std::expected<robot_description, load_error> load_json(const json& j,
-                                                          std::string_view name = "robot.json") {
+                                                         std::string_view name = "robot.json") {
     const auto path = tmp_dir_ / std::string(name);
     std::ofstream out(path);
     out << j.dump(2);
@@ -137,9 +137,8 @@ class LoaderTest : public ::testing::Test {
 void expect_error_shape(const std::expected<robot_description, load_error>& result,
                         load_error_kind expected_kind,
                         std::string_view expected_pointer) {
-  ASSERT_FALSE(result.has_value())
-      << "expected error " << static_cast<int>(expected_kind)
-      << " at " << expected_pointer << " but got success";
+  ASSERT_FALSE(result.has_value()) << "expected error " << static_cast<int>(expected_kind) << " at "
+                                   << expected_pointer << " but got success";
   EXPECT_EQ(result.error().kind, expected_kind);
   EXPECT_EQ(result.error().json_pointer, expected_pointer);
   EXPECT_FALSE(result.error().message.empty()) << "error message must be non-empty";
@@ -157,9 +156,8 @@ void expect_message_contains(const load_error& e, std::initializer_list<std::str
 // ===========================================================================
 
 TEST(RobotDescriptionLoader, A1_loads_minimal_valid_v0_arm) {
-  const auto result = load_from_file(kV0ArmFixturePath);
-  ASSERT_TRUE(result.has_value())
-      << "load failed: " << (result ? "" : result.error().message);
+  const auto result = load_from_file(v0_arm_fixture_path);
+  ASSERT_TRUE(result.has_value()) << "load failed: " << (result ? "" : result.error().message);
 
   const auto& d = *result;
   EXPECT_EQ(d.schema_version, 1);
@@ -202,7 +200,7 @@ TEST(RobotDescriptionLoader, A1_loads_minimal_valid_v0_arm) {
   EXPECT_EQ(d.sensors[0].joint_name, "shoulder");
 }
 
-TEST_F(LoaderTest, A1b_accepts_json_integer_literal_in_float_field) {
+TEST_F(loader_test, A1b_accepts_json_integer_literal_in_float_field) {
   // Decision #6: JSON integer literals are accepted in float fields. mass_kg: 2
   // parses to 2.0.
   auto j = make_v0_arm_json();
@@ -216,7 +214,7 @@ TEST_F(LoaderTest, A1b_accepts_json_integer_literal_in_float_field) {
 // B. Schema version
 // ===========================================================================
 
-TEST_F(LoaderTest, B1_rejects_when_schema_version_unsupported) {
+TEST_F(loader_test, B1_rejects_when_schema_version_unsupported) {
   auto j = make_v0_arm_json();
   j["schema_version"] = 999;
   const auto result = load_json(j);
@@ -224,7 +222,7 @@ TEST_F(LoaderTest, B1_rejects_when_schema_version_unsupported) {
   expect_message_contains(result.error(), {"999"});
 }
 
-TEST_F(LoaderTest, B1b_schema_version_gate_runs_before_field_validation) {
+TEST_F(loader_test, B1b_schema_version_gate_runs_before_field_validation) {
   // The schema-version gate must fire before deeper field validation. A
   // document with both an unsupported version and a missing required field
   // should report the version error, not the missing-field error.
@@ -240,14 +238,15 @@ TEST_F(LoaderTest, B1b_schema_version_gate_runs_before_field_validation) {
 // C. Required-field validation (parameterized)
 // ===========================================================================
 
-struct RequiredFieldCase {
+struct required_field_case {
   std::string field_path_to_remove;
   std::string expected_pointer;
 };
 
-class RequiredFieldTest : public LoaderTest, public ::testing::WithParamInterface<RequiredFieldCase> {};
+class required_field_test : public loader_test,
+                            public ::testing::WithParamInterface<required_field_case> {};
 
-TEST_P(RequiredFieldTest, C1_rejects_when_required_field_missing) {
+TEST_P(required_field_test, C1_rejects_when_required_field_missing) {
   const auto& [field, ptr] = GetParam();
   auto j = make_v0_arm_json();
   erase_at(j, "/" + field);
@@ -260,55 +259,57 @@ TEST_P(RequiredFieldTest, C1_rejects_when_required_field_missing) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RequiredFields, RequiredFieldTest,
+    RequiredFields,
+    required_field_test,
     ::testing::Values(
-        RequiredFieldCase{"schema_version", "/schema_version"},
-        RequiredFieldCase{"name", "/name"},
-        RequiredFieldCase{"links", "/links"},
-        RequiredFieldCase{"joints", "/joints"},
-        RequiredFieldCase{"motors", "/motors"},
-        RequiredFieldCase{"sensors", "/sensors"},
-        RequiredFieldCase{"links/0/name", "/links/0/name"},
-        RequiredFieldCase{"links/0/mass_kg", "/links/0/mass_kg"},
-        RequiredFieldCase{"links/0/length_m", "/links/0/length_m"},
-        RequiredFieldCase{"links/0/inertia_kgm2", "/links/0/inertia_kgm2"},
-        RequiredFieldCase{"joints/0/name", "/joints/0/name"},
-        RequiredFieldCase{"joints/0/type", "/joints/0/type"},
-        RequiredFieldCase{"joints/0/parent", "/joints/0/parent"},
-        RequiredFieldCase{"joints/0/child", "/joints/0/child"},
-        RequiredFieldCase{"joints/0/axis", "/joints/0/axis"},
-        RequiredFieldCase{"joints/0/limit_lower_rad", "/joints/0/limit_lower_rad"},
-        RequiredFieldCase{"joints/0/limit_upper_rad", "/joints/0/limit_upper_rad"},
-        RequiredFieldCase{"joints/0/viscous_friction_nm_per_rad_per_s",
-                          "/joints/0/viscous_friction_nm_per_rad_per_s"},
-        RequiredFieldCase{"motors/0/name", "/motors/0/name"},
-        RequiredFieldCase{"motors/0/motor_model", "/motors/0/motor_model"},
-        RequiredFieldCase{"motors/0/controller", "/motors/0/controller"},
-        RequiredFieldCase{"motors/0/controller_can_id", "/motors/0/controller_can_id"},
-        RequiredFieldCase{"motors/0/controller_firmware_version",
-                          "/motors/0/controller_firmware_version"},
-        RequiredFieldCase{"motors/0/joint", "/motors/0/joint"},
-        RequiredFieldCase{"motors/0/gear_ratio", "/motors/0/gear_ratio"},
-        RequiredFieldCase{"sensors/0/name", "/sensors/0/name"},
-        RequiredFieldCase{"sensors/0/sensor_model", "/sensors/0/sensor_model"},
-        RequiredFieldCase{"sensors/0/controller_can_id", "/sensors/0/controller_can_id"},
-        RequiredFieldCase{"sensors/0/controller_firmware_version",
-                          "/sensors/0/controller_firmware_version"},
-        RequiredFieldCase{"sensors/0/joint", "/sensors/0/joint"}));
+        required_field_case{"schema_version", "/schema_version"},
+        required_field_case{"name", "/name"},
+        required_field_case{"links", "/links"},
+        required_field_case{"joints", "/joints"},
+        required_field_case{"motors", "/motors"},
+        required_field_case{"sensors", "/sensors"},
+        required_field_case{"links/0/name", "/links/0/name"},
+        required_field_case{"links/0/mass_kg", "/links/0/mass_kg"},
+        required_field_case{"links/0/length_m", "/links/0/length_m"},
+        required_field_case{"links/0/inertia_kgm2", "/links/0/inertia_kgm2"},
+        required_field_case{"joints/0/name", "/joints/0/name"},
+        required_field_case{"joints/0/type", "/joints/0/type"},
+        required_field_case{"joints/0/parent", "/joints/0/parent"},
+        required_field_case{"joints/0/child", "/joints/0/child"},
+        required_field_case{"joints/0/axis", "/joints/0/axis"},
+        required_field_case{"joints/0/limit_lower_rad", "/joints/0/limit_lower_rad"},
+        required_field_case{"joints/0/limit_upper_rad", "/joints/0/limit_upper_rad"},
+        required_field_case{"joints/0/viscous_friction_nm_per_rad_per_s",
+                            "/joints/0/viscous_friction_nm_per_rad_per_s"},
+        required_field_case{"motors/0/name", "/motors/0/name"},
+        required_field_case{"motors/0/motor_model", "/motors/0/motor_model"},
+        required_field_case{"motors/0/controller", "/motors/0/controller"},
+        required_field_case{"motors/0/controller_can_id", "/motors/0/controller_can_id"},
+        required_field_case{"motors/0/controller_firmware_version",
+                            "/motors/0/controller_firmware_version"},
+        required_field_case{"motors/0/joint", "/motors/0/joint"},
+        required_field_case{"motors/0/gear_ratio", "/motors/0/gear_ratio"},
+        required_field_case{"sensors/0/name", "/sensors/0/name"},
+        required_field_case{"sensors/0/sensor_model", "/sensors/0/sensor_model"},
+        required_field_case{"sensors/0/controller_can_id", "/sensors/0/controller_can_id"},
+        required_field_case{"sensors/0/controller_firmware_version",
+                            "/sensors/0/controller_firmware_version"},
+        required_field_case{"sensors/0/joint", "/sensors/0/joint"}));
 
 // ===========================================================================
 // D. Type-mismatch validation (parameterized)
 // ===========================================================================
 
-struct TypeMismatchCase {
+struct type_mismatch_case {
   std::string field_path;
   json replacement;
   std::string expected_pointer;
 };
 
-class TypeMismatchTest : public LoaderTest, public ::testing::WithParamInterface<TypeMismatchCase> {};
+class type_mismatch_test : public loader_test,
+                           public ::testing::WithParamInterface<type_mismatch_case> {};
 
-TEST_P(TypeMismatchTest, D1_rejects_when_field_type_mismatched) {
+TEST_P(type_mismatch_test, D1_rejects_when_field_type_mismatched) {
   const auto& [field, replacement, ptr] = GetParam();
   auto j = make_v0_arm_json();
   set_at(j, "/" + field, replacement);
@@ -320,23 +321,24 @@ TEST_P(TypeMismatchTest, D1_rejects_when_field_type_mismatched) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    TypeMismatches, TypeMismatchTest,
+    TypeMismatches,
+    type_mismatch_test,
     ::testing::Values(
-        TypeMismatchCase{"schema_version", 1.0, "/schema_version"},
-        TypeMismatchCase{"links/0/mass_kg", "two", "/links/0/mass_kg"},
-        TypeMismatchCase{"joints/0/axis", 1.0, "/joints/0/axis"},
-        TypeMismatchCase{"joints/0/axis", "y", "/joints/0/axis"},
-        TypeMismatchCase{"joints/0/axis", json::array({1.0, 0.0}), "/joints/0/axis"},
-        TypeMismatchCase{"motors/0/controller_can_id", "1", "/motors/0/controller_can_id"},
-        TypeMismatchCase{"motors/0/controller_can_id", 1.5, "/motors/0/controller_can_id"},
-        TypeMismatchCase{"motors/0/controller_can_id", 1.0, "/motors/0/controller_can_id"},
-        TypeMismatchCase{"motors/0/gear_ratio", true, "/motors/0/gear_ratio"}));
+        type_mismatch_case{"schema_version", 1.0, "/schema_version"},
+        type_mismatch_case{"links/0/mass_kg", "two", "/links/0/mass_kg"},
+        type_mismatch_case{"joints/0/axis", 1.0, "/joints/0/axis"},
+        type_mismatch_case{"joints/0/axis", "y", "/joints/0/axis"},
+        type_mismatch_case{"joints/0/axis", json::array({1.0, 0.0}), "/joints/0/axis"},
+        type_mismatch_case{"motors/0/controller_can_id", "1", "/motors/0/controller_can_id"},
+        type_mismatch_case{"motors/0/controller_can_id", 1.5, "/motors/0/controller_can_id"},
+        type_mismatch_case{"motors/0/controller_can_id", 1.0, "/motors/0/controller_can_id"},
+        type_mismatch_case{"motors/0/gear_ratio", true, "/motors/0/gear_ratio"}));
 
 // ===========================================================================
 // E. Reference integrity
 // ===========================================================================
 
-TEST_F(LoaderTest, E1_rejects_motor_referencing_unknown_joint) {
+TEST_F(loader_test, E1_rejects_motor_referencing_unknown_joint) {
   auto j = make_v0_arm_json();
   j["motors"][0]["joint"] = "no_such_joint";
   const auto result = load_json(j);
@@ -344,7 +346,7 @@ TEST_F(LoaderTest, E1_rejects_motor_referencing_unknown_joint) {
   expect_message_contains(result.error(), {"shoulder_motor", "no_such_joint"});
 }
 
-TEST_F(LoaderTest, E2_rejects_sensor_referencing_unknown_joint) {
+TEST_F(loader_test, E2_rejects_sensor_referencing_unknown_joint) {
   auto j = make_v0_arm_json();
   j["sensors"][0]["joint"] = "no_such_joint";
   const auto result = load_json(j);
@@ -352,7 +354,7 @@ TEST_F(LoaderTest, E2_rejects_sensor_referencing_unknown_joint) {
   expect_message_contains(result.error(), {"shoulder_encoder", "no_such_joint"});
 }
 
-TEST_F(LoaderTest, E3_rejects_joint_referencing_unknown_link_via_child) {
+TEST_F(loader_test, E3_rejects_joint_referencing_unknown_link_via_child) {
   auto j = make_v0_arm_json();
   j["joints"][0]["child"] = "no_such_link";
   const auto result = load_json(j);
@@ -360,22 +362,21 @@ TEST_F(LoaderTest, E3_rejects_joint_referencing_unknown_link_via_child) {
   expect_message_contains(result.error(), {"shoulder", "no_such_link"});
 }
 
-TEST_F(LoaderTest, E3b_rejects_joint_referencing_unknown_link_via_parent) {
+TEST_F(loader_test, E3b_rejects_joint_referencing_unknown_link_via_parent) {
   // Build a fixture with a second link "forearm" and a second joint "elbow"
   // whose parent is dangling. The distinct joint name avoids tripping the
   // duplicate-name check (decision #11) before the reference check fires.
   auto j = make_v0_arm_json();
-  j["links"].push_back({
-      {"name", "forearm"}, {"mass_kg", 1.0}, {"length_m", 0.3}, {"inertia_kgm2", 0.05}});
-  j["joints"].push_back({
-      {"name", "elbow"},
-      {"type", "revolute"},
-      {"parent", "no_such_link"},
-      {"child", "forearm"},
-      {"axis", json::array({0.0, 1.0, 0.0})},
-      {"limit_lower_rad", -1.0},
-      {"limit_upper_rad", 1.0},
-      {"viscous_friction_nm_per_rad_per_s", 0.05}});
+  j["links"].push_back(
+      {{"name", "forearm"}, {"mass_kg", 1.0}, {"length_m", 0.3}, {"inertia_kgm2", 0.05}});
+  j["joints"].push_back({{"name", "elbow"},
+                         {"type", "revolute"},
+                         {"parent", "no_such_link"},
+                         {"child", "forearm"},
+                         {"axis", json::array({0.0, 1.0, 0.0})},
+                         {"limit_lower_rad", -1.0},
+                         {"limit_upper_rad", 1.0},
+                         {"viscous_friction_nm_per_rad_per_s", 0.05}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::reference_error, "/joints/1/parent");
   expect_message_contains(result.error(), {"elbow", "no_such_link"});
@@ -385,12 +386,12 @@ TEST(RobotDescriptionLoader, E4_accepts_world_as_special_parent_in_joint) {
   // Coverage-only: pins the magic-string contract against a future "tighten
   // everything" refactor that drops the special case. A1 already exercises
   // this implicitly.
-  const auto result = load_from_file(kV0ArmFixturePath);
+  const auto result = load_from_file(v0_arm_fixture_path);
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joints[0].parent, "world");
 }
 
-TEST_F(LoaderTest, E4b_rejects_world_as_joint_child) {
+TEST_F(loader_test, E4b_rejects_world_as_joint_child) {
   auto j = make_v0_arm_json();
   j["joints"][0]["child"] = "world";
   const auto result = load_json(j);
@@ -402,22 +403,21 @@ TEST_F(LoaderTest, E4b_rejects_world_as_joint_child) {
 // F. Conflicts (per decision #2: validator reports the second offender)
 // ===========================================================================
 
-TEST_F(LoaderTest, F1_rejects_two_motors_with_same_can_id) {
+TEST_F(loader_test, F1_rejects_two_motors_with_same_can_id) {
   auto j = make_v0_arm_json();
-  j["motors"].push_back({
-      {"name", "shoulder_motor_2"},
-      {"motor_model", "kraken_x60"},
-      {"controller", "talon_fx"},
-      {"controller_can_id", 1},  // duplicate
-      {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
-      {"joint", "shoulder"},
-      {"gear_ratio", 100.0}});
+  j["motors"].push_back({{"name", "shoulder_motor_2"},
+                         {"motor_model", "kraken_x60"},
+                         {"controller", "talon_fx"},
+                         {"controller_can_id", 1},  // duplicate
+                         {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
+                         {"joint", "shoulder"},
+                         {"gear_ratio", 100.0}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/motors/1/controller_can_id");
   expect_message_contains(result.error(), {"shoulder_motor", "shoulder_motor_2", "1"});
 }
 
-TEST_F(LoaderTest, F2_rejects_motor_and_sensor_with_same_can_id) {
+TEST_F(loader_test, F2_rejects_motor_and_sensor_with_same_can_id) {
   auto j = make_v0_arm_json();
   j["sensors"][0]["controller_can_id"] = 1;  // matches the motor's ID
   const auto result = load_json(j);
@@ -425,14 +425,13 @@ TEST_F(LoaderTest, F2_rejects_motor_and_sensor_with_same_can_id) {
   expect_message_contains(result.error(), {"shoulder_motor", "shoulder_encoder", "1"});
 }
 
-TEST_F(LoaderTest, F3_rejects_two_sensors_with_same_can_id) {
+TEST_F(loader_test, F3_rejects_two_sensors_with_same_can_id) {
   auto j = make_v0_arm_json();
-  j["sensors"].push_back({
-      {"name", "shoulder_encoder_2"},
-      {"sensor_model", "cancoder"},
-      {"controller_can_id", 2},  // duplicate of sensors[0]
-      {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
-      {"joint", "shoulder"}});
+  j["sensors"].push_back({{"name", "shoulder_encoder_2"},
+                          {"sensor_model", "cancoder"},
+                          {"controller_can_id", 2},  // duplicate of sensors[0]
+                          {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
+                          {"joint", "shoulder"}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/sensors/1/controller_can_id");
   expect_message_contains(result.error(), {"shoulder_encoder", "shoulder_encoder_2", "2"});
@@ -442,7 +441,7 @@ TEST_F(LoaderTest, F3_rejects_two_sensors_with_same_can_id) {
 // G. File and JSON-level errors
 // ===========================================================================
 
-TEST_F(LoaderTest, G1_rejects_when_file_not_found) {
+TEST_F(loader_test, G1_rejects_when_file_not_found) {
   const auto missing = tmp_dir_ / "definitely_not_here.json";
   ASSERT_FALSE(fs::exists(missing));
   const auto result = load_from_file(missing);
@@ -450,13 +449,14 @@ TEST_F(LoaderTest, G1_rejects_when_file_not_found) {
   EXPECT_EQ(result.error().file_path, missing);
 }
 
-struct MalformedJsonCase {
+struct malformed_json_case {
   std::string contents;
 };
 
-class MalformedJsonTest : public LoaderTest, public ::testing::WithParamInterface<MalformedJsonCase> {};
+class malformed_json_test : public loader_test,
+                            public ::testing::WithParamInterface<malformed_json_case> {};
 
-TEST_P(MalformedJsonTest, G2_rejects_when_json_syntactically_invalid) {
+TEST_P(malformed_json_test, G2_rejects_when_json_syntactically_invalid) {
   const auto path = tmp_dir_ / "bad.json";
   std::ofstream out(path);
   out << GetParam().contents;
@@ -466,10 +466,11 @@ TEST_P(MalformedJsonTest, G2_rejects_when_json_syntactically_invalid) {
   EXPECT_EQ(result.error().file_path, path);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    MalformedJson, MalformedJsonTest,
-    ::testing::Values(MalformedJsonCase{"{"},                  // single-byte truncation
-                      MalformedJsonCase{R"({"name": })"}));    // missing value, multi-char
+INSTANTIATE_TEST_SUITE_P(MalformedJson,
+                         malformed_json_test,
+                         ::testing::Values(malformed_json_case{"{"},  // single-byte truncation
+                                           malformed_json_case{
+                                               R"({"name": })"}));  // missing value, multi-char
 
 // ===========================================================================
 // H. Determinism
@@ -482,7 +483,7 @@ TEST(RobotDescriptionLoader, H1_loads_deterministically) {
   std::vector<robot_description> loads;
   loads.reserve(8);
   for (int i = 0; i < 8; ++i) {
-    auto result = load_from_file(kV0ArmFixturePath);
+    auto result = load_from_file(v0_arm_fixture_path);
     ASSERT_TRUE(result.has_value()) << "load " << i << " failed";
     loads.push_back(*std::move(result));
   }
@@ -491,7 +492,7 @@ TEST(RobotDescriptionLoader, H1_loads_deterministically) {
   }
 }
 
-TEST_F(LoaderTest, H2_error_reporting_is_deterministic) {
+TEST_F(loader_test, H2_error_reporting_is_deterministic) {
   // Pins decision #2 from the validator side: same invalid document, same
   // reported error every time. Uses the F2 fixture (motor + sensor sharing
   // CAN ID 1).
@@ -519,7 +520,7 @@ TEST_F(LoaderTest, H2_error_reporting_is_deterministic) {
 // I. Empty / missing arrays
 // ===========================================================================
 
-TEST_F(LoaderTest, I1_accepts_description_with_empty_motors_and_sensors) {
+TEST_F(loader_test, I1_accepts_description_with_empty_motors_and_sensors) {
   auto j = make_v0_arm_json();
   j["motors"] = json::array();
   j["sensors"] = json::array();
@@ -529,7 +530,7 @@ TEST_F(LoaderTest, I1_accepts_description_with_empty_motors_and_sensors) {
   EXPECT_TRUE(result->sensors.empty());
 }
 
-TEST_F(LoaderTest, I2_rejects_when_links_empty) {
+TEST_F(loader_test, I2_rejects_when_links_empty) {
   auto j = make_v0_arm_json();
   j["links"] = json::array();
   const auto result = load_json(j);
@@ -537,7 +538,7 @@ TEST_F(LoaderTest, I2_rejects_when_links_empty) {
   expect_message_contains(result.error(), {"links"});
 }
 
-TEST_F(LoaderTest, I3_rejects_when_joints_empty) {
+TEST_F(loader_test, I3_rejects_when_joints_empty) {
   auto j = make_v0_arm_json();
   j["joints"] = json::array();
   // Empty motors/sensors so reference checks don't fire first.
@@ -552,15 +553,15 @@ TEST_F(LoaderTest, I3_rejects_when_joints_empty) {
 // J. Domain-range validation
 // ===========================================================================
 
-struct DomainCase {
+struct domain_case {
   std::string field_path;
   json replacement;
   std::string expected_pointer;
 };
 
-class DomainTest : public LoaderTest, public ::testing::WithParamInterface<DomainCase> {};
+class domain_test : public loader_test, public ::testing::WithParamInterface<domain_case> {};
 
-TEST_P(DomainTest, J1_rejects_when_value_outside_allowed_range) {
+TEST_P(domain_test, J1_rejects_when_value_outside_allowed_range) {
   const auto& [field, replacement, ptr] = GetParam();
   auto j = make_v0_arm_json();
   set_at(j, "/" + field, replacement);
@@ -572,25 +573,25 @@ TEST_P(DomainTest, J1_rejects_when_value_outside_allowed_range) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    DomainRanges, DomainTest,
-    ::testing::Values(
-        DomainCase{"links/0/mass_kg", -2.0, "/links/0/mass_kg"},
-        DomainCase{"links/0/mass_kg", 0.0, "/links/0/mass_kg"},
-        DomainCase{"links/0/inertia_kgm2", 0.0, "/links/0/inertia_kgm2"},
-        DomainCase{"links/0/length_m", -0.5, "/links/0/length_m"},
-        DomainCase{"motors/0/controller_can_id", -1, "/motors/0/controller_can_id"},
-        DomainCase{"motors/0/controller_can_id", 64, "/motors/0/controller_can_id"},
-        DomainCase{"motors/0/gear_ratio", 0.0, "/motors/0/gear_ratio"},
-        DomainCase{"motors/0/gear_ratio", -1.0, "/motors/0/gear_ratio"}));
+    DomainRanges,
+    domain_test,
+    ::testing::Values(domain_case{"links/0/mass_kg", -2.0, "/links/0/mass_kg"},
+                      domain_case{"links/0/mass_kg", 0.0, "/links/0/mass_kg"},
+                      domain_case{"links/0/inertia_kgm2", 0.0, "/links/0/inertia_kgm2"},
+                      domain_case{"links/0/length_m", -0.5, "/links/0/length_m"},
+                      domain_case{"motors/0/controller_can_id", -1, "/motors/0/controller_can_id"},
+                      domain_case{"motors/0/controller_can_id", 64, "/motors/0/controller_can_id"},
+                      domain_case{"motors/0/gear_ratio", 0.0, "/motors/0/gear_ratio"},
+                      domain_case{"motors/0/gear_ratio", -1.0, "/motors/0/gear_ratio"}));
 
-struct CanIdBoundaryCase {
+struct can_id_boundary_case {
   int can_id;
 };
 
-class CanIdBoundaryTest : public LoaderTest,
-                          public ::testing::WithParamInterface<CanIdBoundaryCase> {};
+class can_id_boundary_test : public loader_test,
+                             public ::testing::WithParamInterface<can_id_boundary_case> {};
 
-TEST_P(CanIdBoundaryTest, J1b_accepts_can_id_boundaries) {
+TEST_P(can_id_boundary_test, J1b_accepts_can_id_boundaries) {
   // Pins decision #10 from the positive side: 0 and 63 are both inside the
   // inclusive range and accepted.
   auto j = make_v0_arm_json();
@@ -602,11 +603,11 @@ TEST_P(CanIdBoundaryTest, J1b_accepts_can_id_boundaries) {
   EXPECT_EQ(result->motors[0].controller_can_id, GetParam().can_id);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    CanIdBoundaries, CanIdBoundaryTest,
-    ::testing::Values(CanIdBoundaryCase{0}, CanIdBoundaryCase{63}));
+INSTANTIATE_TEST_SUITE_P(CanIdBoundaries,
+                         can_id_boundary_test,
+                         ::testing::Values(can_id_boundary_case{0}, can_id_boundary_case{63}));
 
-TEST_F(LoaderTest, J2_accepts_equal_joint_limits) {
+TEST_F(loader_test, J2_accepts_equal_joint_limits) {
   // Decision #7 case A: lower == upper is a deliberate fixed-joint declaration.
   auto j = make_v0_arm_json();
   j["joints"][0]["limit_lower_rad"] = 0.5;
@@ -617,7 +618,7 @@ TEST_F(LoaderTest, J2_accepts_equal_joint_limits) {
   EXPECT_EQ(result->joints[0].limit_upper_rad, 0.5);
 }
 
-TEST_F(LoaderTest, J2_rejects_inverted_joint_limits) {
+TEST_F(loader_test, J2_rejects_inverted_joint_limits) {
   // Decision #7 case B: lower > upper is a typo. Per second-offender rule,
   // pointer is /limit_upper_rad (parsed after lower).
   auto j = make_v0_arm_json();
@@ -632,64 +633,60 @@ TEST_F(LoaderTest, J2_rejects_inverted_joint_limits) {
 // K. Duplicate names (per-kind uniqueness; decision #11)
 // ===========================================================================
 
-TEST_F(LoaderTest, K1_rejects_duplicate_link_name) {
+TEST_F(loader_test, K1_rejects_duplicate_link_name) {
   // Add a second link with duplicate name "arm". Add a second joint that
   // references it consistently so no reference error fires first.
   auto j = make_v0_arm_json();
-  j["links"].push_back({
-      {"name", "arm"},  // duplicate
-      {"mass_kg", 1.0},
-      {"length_m", 0.3},
-      {"inertia_kgm2", 0.05}});
+  j["links"].push_back({{"name", "arm"},  // duplicate
+                        {"mass_kg", 1.0},
+                        {"length_m", 0.3},
+                        {"inertia_kgm2", 0.05}});
   // The duplicate-link check fires before any further validation.
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/links/1/name");
   expect_message_contains(result.error(), {"arm"});
 }
 
-TEST_F(LoaderTest, K1_rejects_duplicate_joint_name) {
+TEST_F(loader_test, K1_rejects_duplicate_joint_name) {
   // Two joints named "shoulder", with otherwise valid distinct geometry.
   auto j = make_v0_arm_json();
-  j["links"].push_back({
-      {"name", "forearm"}, {"mass_kg", 1.0}, {"length_m", 0.3}, {"inertia_kgm2", 0.05}});
-  j["joints"].push_back({
-      {"name", "shoulder"},  // duplicate
-      {"type", "revolute"},
-      {"parent", "arm"},
-      {"child", "forearm"},
-      {"axis", json::array({0.0, 1.0, 0.0})},
-      {"limit_lower_rad", -1.0},
-      {"limit_upper_rad", 1.0},
-      {"viscous_friction_nm_per_rad_per_s", 0.05}});
+  j["links"].push_back(
+      {{"name", "forearm"}, {"mass_kg", 1.0}, {"length_m", 0.3}, {"inertia_kgm2", 0.05}});
+  j["joints"].push_back({{"name", "shoulder"},  // duplicate
+                         {"type", "revolute"},
+                         {"parent", "arm"},
+                         {"child", "forearm"},
+                         {"axis", json::array({0.0, 1.0, 0.0})},
+                         {"limit_lower_rad", -1.0},
+                         {"limit_upper_rad", 1.0},
+                         {"viscous_friction_nm_per_rad_per_s", 0.05}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/joints/1/name");
   expect_message_contains(result.error(), {"shoulder"});
 }
 
-TEST_F(LoaderTest, K1_rejects_duplicate_motor_name) {
+TEST_F(loader_test, K1_rejects_duplicate_motor_name) {
   // Distinct CAN ID so the duplicate-name conflict is the only conflict.
   auto j = make_v0_arm_json();
-  j["motors"].push_back({
-      {"name", "shoulder_motor"},  // duplicate
-      {"motor_model", "kraken_x60"},
-      {"controller", "talon_fx"},
-      {"controller_can_id", 3},  // distinct from existing 1 and 2
-      {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
-      {"joint", "shoulder"},
-      {"gear_ratio", 100.0}});
+  j["motors"].push_back({{"name", "shoulder_motor"},  // duplicate
+                         {"motor_model", "kraken_x60"},
+                         {"controller", "talon_fx"},
+                         {"controller_can_id", 3},  // distinct from existing 1 and 2
+                         {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
+                         {"joint", "shoulder"},
+                         {"gear_ratio", 100.0}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/motors/1/name");
   expect_message_contains(result.error(), {"shoulder_motor"});
 }
 
-TEST_F(LoaderTest, K1_rejects_duplicate_sensor_name) {
+TEST_F(loader_test, K1_rejects_duplicate_sensor_name) {
   auto j = make_v0_arm_json();
-  j["sensors"].push_back({
-      {"name", "shoulder_encoder"},  // duplicate
-      {"sensor_model", "cancoder"},
-      {"controller_can_id", 4},  // distinct
-      {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
-      {"joint", "shoulder"}});
+  j["sensors"].push_back({{"name", "shoulder_encoder"},  // duplicate
+                          {"sensor_model", "cancoder"},
+                          {"controller_can_id", 4},  // distinct
+                          {"controller_firmware_version", "TBD-pinned-at-v0-ship"},
+                          {"joint", "shoulder"}});
   const auto result = load_json(j);
   expect_error_shape(result, load_error_kind::conflict_error, "/sensors/1/name");
   expect_message_contains(result.error(), {"shoulder_encoder"});
@@ -699,7 +696,7 @@ TEST_F(LoaderTest, K1_rejects_duplicate_sensor_name) {
 // L. Enum-like field strictness (case-sensitive; decision #12)
 // ===========================================================================
 
-TEST_F(LoaderTest, L1_rejects_when_enum_field_has_wrong_case) {
+TEST_F(loader_test, L1_rejects_when_enum_field_has_wrong_case) {
   auto j = make_v0_arm_json();
   j["joints"][0]["type"] = "Revolute";
   const auto result = load_json(j);
@@ -707,7 +704,7 @@ TEST_F(LoaderTest, L1_rejects_when_enum_field_has_wrong_case) {
   expect_message_contains(result.error(), {"Revolute"});
 }
 
-TEST_F(LoaderTest, L2_rejects_when_enum_field_has_unknown_value) {
+TEST_F(loader_test, L2_rejects_when_enum_field_has_unknown_value) {
   auto j = make_v0_arm_json();
   j["joints"][0]["type"] = "wibble";
   const auto result = load_json(j);
@@ -719,15 +716,16 @@ TEST_F(LoaderTest, L2_rejects_when_enum_field_has_unknown_value) {
 // M. Unknown-field rejection (decision #8 — strongest "no shortcuts" guard)
 // ===========================================================================
 
-struct UnknownFieldCase {
+struct unknown_field_case {
   std::string parent_pointer;  // "" for root, "/links/0" for a link
   std::string unknown_key;
   std::string expected_pointer;
 };
 
-class UnknownFieldTest : public LoaderTest, public ::testing::WithParamInterface<UnknownFieldCase> {};
+class unknown_field_test : public loader_test,
+                           public ::testing::WithParamInterface<unknown_field_case> {};
 
-TEST_P(UnknownFieldTest, M1_rejects_when_unknown_field_present) {
+TEST_P(unknown_field_test, M1_rejects_when_unknown_field_present) {
   const auto& [parent, key, ptr] = GetParam();
   auto j = make_v0_arm_json();
   if (parent.empty()) {
@@ -741,13 +739,14 @@ TEST_P(UnknownFieldTest, M1_rejects_when_unknown_field_present) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    UnknownFields, UnknownFieldTest,
-    ::testing::Values(UnknownFieldCase{"", "extra_root_key", "/extra_root_key"},
-                      UnknownFieldCase{"/links/0", "mass_g", "/links/0/mass_g"},
-                      UnknownFieldCase{"/joints/0", "axisz", "/joints/0/axisz"},
-                      UnknownFieldCase{"/motors/0", "gear_ration", "/motors/0/gear_ration"},
-                      UnknownFieldCase{"/sensors/0", "cancoder_thing",
-                                       "/sensors/0/cancoder_thing"}));
+    UnknownFields,
+    unknown_field_test,
+    ::testing::Values(unknown_field_case{"", "extra_root_key", "/extra_root_key"},
+                      unknown_field_case{"/links/0", "mass_g", "/links/0/mass_g"},
+                      unknown_field_case{"/joints/0", "axisz", "/joints/0/axisz"},
+                      unknown_field_case{"/motors/0", "gear_ration", "/motors/0/gear_ration"},
+                      unknown_field_case{
+                          "/sensors/0", "cancoder_thing", "/sensors/0/cancoder_thing"}));
 
 }  // namespace
 }  // namespace robosim::description

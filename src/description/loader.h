@@ -8,7 +8,7 @@
 
 namespace robosim::description {
 
-[[nodiscard]] std::expected<robot_description, load_error>
-load_from_file(const std::filesystem::path& path);
+[[nodiscard]] std::expected<robot_description, load_error> load_from_file(
+    const std::filesystem::path& path);
 
 }  // namespace robosim::description

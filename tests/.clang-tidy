@@ -1,0 +1,22 @@
+# tests/.clang-tidy — overrides for test code.
+#
+# Inherits the project root .clang-tidy by default; only the differences
+# needed to keep test code idiomatic live here.
+
+---
+InheritParentConfig: true
+
+CheckOptions:
+  # Test bodies that assert on many fields (e.g. a happy-path test that
+  # round-trips every leaf of a struct) accumulate cognitive complexity
+  # from each EXPECT_* macro even though the body is conceptually one
+  # stream of assertions, not branching logic. Raise the threshold for
+  # tests rather than fragmenting tests into helper functions that hide
+  # what's being checked.
+  - key:   readability-function-cognitive-complexity.Threshold
+    value: '200'
+  # Same reasoning for the line/statement cap.
+  - key:   readability-function-size.LineThreshold
+    value: '300'
+  - key:   readability-function-size.StatementThreshold
+    value: '200'

@@ -90,11 +90,15 @@ CheckOptions:
     value: CamelCase
 
   # Function size cap reflects code-style.md ("~30 line soft cap").
+  # Thresholds are higher than the soft cap to give std::expected-based
+  # error-return idioms (each fallible call is ~3 lines: extract result,
+  # check, propagate error) headroom before tripping. If a function still
+  # exceeds these, factor it.
   - key:   readability-function-size.LineThreshold
-    value: '60'
+    value: '100'
   - key:   readability-function-size.StatementThreshold
-    value: '40'
+    value: '70'
   - key:   readability-function-size.ParameterThreshold
     value: '5'
   - key:   readability-function-cognitive-complexity.Threshold
-    value: '20'
+    value: '40'
