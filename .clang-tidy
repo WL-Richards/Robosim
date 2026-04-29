@@ -1,0 +1,100 @@
+# clang-tidy configuration for robosim.
+#
+# Philosophy: enable broad check families (cppcoreguidelines, bugprone,
+# misc), then selectively disable the noisier or contradictory checks.
+# All warnings are errors in CI.
+#
+# The custom "no std::chrono::*_clock in sim core" rule is enforced by a
+# regex check in scripts/lint.sh until a real clang-tidy module exists.
+# TODO(robosim): upgrade the regex check to a proper clang-tidy
+# CheckMatcher once we have one custom check; the regex version misses
+# qualified-name aliases.
+
+---
+Checks: >
+  -*,
+  bugprone-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  readability-identifier-naming,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-function-cognitive-complexity,
+  readability-function-size,
+  readability-implicit-bool-conversion,
+  readability-misleading-indentation,
+  readability-redundant-*,
+  readability-simplify-boolean-expr,
+  readability-string-compare,
+  readability-uniqueptr-delete-release,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-trailing-return-type,
+  -modernize-use-nodiscard,
+  -readability-magic-numbers,
+
+WarningsAsErrors: '*'
+
+HeaderFilterRegex: '^(src|tests)/.*\.h$'
+
+CheckOptions:
+  # snake_case throughout (matches WPILib HAL C-ABI naming, see
+  # docs/ARCHITECTURE.md "Language and toolchain").
+  - key:   readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key:   readability-identifier-naming.ClassCase
+    value: lower_case
+  - key:   readability-identifier-naming.StructCase
+    value: lower_case
+  - key:   readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key:   readability-identifier-naming.VariableCase
+    value: lower_case
+  - key:   readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key:   readability-identifier-naming.MemberCase
+    value: lower_case
+  - key:   readability-identifier-naming.PrivateMemberSuffix
+    value: _
+  - key:   readability-identifier-naming.ProtectedMemberSuffix
+    value: _
+  - key:   readability-identifier-naming.EnumCase
+    value: lower_case
+  - key:   readability-identifier-naming.EnumConstantCase
+    value: lower_case
+  - key:   readability-identifier-naming.ConstexprVariableCase
+    value: lower_case
+  - key:   readability-identifier-naming.ConstantCase
+    value: lower_case
+  - key:   readability-identifier-naming.GlobalConstantCase
+    value: lower_case
+  - key:   readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key:   readability-identifier-naming.TypeAliasCase
+    value: lower_case
+  - key:   readability-identifier-naming.TypedefCase
+    value: lower_case
+  - key:   readability-identifier-naming.TemplateParameterCase
+    value: CamelCase
+
+  # Function size cap reflects code-style.md ("~30 line soft cap").
+  - key:   readability-function-size.LineThreshold
+    value: '60'
+  - key:   readability-function-size.StatementThreshold
+    value: '40'
+  - key:   readability-function-size.ParameterThreshold
+    value: '5'
+  - key:   readability-function-cognitive-complexity.Threshold
+    value: '20'
