@@ -9,32 +9,50 @@ depends on the visualizer being attached.
 
 1. **`CLAUDE.md`** — repo orientation, non-negotiables, the rule about
    reading skills before implementing.
-2. **`docs/ARCHITECTURE.md`** — process model (visualizer is a separate
-   process), robot description format, logging / observability section.
-3. **`docs/OPEN_QUESTIONS.md`** — **OQ-7 (Visualizer)** and **OQ-11
-   (Authoring GUI / CAD)**. This work resolves OQ-7 in part and reopens
-   OQ-11 in a tightly-scoped form. Do not start before those resolutions
-   are written up (Phase VA1).
+2. **`docs/ARCHITECTURE.md`** — the **"Visualizer"** section is the
+   binding architecture for this work. Also: process model, robot
+   description format, logging / observability.
+3. **`docs/OPEN_QUESTIONS.md`** — OQ-7 (decided 2026-04-29) and OQ-11
+   (folded into OQ-7). The original framings are preserved for
+   context; the resolutions are in `ARCHITECTURE.md`.
 4. **`docs/VISUALIZER_V0_PLAN.md`** — this file.
 5. **`.claude/skills/code-style.md`** — C++ style; visualizer code
-   follows the same rules as the sim core (with the exceptions in
-   §"Determinism" below).
+   follows the same rules as the sim core, with the determinism
+   exception noted in `ARCHITECTURE.md` "Visualizer" and elaborated
+   in the visualizer skill.
 6. **`.claude/skills/tdd-workflow.md`** + **`adding-a-feature.md`** —
    TDD discipline and the test-reviewer gate apply here too.
-7. **`.claude/skills/visualizer.md`** — created in Phase VA. Once it
+7. **`.claude/skills/visualizer.md`** — created in Phase VA1. Once it
    exists, prefer it as the entry point.
 
 ## Status
 
-Foundational design fixed; implementation gated on (a) OQ-7 / OQ-11
-write-up and (b) `descriptions/v0-arm.json` actually loading via
-`description::load_from_file` (V0_PLAN Phase B). Phase VA scaffold can
-land before V0_PLAN B7/B8 finish — only Phase VB onward consumes the
-loader.
+Foundational design decided (OQ-7 resolution + ARCHITECTURE.md
+"Visualizer"). **Phase VA scaffold and Phase VB read-side are
+landed:** `src/viz/` has the scene-snapshot seam, edit-mode builder,
+orbit camera, ray-vs-primitive picking, OpenGL primitive renderer,
+ImGui scene tree / inspector / status bar, and a working
+`robosim-viz` CLI. The cylinder/arrow primitive convention was
+amended to anchor at the proximal cap (TEST_PLAN rev 4) so a link's
+local origin coincides with its parent-joint attachment. 49 viz-side
+tests are green.
+
+ImGuizmo translate / rotate manipulators are wired in `main.cpp`
+against `scene_node::world_from_local`, but they only mutate the
+in-memory snapshot — there is no `link.visual_origin` /
+`joint.origin` schema field to write back to and no
+`description::save_to_file` yet. **Phase VC (schema bump + serializer)
+is the next gating step.** Phase VD's UI scaffolding (gizmo + snap
+controls) is partly in place; the formal VD test plan + save flow
+land after VC.
 
 ## Scope
 
-### In scope (v0 visualizer)
+The 3D viewer is a single binary with three modes (per `ARCHITECTURE.md`
+"Visualizer"): **Edit**, **Live**, **Replay**. **v0 ships Edit mode
+only.** Live and Replay are post-v0.
+
+### In scope (v0 — Edit mode)
 
 - **Load** an existing robot description JSON via the existing loader.
 - **Render** the kinematic tree in 3D using primitive shapes (link =
@@ -52,83 +70,72 @@ loader.
 
 ### Explicitly out of scope (deferred)
 
-- **CAD / mesh import** (STEP, IGES, glTF, OBJ, STL). Tracked under
-  OQ-11; primitive shapes only for v0.
-- **State-stream / replay viewer** — animating joints from a running
-  sim's WPILOG output. AdvantageScope owns this; revisit post-v0 if
-  there's a sim-specific view AdvantageScope can't show.
-- **Authoring from scratch** — creating new links/joints/motors via the
-  GUI. v0 edits an existing file; create-from-scratch is a follow-up.
+- **Live and Replay modes.** Architectural seam preserved in Phase VB
+  (renderer reads from a scene snapshot, not from the loader directly)
+  but no state-stream consumer or WPILOG reader in v0.
+- **CAD / mesh import** (STEP, IGES, glTF, OBJ, STL). Edit-mode
+  roadmap item; primitive shapes only for v0.
+- **Authoring from scratch** — creating new links / joints / motors via
+  the GUI. v0 edits an existing file; create-from-scratch is an
+  Edit-mode roadmap item.
+- **Vendor-binding UI** — assigning CAN IDs, picking firmware versions
+  through the GUI. Edit-mode roadmap item.
 - **Multi-robot / shared-module support** — single robot per file (per
   schema decision in OQ-4).
 - **Validation panel beyond loader errors** — surface the loader's
   `load_error` in the UI; richer rule-checks come later.
-- **Determinism / replay discipline** — visualizer is interactive
-  tooling, not sim core.
-
-## OQ resolutions this plan implies (must be written up in VA1)
-
-### OQ-7 (Visualizer) — partial resolution
-
-Pick **option C** with a v0 scoping clarification:
-
-- **AdvantageScope** owns log replay and time-series visualization.
-- **A custom viewer** (this project) owns description-time
-  visualization and authoring assist — things AdvantageScope cannot do
-  because they involve editing the description, not viewing match
-  output.
-- v0 ships the description-time viewer. State-stream consumption stays
-  open under OQ-7 for post-v0.
-
-### OQ-11 (Authoring GUI / CAD) — partial reopen
-
-Re-open under tight scope:
-
-- v0 GUI **edits an existing JSON** in place (origins of already-
-  declared links and joints). It does **not** create new entities, does
-  **not** import CAD, does **not** rewire CAN bindings via GUI.
-- Full authoring (create from scratch, CAD import, vendor binding UI)
-  remains deferred. Re-trigger when a real second robot description is
-  authored and hand-editing JSON becomes the bottleneck.
-
-Both writeups land in `docs/ARCHITECTURE.md` (new "Visualizer" section)
-and `docs/OPEN_QUESTIONS.md` (status flips). User sign-off required
-before VA scaffold is committed.
 
 ## Architectural shape
 
+The binding decisions are in `ARCHITECTURE.md` "Visualizer". Restated
+here for the work-plan context:
+
+- **Lives at `src/viz/` as a first-class subsystem.** Not in `tools/`.
 - **Separate binary**, not linked into sim core. Built by an opt-in
-  CMake flag `ROBOSIM_BUILD_VISUALIZER=OFF` (default OFF so the headless
-  CI matrix doesn't need GLFW/OpenGL).
-- **Lives in `tools/visualizer/`** alongside `tools/rio-bench/`. It is
-  tooling, not a layer of the sim.
+  CMake flag `ROBOSIM_BUILD_VIZ=OFF` (default OFF so the headless
+  CI matrix doesn't need GLFW / OpenGL).
+- **Single binary, mode switching.** Edit / Live / Replay are modes
+  inside one app, not separate binaries — they share the 3D engine,
+  scene graph, camera, and selection model. v0 implements only Edit
+  mode but the architecture must not preclude the others.
 - **Depends on** `src/description/` (loader + schema) and the new
   `src/description/serializer.{h,cpp}` (Phase VC). **Does not depend
   on** MuJoCo, Layer 5, sim core, HAL, or backends.
 - **Process model:** standalone GUI app. No IPC with sim core in v0.
+  Live mode (post-v0) connects via the same WPILOG / NetworkTables
+  stream that AdvantageScope reads — no custom IPC.
 
-### Tech stack (proposed; finalized in VA1)
+### Tech stack
+
+Per `ARCHITECTURE.md` "Visualizer":
 
 - **Window + input:** GLFW (zlib/libpng license).
 - **Renderer:** OpenGL 3.3 core (portable, mature on Linux). glad as
-  the loader. Vulkan rejected as overkill for v0.
+  the loader.
 - **UI:** Dear ImGui (docking branch).
 - **Gizmos:** ImGuizmo (Unreal-style translate / rotate / scale, world
   / local toggle, snap support).
 - **Math:** GLM (header-only, MIT). ImGuizmo already uses it.
-- **Mesh import (later):** Assimp (BSD) — **not added in v0**, listed
-  here for the post-v0 path.
+- **Mesh import (post-v0):** Assimp (BSD) — **not added in v0**.
+  STEP via OpenCASCADE much later.
 
 All deps via `FetchContent` with pinned commit SHAs, same pattern as
-the existing top-level `CMakeLists.txt`.
+the existing top-level `CMakeLists.txt`. SHAs resolved via
+`scripts/resolve-dep-sha.sh`.
 
-## Determinism
+## Design constraint: data-source seam (carries through every phase)
 
-Visualizer is interactive tooling. The bans on `system_clock` /
-`steady_clock` / `random_device` from `code-style.md` **apply only to
-the sim core**, not to the visualizer. The visualizer is allowed to use
-wall-clock time for animation, frame pacing, and GLFW input timestamps.
-This is a documented exception that goes into `.claude/skills/visualizer.md`.
+The renderer must **not** read directly from `robot_description`. It
+reads from a `scene_snapshot` (working name) — a flat, immutable bundle
+of nodes with world transforms, primitive shapes, axes, selection
+state, and per-frame data slots reserved for Live / Replay (joint
+angles, contact points, force vectors). Edit mode populates the
+snapshot from a `robot_description`; Live mode (post-v0) populates it
+from a state-stream message; Replay mode (post-v0) populates it from a
+WPILOG sample.
+
+This is the single architectural commitment that lets Edit-only v0 grow
+into Live / Replay without a rewrite. Phase VB enforces it.
 
 ## Phases
 
@@ -139,29 +146,26 @@ through the test-reviewer gate before any test code is written.
 
 No TDD step; this is engineering infrastructure.
 
-1. **VA1. OQ resolutions written up.** Update
-   `docs/ARCHITECTURE.md` + `docs/OPEN_QUESTIONS.md` per the resolutions
-   above. **Get user sign-off before committing.**
-2. **VA2. Skill drafted.** `.claude/skills/visualizer.md` with scope,
-   public surface (CLI flags, panels, hotkeys), tech stack, determinism
-   exception, and known limits. Add to the index in `CLAUDE.md`.
-3. **VA3. Directory + CMake.** Create `tools/visualizer/`
-   (with `CMakeLists.txt`) and `tests/visualizer/`. Top-level CMake
-   gains `ROBOSIM_BUILD_VISUALIZER` option (default OFF) and
-   conditional `FetchContent` for GLFW, glad, Dear ImGui, ImGuizmo,
-   GLM. Pinned SHAs, resolved via the existing
-   `scripts/resolve-dep-sha.sh` pattern.
-4. **VA4. Empty entry point.** `tools/visualizer/main.cpp` opens a GLFW
-   window, initializes ImGui + OpenGL3 backends, runs an empty frame
-   loop with a "Hello, robosim" demo window, exits cleanly.
-5. **VA5. CI.** Add a separate workflow / matrix entry that builds the
-   visualizer (still no display required for build-only). Existing
-   sanitizer matrix stays headless and unaffected.
+1. **VA1. Skill drafted.** `.claude/skills/visualizer.md` with scope,
+   public surface (CLI flags, panels, hotkeys, modes), tech stack,
+   determinism exception, data-source seam, and known limits.
+2. **VA2. Directory + CMake.** Create `src/viz/` (with
+   `CMakeLists.txt`) and `tests/viz/`. Top-level CMake gains
+   `ROBOSIM_BUILD_VIZ` option (default OFF) and conditional
+   `FetchContent` for GLFW, glad, Dear ImGui, ImGuizmo, GLM. Pinned
+   SHAs.
+3. **VA3. Empty entry point.** `src/viz/main.cpp` opens a GLFW window,
+   initializes ImGui + OpenGL3 backends, runs an empty frame loop with
+   a "Hello, robosim" demo window, exits cleanly. The binary is named
+   `robosim-viz`.
+4. **VA4. CI.** Add a separate workflow / matrix entry that builds the
+   visualizer (compile-only; no display required). Existing sanitizer
+   matrix stays headless and unaffected.
 
-Commit boundary: VA1 (docs) and VA2 (skill) can be one commit; VA3 +
-VA4 one commit; VA5 one commit.
+Commit boundary: VA1 (skill) one commit; VA2 + VA3 one commit; VA4 one
+commit.
 
-### Phase VB — Read-side: scene model, render, inspect, pick
+### Phase VB — Read-side: scene snapshot, render, inspect, pick
 
 **This is the first visualizer feature under TDD.** Pure-logic pieces
 are TDD-able with GoogleTest; rendering / ImGui glue is exercised by a
@@ -170,11 +174,19 @@ display required if we use `EGL_SURFACELESS_MESA` or skip with a
 runtime-detect fallback — finalize in test plan).
 
 1. **VB1. Test plan.** Cover, at minimum:
-   - **Camera math**: orbit (pitch/yaw/zoom around pivot), pan, frame-
-     fit-to-AABB. Assertions on output matrices vs. closed-form values.
-   - **Scene-tree builder**: given a `robot_description`, produce a
-     tree of nodes with correct parent/child relationships and (for
-     v0) world-origin-rooted transforms. Joint axis preserved.
+   - **Scene snapshot data model**: the seam itself. A pure POD bundle
+     (nodes with world transforms, primitive shapes, axes, selection
+     state, reserved per-frame slots for joint angles / contact /
+     forces) with **no dependency on `robot_description`**. Tests
+     pin the contract: any data source can produce a snapshot; the
+     renderer reads only the snapshot.
+   - **Edit-mode snapshot builder**: `robot_description` →
+     `scene_snapshot`. Correct kinematic-tree structure (parent /
+     child), world-origin-rooted transforms (v0 schema), joint axes
+     preserved, primitive shape per link (cylinder from `length_m`).
+   - **Camera math**: orbit (pitch / yaw / zoom around pivot), pan,
+     frame-fit-to-AABB. Assertions on output matrices vs. closed-form
+     values.
    - **Picking**: ray vs. cylinder / box / sphere primitives, returns
      hit index + entity reference. Boundary cases (parallel ray,
      grazing, behind camera).
@@ -184,29 +196,32 @@ runtime-detect fallback — finalize in test plan).
 2. **VB2. Submit to test-reviewer.** Iterate until
    `ready-to-implement`.
 3. **VB3. Implement failing tests.**
-4. **VB4. Implement** `tools/visualizer/scene.{h,cpp}` (kinematic tree
-   from description), `camera.{h,cpp}` (orbit math), `picking.{h,cpp}`
+4. **VB4. Implement** `src/viz/scene_snapshot.{h,cpp}` (the seam),
+   `src/viz/edit_mode_builder.{h,cpp}` (description → snapshot),
+   `src/viz/camera.{h,cpp}` (orbit math), `src/viz/picking.{h,cpp}`
    (ray-primitive intersection).
-5. **VB5. Implement** `renderer.{h,cpp}` — primitive cylinders / boxes
-   / arrows, grid, world axes, basic Phong-ish lighting. Selection
-   highlight pass.
+5. **VB5. Implement** `src/viz/renderer.{h,cpp}` — primitive cylinders /
+   boxes / arrows, grid, world axes, basic Phong-ish lighting.
+   Selection highlight pass. **Reads from `scene_snapshot` only.**
 6. **VB6. Implement panels** — scene tree panel (ImGui, hierarchical),
    inspector panel (read-only fields driven by the schema), status bar
    showing loader errors.
 7. **VB7. CLI** — `robosim-viz <path-to-description.json>`; load,
-   render, inspect, exit on window close.
+   render, inspect, exit on window close. Mode argument (`--mode=edit`)
+   reserved but defaults to `edit` for v0.
 8. **VB8. Skill update** — fill in public surface and known limits in
-   `.claude/skills/visualizer.md`.
+   `.claude/skills/visualizer.md`. Document the snapshot seam contract.
 
-Commit boundary: scene + camera + picking (and their tests) one
-commit; renderer + panels one commit; CLI + skill update one commit.
+Commit boundary: snapshot + edit-mode builder + camera + picking (and
+their tests) one commit; renderer + panels one commit; CLI + skill
+update one commit.
 
 ### Phase VC — Schema extension: origin transforms
 
 **Blocker for VD.** The current schema (v1) has no link visual origin
 or joint origin — everything is implicitly at world origin. That's fine
-for the single-DOF arm, but gizmo-manipulation needs fields to write
-into.
+for the single-DOF arm rendered by Phase VB, but gizmo manipulation
+needs fields to write into.
 
 1. **VC1. Schema design write-up.** Propose:
    - `link.visual_origin`: `{ xyz_m: [x, y, z], rpy_rad: [r, p, y] }`,
@@ -225,9 +240,8 @@ into.
    sub-field), absent (defaults), v1→v2 forward compatibility, both
    versions produce equivalent struct when origins are identity.
 3. **VC3. Loader implementation** — extend
-   `src/description/{schema.h,loader.cpp}`. Re-run existing loader test
-   suite; existing tests must not need changes (defaults preserve
-   behavior).
+   `src/description/{schema.h,loader.cpp}`. Existing 83-test loader
+   suite must not need changes (defaults preserve behavior).
 4. **VC4. Serializer** — `src/description/serializer.{h,cpp}` exposing
    `save_to_file(robot_description, path) -> std::expected<void, save_error>`.
    Serializer test plan + test-reviewer gate. Round-trip property test:
@@ -252,16 +266,17 @@ review.
      escape clears it.
    - Gizmo delta application: given a selected joint and a delta
      transform, produce an updated `joint.origin` and an updated
-     in-memory `robot_description`.
+     in-memory `robot_description`. Snapshot rebuilds from the
+     updated description.
    - Save flow: edit-then-save round-trips identically to a hand-
-     edited file (uses the VC3 serializer).
+     edited file (uses the VC4 serializer).
 2. **VD2. Test-reviewer.**
 3. **VD3. Failing tests, then implementation.**
 4. **VD4. ImGuizmo wiring** — translate + rotate gizmos for selected
    link visual origins and joint origins. World / local space toggle,
    W (translate) / E (rotate) hotkeys, snap (configurable). No scale
    gizmo for v0 (link sizing is driven by `length_m` / inertia, which
-   is a Phase-V-stretch concern).
+   is a follow-up concern).
 5. **VD5. File menu** — Save (writes back to the loaded path), Save
    As, Reload from disk (drops unsaved edits with confirmation).
 6. **VD6. Skill update** — public surface for gizmo flow, hotkeys,
@@ -273,17 +288,20 @@ polish as a follow-up if needed.
 
 ## What NOT to do in early sessions
 
-- **Don't skip the OQ resolution writeups.** The user must sign off
-  before VA scaffold lands. Implementing first and writing the OQ
-  resolution as an afterthought is exactly the "silently take a
-  position" failure mode `adding-a-feature.md` warns against.
+- **Don't break the snapshot seam.** Phase VB is the one chance to get
+  this right cheaply; bypassing it (renderer reading
+  `robot_description` directly) makes Live / Replay much more expensive
+  later.
 - **Don't import CAD.** Tracked, deferred. v0 is primitive shapes only.
-- **Don't subscribe to a running sim's state stream.** That's a v1
-  follow-up and needs a separate design pass.
-- **Don't add a "create new link/joint" UI.** v0 edits an existing
-  description; create-from-scratch is OQ-11-deferred.
+- **Don't subscribe to a running sim's state stream.** Live mode is
+  post-v0 and needs its own design pass.
+- **Don't add a "create new link / joint" UI.** v0 edits an existing
+  description; create-from-scratch is an Edit-mode roadmap item.
 - **Don't link the visualizer into sim core, or make sim core depend
   on it.** Always a separate binary, always optional.
+- **Don't use `system_clock` / `steady_clock` / `random_device` outside
+  `src/viz/`.** The exception applies only inside the visualizer
+  subtree.
 
 ## Suggested session boundaries
 
@@ -302,28 +320,34 @@ If a session runs short, stop at the last passing test boundary.
   4×4 model matrix in some space; mapping it to "joint origin in the
   parent link's frame" is straightforward but needs verification. The
   test plan in VD1 will pin this contract.
-- **Pure-logic test reach for the rendering layer.** Camera, picking,
-  scene tree, and gizmo math are all testable. The OpenGL pipeline
-  itself is exercised only by the smoke test. If smoke testing proves
-  flaky on headless CI we either Xvfb-host the build job or skip the
-  smoke test on CI and run it in a developer-machine matrix.
-- **Schema bump (Phase VC) breaks the loader's existing test
-  suite if not done carefully.** Loader's existing tests assume the
-  v1 schema. The schema-design writeup in VC1 must enumerate which
-  existing tests change (ideally none, by making the new fields
-  optional) and which new tests are added.
+- **Pure-logic test reach for the rendering layer.** Snapshot, camera,
+  picking, scene tree, and gizmo math are all testable. The OpenGL
+  pipeline itself is exercised only by the smoke test. If smoke
+  testing proves flaky on headless CI we either Xvfb-host the build
+  job or skip the smoke test on CI and run it in a developer-machine
+  matrix.
+- **Schema bump (Phase VC) breaks the loader's existing test suite if
+  not done carefully.** The 83 existing tests assume v1 schema. The
+  schema-design writeup in VC1 must enumerate which existing tests
+  change (ideally none, by making the new fields optional) and which
+  new tests are added.
 - **Save flow with comments / formatting in JSON.** JSON has no
   comment support; a hand-authored file with whitespace conventions
   will lose them on round-trip. v0 documents this as a known limit
   and accepts it. Schema-version-aware migration (e.g. comment-
   preserving via a sidecar or YAML migration) is a v1+ concern.
+- **Snapshot data model under Live / Replay.** The snapshot must
+  carry per-frame data slots that v0 doesn't populate (joint angles,
+  contact lists, force vectors) without making them awkward when
+  they're empty. VB1 should sketch the post-v0 fields even though v0
+  doesn't write them.
 
 ## If you get stuck
 
-- Re-read this plan and the linked OQ entries. Don't silently take a
-  position on OQ-7 / OQ-11 by implementing.
+- The binding architecture is in `docs/ARCHITECTURE.md` "Visualizer".
+  Don't re-litigate decided questions silently.
 - The sim-core layers' design intent is in their layer skills.
   Visualizer-specific decisions live in `.claude/skills/visualizer.md`
-  once Phase VA2 lands.
+  once Phase VA1 lands.
 - For schema questions, the user makes the call. Surface the
   trade-off; don't guess.

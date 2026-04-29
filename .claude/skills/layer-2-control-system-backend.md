@@ -225,11 +225,33 @@ mutation discipline, direction-specific `boot` / `boot_ack` ordering,
 single-flight on-demand request/reply pairing, and shutdown terminal
 receive state.
 
+The **Tier 1 shared-memory transport** is implemented through the
+OS-backed mapping/lifecycle foundation and 24-test green. See
+`.claude/skills/tier1-shared-memory-transport.md` for the working
+knowledge: fixed two-lane shared-region ABI, atomic lane states, exact
+payload-copy boundaries, nonblocking endpoint send/receive,
+`protocol_session` integration, Linux memfd/mmap lifecycle, and
+move-only fd/mapping RAII. Blocking waits, cross-process stress,
+named shared-memory discovery, and reset/reconnect behavior remain
+future cycles.
+
+The **HAL shim core (cycle 1)** is implemented and 14-test green.
+See `.claude/skills/hal-shim.md` for the working knowledge: boot
+publish on construction, single-threaded `poll()`-driven inbound
+drain, dispatch by `(envelope_kind, schema_id)`, cycle-1 explicit
+reject for unsupported schemas with session-counter advance through
+dispatch, terminal post-shutdown short-circuit. Cycle 1 surface is a
+C++ API; the C HAL ABI (`HAL_GetFPGATime`, `HAL_Initialize`, etc.),
+the seven inbound schemas other than `clock_state`, all outbound
+traffic past `boot`, and threading remain future cycles.
+
 Still ahead, each its own TDD cycle:
-- HAL shim (the in-process `libhal.so` replacement that produces /
-  consumes the schema).
-- Transport: T1 shared-memory + atomic sync; T2 socket framing +
-  reconnect.
+- HAL shim cycles 2+: additional inbound schemas (power_state,
+  ds_state, can_status, can_frame_batch, notifier_alarm_batch,
+  error_message_batch, on-demand replies), outbound traffic past
+  boot, and the exported C HAL ABI surfaces.
+- Transport lifecycle: T1 waits/reset/named discovery and T2 socket
+  framing + reconnect.
 - LD_PRELOAD libc shim for `clock_gettime` / `nanosleep` / etc.
 - `tools/rio-bench/` HAL-cost fixture.
 
@@ -243,6 +265,12 @@ Still ahead, each its own TDD cycle:
   truncation helpers; the foundation this layer extends.
 - `protocol-session.md` — stateful validator wrapper for handshake,
   counters, request/reply pairing, and shutdown receive state.
+- `tier1-shared-memory-transport.md` — native shared-region ABI,
+  endpoint wrapper, and Linux memfd/mmap lifecycle for T1 protocol
+  bytes.
+- `hal-shim.md` — in-process HAL shim core: boot handshake, inbound
+  state cache, dispatch by `(envelope_kind, schema_id)`. Cycle 1
+  covers `clock_state` and shutdown only.
 - `robot-description-loader.md` — what we read to enumerate CAN IDs
   and pin firmware versions.
 - `docs/ARCHITECTURE.md` — process model, HAL boundary protocol,

@@ -4,3 +4,4 @@
 add_subdirectory(common)
 add_subdirectory(tier1)
 add_subdirectory(tier2)
+add_subdirectory(shim)

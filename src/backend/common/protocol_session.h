@@ -56,7 +56,8 @@ class protocol_session {
       envelope_kind kind,
       schema_id payload_schema,
       std::uint32_t payload_bytes,
-      std::uint64_t sim_time_us);
+      std::uint64_t sim_time_us,
+      std::span<const std::uint8_t> payload = {});
 
   [[nodiscard]] std::expected<void, session_error> accept_envelope(
       const sync_envelope& env, std::span<const std::uint8_t> payload = {});

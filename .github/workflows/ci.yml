@@ -127,6 +127,50 @@ jobs:
         run: scripts/lint.sh --all
 
   # -------------------------------------------------------------------
+  # Visualizer build (compile-only).
+  #
+  # Separate from the sanitizer matrix because the headless sanitizer
+  # build doesn't need GLFW / OpenGL / X11 / Wayland headers. This job
+  # verifies the src/viz/ tree (gated by ROBOSIM_BUILD_VIZ=ON) builds
+  # against pinned GLFW / glad / Dear ImGui / ImGuizmo / GLM. No display
+  # is required; the viz binary is built but not run.
+  # -------------------------------------------------------------------
+  viz-build:
+    name: visualizer build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake \
+            clang-${CLANG_VERSION} \
+            libc++-${CLANG_VERSION}-dev \
+            libc++abi-${CLANG_VERSION}-dev \
+            libgl-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev xorg-dev \
+            python3 python3-jinja2
+          echo "CC=clang-${CLANG_VERSION}"   >> "$GITHUB_ENV"
+          echo "CXX=clang++-${CLANG_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-viz-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: |
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DROBOSIM_BUILD_VIZ=ON
+
+      - name: Build viz target
+        run: cmake --build build --target robosim-viz --parallel
+
+  # -------------------------------------------------------------------
   # ARM cross-compile build (no test execution; just verify it builds).
   # Full tier-2 testing requires qemu-user, added in a later session.
   # -------------------------------------------------------------------

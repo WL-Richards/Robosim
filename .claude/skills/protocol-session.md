@@ -51,7 +51,7 @@ mutation, or time interception live here.
 - `has_received_boot_ack()`, `has_sent_boot_ack()`
 - `has_pending_on_demand_reply()`
 - `has_received_shutdown()`
-- `build_envelope(kind, schema, payload_bytes, sim_time_us)`
+- `build_envelope(kind, schema, payload_bytes, sim_time_us, payload = {})`
 - `accept_envelope(env, payload)`
 
 Errors use `session_error_kind` plus an optional embedded
@@ -65,6 +65,8 @@ message prose.
    paths run `validate_envelope` before mutating session state or
    applying handshake rules. This preserves the schema-cycle boundary
    and keeps framing errors distinct from state-machine errors.
+   Variable-size outbound schemas pass the payload byte span through
+   this path so the stateless validator can check header-derived sizes.
 2. **One endpoint per session.** A backend-local session sends
    `backend_to_core` and receives `core_to_backend`; a core-local
    session does the reverse.

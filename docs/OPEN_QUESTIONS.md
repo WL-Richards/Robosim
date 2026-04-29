@@ -21,16 +21,19 @@ Conventions:
 | OQ-4  | Robot description format          | decided  |
 | OQ-5  | Determinism scope                 | decided  |
 | OQ-6  | Vendor model fidelity strategy    | open     |
-| OQ-7  | Visualizer                        | open     |
+| OQ-7  | Visualizer                        | decided  |
 | OQ-8  | CAN bus topology fidelity         | open     |
 | OQ-9  | Vision pipeline                   | deferred |
 | OQ-10 | Test field for validation         | open     |
-| OQ-11 | Authoring GUI / CAD integration   | deferred |
+| OQ-11 | Authoring GUI / CAD integration   | folded   |
 
 **v0 implementation is unblocked** — all v0-gating questions
 (OQ-1–OQ-5) are decided. OQ-6/8/10 affect post-v0 work and can be
-resolved as those layers come into focus. OQ-7/9/11 are explicitly
-deferred. See `docs/V0_PLAN.md` for the implementation plan.
+resolved as those layers come into focus. OQ-9 is deferred; OQ-11 is
+folded into OQ-7 (the visualizer's Edit mode is the authoring tool).
+See `docs/V0_PLAN.md` for the sim-core implementation plan and
+`docs/VISUALIZER_V0_PLAN.md` for the visualizer subsystem (parallel
+work stream).
 
 ---
 
@@ -428,7 +431,10 @@ only honest path to tier 3+.
 
 ## OQ-7. Visualizer
 
-**Status:** open. Lower priority — can defer.
+**Status:** **decided** (2026-04-29). Binding resolution recorded in
+`docs/ARCHITECTURE.md` "Visualizer" section. The original framing is
+preserved below for context.
+**Subsumes:** OQ-11 (authoring GUI / CAD) — folded in as Edit mode.
 
 **Options.**
 A. AdvantageScope-only (it's already the de-facto FRC viewer; ride on it).
@@ -438,6 +444,41 @@ C. Both: ship logs that work in AdvantageScope; build our own viewer for
    contact forces).
 
 **Leaning.** C, but A is enough for v0.
+
+### Resolution (2026-04-29)
+
+**Picked: option C** with a clear division of labor between 2D and 3D
+surfaces.
+
+- **2D — AdvantageScope.** Time-series, WPILOG inspection, NetworkTables
+  scope. Sim Core emits WPILOG / NT cleanly and AdvantageScope reads
+  it. We do not build a 2D telemetry viewer.
+- **3D — our own viewer.** A single binary at `src/viz/` with three
+  modes:
+  - **Edit mode** — load a robot description JSON, render the kinematic
+    tree, click-pick entities, ImGuizmo translate / rotate handles for
+    link / joint origins, save back to JSON. (Subsumes what was
+    tracked separately as OQ-11.)
+  - **Live mode** — subscribe to a running sim and animate the rendered
+    robot from the state stream. Future home for force vectors,
+    contact visualization, game-piece flow.
+  - **Replay mode** — load a recorded WPILOG and scrub through it in
+    3D, complementing AdvantageScope's 2D view of the same log.
+
+**v0 ships Edit mode only.** Live and Replay are post-v0; the phased
+plan lives in `docs/VISUALIZER_V0_PLAN.md`. Phase VB's scene graph and
+renderer are constrained to not preclude the later modes (the
+data-source seam is explicit).
+
+The viewer is a separate binary, not linked into sim core. Sim core
+does not depend on the visualizer. Build is opt-in via
+`ROBOSIM_BUILD_VIZ=OFF` (default) so the headless CI matrix doesn't
+need GLFW / OpenGL.
+
+**Determinism exception.** The visualizer is interactive tooling, not
+sim core. The bans on `system_clock` / `steady_clock` /
+`random_device` from `code-style.md` do not apply inside `src/viz/`.
+Captured in `.claude/skills/visualizer.md` once that skill lands.
 
 ---
 
@@ -473,7 +514,17 @@ rendered pipeline for validation.
 
 ## OQ-11. Authoring GUI / CAD integration
 
-**Status:** **deferred** (post-v0). Tracked here so it isn't lost.
+**Status:** **folded into OQ-7** (2026-04-29).
+
+The 3D viewer's Edit mode (per the OQ-7 resolution) is the authoring
+tool. Specific authoring features that were tracked here — CAD / mesh
+import (STEP, IGES, glTF, OBJ, STL), create-from-scratch entity
+creation, vendor-binding UI, multi-file shared-module support — are
+post-v0 Edit-mode roadmap items, not a separate open question. v0
+Edit mode edits an existing JSON in place (origins of already-declared
+links and joints); the broader authoring surface grows on demand.
+
+The original framing is preserved below for historical context only.
 
 **Goal.** A GUI for authoring robot descriptions (the JSON files
 decided in OQ-4), with CAD import for geometry and inertia

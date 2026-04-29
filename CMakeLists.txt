@@ -3,8 +3,10 @@ cmake_minimum_required(VERSION 3.24)
 project(robosim
   VERSION 0.0.0
   DESCRIPTION "High-fidelity, control-system-agnostic FRC robot simulator"
-  LANGUAGES CXX
+  LANGUAGES C CXX
 )
+# C is enabled for the visualizer's glad loader (generated C source).
+# Sim-core code is C++; the C language is not used outside src/viz/.
 
 # ---------------------------------------------------------------------------
 # Language standard
@@ -161,9 +163,98 @@ set(MUJOCO_BUILD_SIMULATE OFF CACHE INTERNAL "")
 set(MUJOCO_BUILD_TESTS    OFF CACHE INTERNAL "")
 set(MUJOCO_TEST_LOAD_ABSL OFF CACHE INTERNAL "")
 
+# ---------------------------------------------------------------------------
+# Visualizer dependencies (src/viz/).
+#
+# Opt-in via ROBOSIM_BUILD_VIZ=ON (default OFF). The headless CI matrix
+# does not need GLFW / OpenGL; a separate CI job builds the viz target.
+# Determinism rules (banned clocks, banned RNG) do not apply inside
+# src/viz/ — see .claude/skills/visualizer.md "Determinism exception."
+# ---------------------------------------------------------------------------
+
+option(ROBOSIM_BUILD_VIZ
+  "Fetch viz deps (GLFW / glad / Dear ImGui / ImGuizmo / GLM) and build the robosim-viz binary"
+  OFF)
+
+# GLFW 3.4
+FetchContent_Declare(glfw
+  GIT_REPOSITORY https://github.com/glfw/glfw.git
+  GIT_TAG        a74efa0d5628b74adc0426af4c5710e287fa7c2c
+  GIT_SHALLOW    FALSE
+)
+set(GLFW_BUILD_EXAMPLES OFF CACHE INTERNAL "")
+set(GLFW_BUILD_TESTS    OFF CACHE INTERNAL "")
+set(GLFW_BUILD_DOCS     OFF CACHE INTERNAL "")
+set(GLFW_INSTALL        OFF CACHE INTERNAL "")
+
+# glad v2.0.6 — generates the OpenGL 3.3 core loader at configure time.
+# Requires Python 3 (any modern version). The generator is invoked by
+# glad_add_library() (provided by glad's CMake module).
+FetchContent_Declare(glad
+  GIT_REPOSITORY https://github.com/Dav1dde/glad.git
+  GIT_TAG        658f48e72aee3c6582e80b05ac0f8787a64fe6bb
+  GIT_SHALLOW    FALSE
+)
+
+# Dear ImGui — docking branch. No upstream CMakeLists; src/viz/ wraps
+# the sources + the GLFW / OpenGL3 backends in a small INTERFACE target.
+FetchContent_Declare(imgui
+  GIT_REPOSITORY https://github.com/ocornut/imgui.git
+  GIT_TAG        ed9d1e742793f7e4333565f891b4e3821b205f09
+  GIT_SHALLOW    FALSE
+)
+
+# ImGuizmo — Unreal-style translate / rotate / scale handles.
+# No upstream CMakeLists; src/viz/ wraps the sources in a small target.
+# Master HEAD as of 2026-04-29: the most recent tagged release (1.83,
+# 2021) predates ImGui's IMGUI_VERSION_NUM>=18723 API rename
+# (CaptureMouseFromApp -> SetNextFrameWantCaptureMouse), so 1.83 won't
+# compile against the docking branch we pin. Master uses #if guards to
+# work on both. Re-pin to a tag once upstream cuts one.
+FetchContent_Declare(imguizmo
+  GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+  GIT_TAG        a2da036ad300de1fd8d706f969b46e1c5a837d82
+  GIT_SHALLOW    FALSE
+)
+
+# GLM 1.0.1 — header-only math.
+FetchContent_Declare(glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG        0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+  GIT_SHALLOW    FALSE
+)
+set(GLM_BUILD_TESTS  OFF CACHE INTERNAL "")
+set(GLM_BUILD_LIBRARY ON CACHE INTERNAL "")
+
 FetchContent_MakeAvailable(nlohmann_json googletest spdlog)
 if(ROBOSIM_BUILD_PHYSICS)
   FetchContent_MakeAvailable(mujoco)
+endif()
+if(ROBOSIM_BUILD_VIZ)
+  # Order matters: GLM and GLFW have CMake configs and can be made
+  # available directly. glad's CMake support lives in its `cmake/`
+  # subdirectory (the repo root has none); we add_subdirectory it after
+  # population. ImGui and ImGuizmo do not ship CMakeLists; src/viz/
+  # picks up their sources via the populated-source paths below.
+  FetchContent_MakeAvailable(glfw glm)
+
+  FetchContent_GetProperties(glad)
+  if(NOT glad_POPULATED)
+    FetchContent_Populate(glad)
+  endif()
+  add_subdirectory("${glad_SOURCE_DIR}/cmake" glad_cmake)
+
+  FetchContent_GetProperties(imgui)
+  if(NOT imgui_POPULATED)
+    FetchContent_Populate(imgui)
+  endif()
+  set(ROBOSIM_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}" CACHE INTERNAL "")
+
+  FetchContent_GetProperties(imguizmo)
+  if(NOT imguizmo_POPULATED)
+    FetchContent_Populate(imguizmo)
+  endif()
+  set(ROBOSIM_IMGUIZMO_SOURCE_DIR "${imguizmo_SOURCE_DIR}" CACHE INTERNAL "")
 endif()
 
 # ---------------------------------------------------------------------------

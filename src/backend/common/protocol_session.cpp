@@ -85,7 +85,8 @@ std::expected<sync_envelope, session_error> protocol_session::build_envelope(
     envelope_kind kind,
     schema_id payload_schema,
     std::uint32_t payload_bytes,
-    std::uint64_t sim_time_us) {
+    std::uint64_t sim_time_us,
+    std::span<const std::uint8_t> payload) {
   sync_envelope env{};
   env.magic = kProtocolMagic;
   env.protocol_version = kProtocolVersion;
@@ -96,7 +97,7 @@ std::expected<sync_envelope, session_error> protocol_session::build_envelope(
   env.payload_schema = payload_schema;
   env.sender = local_direction_;
 
-  auto valid = validate_envelope(env, local_direction_, next_sequence_to_send_);
+  auto valid = validate_envelope(env, local_direction_, next_sequence_to_send_, payload);
   if (!valid.has_value()) {
     return std::unexpected(wrap_validator_error(valid.error()));
   }

@@ -338,14 +338,16 @@ These remain in `OPEN_QUESTIONS.md`:
 
 - **OQ-6** — vendor model fidelity strategy. Resolve when the first
   vendor model lands (likely session 3 or 4).
-- **OQ-7** — visualizer. Defer until v0 demo runs and we want to
-  watch it.
 - **OQ-8** — CAN bus topology fidelity. Resolve before the bus
   arbitration model lands (probably session 4 or 5).
 - **OQ-9** — vision pipeline. Deferred until v1+.
 - **OQ-10** — test field for validation. Resolve as bench access
   becomes concrete.
-- **OQ-11** — authoring GUI / CAD. Deferred until schema stabilizes.
+
+OQ-7 (visualizer) was decided 2026-04-29 — option C, with the 3D
+viewer at `src/viz/` (Edit / Live / Replay modes) running parallel to
+the sim core. OQ-11 (authoring GUI / CAD) was folded into OQ-7 as the
+visualizer's Edit mode. See `docs/VISUALIZER_V0_PLAN.md`.
 
 ## If you get stuck
 

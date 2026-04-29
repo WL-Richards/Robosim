@@ -67,3 +67,10 @@ Thumbs.db
 # Logs / runtime outputs
 *.log
 *.wpilog
+
+# Dear ImGui's runtime layout file (regenerated on each viewer launch)
+imgui.ini
+
+# Agent scaffolding markers — not part of project source
+.codex
+.claude/scheduled_tasks.lock

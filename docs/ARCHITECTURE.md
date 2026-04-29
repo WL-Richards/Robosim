@@ -282,8 +282,11 @@ binding all read from it.
 
 Every state variable produced by the Sim Core is logged in WPILOG format
 so AdvantageScope works out of the box. NetworkTables is also exposed for
-live viewers. The visualizer is a separate process consuming this stream;
-nothing in the sim core depends on the visualizer being attached.
+live viewers.
+
+The 3D visualizer is a separate binary; see "Visualizer" below for the
+binding decision. Nothing in the sim core depends on the visualizer
+being attached.
 
 ## Validation
 
@@ -510,3 +513,66 @@ boundary where ABI stability matters.
 - User-code launcher (loads our HAL shim alongside the user's JVM
   or native process) — C++.
 - Build / dev / lint scripts — Python or shell. Kept minimal.
+
+## Visualizer (decided 2026-04-29)
+
+**Resolution of OQ-7 (Visualizer); subsumes OQ-11 (Authoring GUI / CAD)
+as Edit mode of the visualizer.**
+
+Two viewer surfaces, kept distinct:
+
+- **2D — AdvantageScope.** Time-series, WPILOG inspection,
+  NetworkTables scope. Sim Core emits WPILOG / NT cleanly and
+  AdvantageScope reads it. We do not build a 2D telemetry viewer.
+- **3D — our own viewer.** A single binary at `src/viz/` with three
+  modes:
+  - **Edit mode** — load a robot description JSON via the existing
+    loader; render the kinematic tree with primitive shapes; click-
+    pick entities; ImGuizmo translate / rotate handles for link /
+    joint origins; save back to JSON. Subsumes what was tracked
+    separately as OQ-11.
+  - **Live mode** — subscribe to a running sim and animate the
+    rendered robot from the state stream. Future home for force
+    vectors, contact visualization, and game-piece flow — the
+    sim-specific overlays AdvantageScope cannot render.
+  - **Replay mode** — load a recorded WPILOG and scrub through it
+    in 3D, complementing AdvantageScope's 2D view of the same log.
+
+**v0 ships Edit mode only.** Live and Replay modes are post-v0;
+Edit-mode phasing is in `docs/VISUALIZER_V0_PLAN.md`. The renderer
+reads from a scene snapshot, not from the loader directly — Edit mode
+populates the snapshot from a `robot_description`; Live and Replay
+modes will populate it from a state stream. This data-source seam is
+a Phase VB design constraint.
+
+**Process model.** The visualizer is a separate binary, not linked
+into sim core. Sim core does not link against, depend on, or know
+about the visualizer. Live mode connects to a running sim by
+subscribing to the same WPILOG / NetworkTables stream that
+AdvantageScope reads — no custom IPC. Edit mode reads the description
+JSON directly and uses no state stream.
+
+**Build.** Opt-in via `ROBOSIM_BUILD_VIZ=OFF` (default). The headless
+CI matrix doesn't need GLFW / OpenGL. A separate CI job builds the
+visualizer for compile-only verification.
+
+**Tech stack.** GLFW (window + input), OpenGL 3.3 core via glad
+(renderer), Dear ImGui docking branch (UI), ImGuizmo (Unreal-style
+gizmos), GLM (math). All via `FetchContent` with pinned commit SHAs.
+Mesh import (Assimp for OBJ / glTF / STL; OpenCASCADE for STEP) is
+post-v0.
+
+**Determinism exception.** The visualizer is interactive tooling, not
+sim core. The bans on `std::chrono::system_clock`,
+`std::chrono::steady_clock`, `std::random_device`, and default-seeded
+RNG do not apply inside `src/viz/`. Wall-clock for animation, frame
+pacing, and GLFW input timestamps is acceptable. The sim core's
+determinism guarantees are unaffected because the visualizer reads
+from the sim core, never writes to it.
+
+**Schema implications.** Edit-mode gizmo manipulation requires joint
+and link origin transforms in the description schema. The current
+schema (v1) has no such fields; the v1→v2 schema bump and the matching
+`description::save_to_file` round-trip serializer are Phase VC of the
+visualizer plan. Both are sim-core changes and go through the same
+TDD discipline as the rest of the description loader.

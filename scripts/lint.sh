@@ -76,11 +76,18 @@ fi
 # src/ is the sim-core surface. Banned identifiers may not appear in it.
 # Tests are allowed to reference them (e.g. to write a test that asserts
 # they don't get used at runtime).
+#
+# Exception: src/viz/ is interactive tooling, not sim core. The
+# determinism rules (banned clocks / banned RNG) explicitly do not
+# apply there — see .claude/skills/visualizer.md "Determinism
+# exception." Wall-clock for animation, frame pacing, and GLFW input
+# timestamps is acceptable.
 
 BANNED_PATTERN='\bstd::chrono::(system_clock|steady_clock)\b'
 SIM_CORE_FILES=()
 for f in "${FILES[@]}"; do
   case "$f" in
+    src/viz/*) ;;  # determinism exception — skip
     src/*) SIM_CORE_FILES+=("$f") ;;
   esac
 done
