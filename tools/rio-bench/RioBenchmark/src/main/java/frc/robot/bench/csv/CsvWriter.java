@@ -4,9 +4,21 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
+/**
+ * Pure formatter for the rio-bench v0 CSV. Header lines start with
+ * {@code "# "} and carry every field of {@link RunMetadata} as a
+ * {@code key=value} pair so downstream tooling can recover the run
+ * environment without an out-of-band manifest.
+ */
 public final class CsvWriter {
   private CsvWriter() {}
 
+  /**
+   * Renders metadata + records as the v0 CSV. Records are sorted by
+   * {@link BenchmarkRecord#CSV_ORDER} so the byte-identical-output property
+   * the project's determinism non-negotiable demands holds regardless of
+   * insertion order.
+   */
   public static String write(RunMetadata metadata, List<BenchmarkRecord> records) {
     StringBuilder out = new StringBuilder();
 
@@ -35,10 +47,12 @@ public final class CsvWriter {
     return out.toString();
   }
 
+  /** Locale-stable mean-microseconds formatter; used by tests to assert column-level formatting. */
   static String formatMeanUs(double v) {
     return String.format(Locale.ROOT, "%.3f", v);
   }
 
+  /** Locale-stable outlier-rate formatter; used by tests to assert column-level formatting. */
   static String formatOutlierRate(double v) {
     return String.format(Locale.ROOT, "%.6f", v);
   }

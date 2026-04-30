@@ -33,7 +33,11 @@ every tier-1 fidelity claim downstream is sloppy.
   sequencer.
 - Auto-sweep entry from `autonomousInit` so the operator doesn't have
   to drive state changes from the DS.
-- File output to `/home/lvuser/rio-bench/<wpilib-version>-<rio-firmware>.csv`
+- File output to `rio-bench/<wpilib-version>-<rio-firmware>.csv`,
+  resolved against the JVM cwd (which `frcRunRobot.sh` sets to
+  `/home/lvuser` on a real RIO, so files land at
+  `/home/lvuser/rio-bench/...` there; off-RIO they land under whichever
+  directory the caller launched from)
   on the RIO. The operator pulls it back to `references/rio2-hal-costs/`
   in the repo by hand.
 
@@ -112,8 +116,11 @@ preamble and `validated=false`.
 
 1. `cd tools/rio-bench/RioBenchmark && ./gradlew deploy` (team 6443).
 2. Connect the DS, enable autonomous. The sweep runs to completion
-   (~2 minutes). Disable when `[rio-bench] DONE: file at <path>`
-   appears in the console.
+   (~2 minutes). The runner emits `[rio-bench] progress: NN%` lines
+   to the DataLog at every 5% boundary across the full sweep
+   (warmup + every operating point), so the operator can confirm
+   forward progress without watching the timer. Disable when
+   `[rio-bench] DONE: file at <path>` appears in the console.
 3. `scp lvuser@10.64.43.2:/home/lvuser/rio-bench/<file>.csv references/rio2-hal-costs/`.
 4. Edit the preamble: set `validated=true`. Commit.
 
@@ -264,7 +271,7 @@ tools/rio-bench/RioBenchmark/
       calls/CallClass.java        # enum + label/block-size table; tested
       runner/BenchmarkRunner.java # HAL-bound; not unit-tested
       runner/CallBindings.java    # one method per CallClass; HAL-bound
-      io/RioFileSink.java         # writes /home/lvuser/rio-bench/<file>.csv
+      io/RioFileSink.java         # writes rio-bench/<file>.csv (relative; cwd-resolved)
   src/test/java/frc/robot/bench/
     stats/StatisticsTest.java
     csv/CsvWriterTest.java

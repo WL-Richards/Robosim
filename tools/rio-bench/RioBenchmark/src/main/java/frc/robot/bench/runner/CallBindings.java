@@ -10,10 +10,26 @@ import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.util.concurrent.locks.LockSupport;
 
+/**
+ * Wraps each {@link CallClass} as a one-shot timed block. Each
+ * {@code timeBlockNs} implementation runs the underlying HAL call
+ * {@link CallClass#blockSize()} times inside a single
+ * {@code System.nanoTime()} window — this amortizes the timestamping
+ * overhead across the call cost we actually want to measure.
+ *
+ * <p>The {@code sink} field exists to defeat dead-code elimination: every
+ * timed block writes its result into {@code sink} via XOR so the JIT cannot
+ * recognize the loop body as side-effect-free and skip it.
+ *
+ * <p>Holds per-instance native buffers (for the CAN HAL calls) so the
+ * timed sections never allocate.
+ */
 public final class CallBindings {
-  // CAN message ID outside any production device range. Used to time the
-  // HAL call cost itself; we expect the receive to find no match and the
-  // send to either succeed silently or be ignored by every device.
+  /**
+   * CAN message ID outside any production device range. Used to time the
+   * HAL call cost itself; we expect the receive to find no match and the
+   * send to either succeed silently or be ignored by every device.
+   */
   private static final int CAN_BENCH_MESSAGE_ID = 0x1FFFFFFE;
 
   private final IntBuffer canRxId =
@@ -24,6 +40,13 @@ public final class CallBindings {
 
   private long sink;
 
+  /**
+   * Times one block for the requested call class.
+   *
+   * @return wall-time nanoseconds for the whole block (not per-call); the
+   *     {@link frc.robot.bench.stats.Statistics} stage divides by
+   *     {@link CallClass#blockSize()} when reporting per-call latency
+   */
   public long timeBlockNs(CallClass cc) {
     return switch (cc) {
       case HAL_GET_FPGA_TIME -> timeFpgaTime();
@@ -35,18 +58,35 @@ public final class CallBindings {
     };
   }
 
+  /**
+   * 100-call block. {@code HAL_GetFPGATime} is one of the cheapest HAL
+   * calls, so we need a large block to lift the signal above clock
+   * granularity (~250 ns on the RIO 2).
+   */
   private long timeFpgaTime() {
     long start = System.nanoTime();
-    for (int i = 0; i < 100; i++) sink ^= HALUtil.getFPGATime();
+    for (int i = 0; i < 100; i++) {
+      sink ^= HALUtil.getFPGATime();
+    }
     return System.nanoTime() - start;
   }
 
+  /**
+   * Single-shot 1 ms park. Reports the *jitter* (absolute deviation from
+   * the requested wake instant) rather than total elapsed time, because
+   * the 1 ms sleep itself is a constant we already know.
+   */
   private long timeNotifierWait() {
     long targetNs = System.nanoTime() + 1_000_000L;
     LockSupport.parkNanos(1_000_000L);
     return Math.abs(System.nanoTime() - targetNs);
   }
 
+  /**
+   * 10-call block hitting both the bool and the double DS getters in each
+   * iteration; together they exercise the typical "is enabled + match
+   * time" pair a robot loop reads.
+   */
   private long timeDsStateRead() {
     long start = System.nanoTime();
     for (int i = 0; i < 10; i++) {
@@ -56,6 +96,7 @@ public final class CallBindings {
     return System.nanoTime() - start;
   }
 
+  /** 10-call block of battery-voltage reads — a representative power-state HAL surface. */
   private long timePowerStateRead() {
     long start = System.nanoTime();
     for (int i = 0; i < 10; i++) {
@@ -64,6 +105,11 @@ public final class CallBindings {
     return System.nanoTime() - start;
   }
 
+  /**
+   * Times the CAN-receive HAL call once. The receive is expected to find
+   * no frame matching the bench ID; the cost being measured is the round-
+   * trip into the FRCNetComm session mux, not actual frame-handling work.
+   */
   private long timeCanFrameRead() {
     canRxId.put(0, CAN_BENCH_MESSAGE_ID);
     long start = System.nanoTime();
@@ -76,6 +122,11 @@ public final class CallBindings {
     return System.nanoTime() - start;
   }
 
+  /**
+   * Times the CAN-send HAL call once. {@code CAN_SEND_PERIOD_NO_REPEAT}
+   * disables HAL retries, so we measure a single transmit attempt
+   * regardless of bus state.
+   */
   private long timeCanFrameWrite() {
     long start = System.nanoTime();
     try {
@@ -87,6 +138,11 @@ public final class CallBindings {
     return System.nanoTime() - start;
   }
 
+  /**
+   * Exposes the JIT-defeat sink. Callers that want to be doubly sure the
+   * loops were not optimized away can read this and write it somewhere
+   * the JIT cannot see (for example, log output).
+   */
   public long sinkValue() {
     return sink;
   }
