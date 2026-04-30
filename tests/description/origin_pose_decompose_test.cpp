@@ -17,8 +17,8 @@ constexpr double tol_1e_12 = 1e-12;
 constexpr double tol_1e_9 = 1e-9;
 
 void expect_matrix_near(const transform_4x4& a, const transform_4x4& b, double tol) {
-  for (int col = 0; col < 4; ++col) {
-    for (int row = 0; row < 4; ++row) {
+  for (std::size_t col = 0; col < 4; ++col) {
+    for (std::size_t row = 0; row < 4; ++row) {
       EXPECT_NEAR(a[col][row], b[col][row], tol)
           << "mismatch at m[" << col << "][" << row << "]";
     }
@@ -64,7 +64,7 @@ TEST_P(DecomposeSingleAxis, ReproducesRpyForSingleAxisRotations) {
 
   const auto decomposed = decompose_origin(m);
 
-  for (int i = 0; i < 3; ++i) {
+  for (std::size_t i = 0; i < 3; ++i) {
     EXPECT_NEAR(decomposed.rpy_rad[i], rpy[i], tol_1e_12)
         << "rpy_rad[" << i << "] mismatch";
   }

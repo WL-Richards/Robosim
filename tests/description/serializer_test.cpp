@@ -239,7 +239,20 @@ TEST_F(serializer_test, S2_round_trip_with_modified_joint_origin_persists_value)
 // ===========================================================================
 
 TEST_F(serializer_test, S3_identity_origin_is_omitted_from_output) {
-  const auto d = load_v0_arm_v2_or_die();
+  // Load the fixture, then explicitly force every joint and link
+  // origin to identity in-memory. The on-disk fixture may carry
+  // non-identity values (e.g. authored via the visualizer gizmo);
+  // S3's contract is "if origins ARE identity, the serializer
+  // omits the keys," so the test sets identity directly rather
+  // than depending on the fixture's pose state.
+  auto d = load_v0_arm_v2_or_die();
+  for (auto& j : d.joints) {
+    j.origin = origin_pose{};
+  }
+  for (auto& l : d.links) {
+    l.visual_origin = origin_pose{};
+  }
+
   const auto path = tmp_dir_ / "identity.json";
   ASSERT_TRUE(save_to_file(d, path).has_value());
 
