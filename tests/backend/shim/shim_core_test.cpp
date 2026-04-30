@@ -9676,4 +9676,187 @@ TEST(HalObserveUserProgram, ShutdownMakesLaterObserverCallsNoOpsForOldShim) {
   EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::starting);
 }
 
+// ============================================================================
+// Cycle 36 — HAL_SetJoystickOutputs.
+// ============================================================================
+
+namespace {
+
+void expect_joystick_output_state_eq(const joystick_output_state& actual,
+                                     std::int64_t outputs,
+                                     std::int32_t left_rumble,
+                                     std::int32_t right_rumble) {
+  EXPECT_EQ(actual.outputs, outputs);
+  EXPECT_EQ(actual.left_rumble, left_rumble);
+  EXPECT_EQ(actual.right_rumble, right_rumble);
+}
+
+}  // namespace
+
+// C36-1. The C HAL signature matches WPILib's int64 output-bitmask ABI.
+TEST(HalSetJoystickOutputs, SignatureMatchesWpilibAbi) {
+  using expected_signature =
+      std::int32_t (*)(std::int32_t, std::int64_t, std::int32_t, std::int32_t);
+  static_assert(std::is_same_v<decltype(&HAL_SetJoystickOutputs), expected_signature>);
+  SUCCEED();
+}
+
+// C36-2. No installed shim returns handle error.
+TEST(HalSetJoystickOutputs, WithNoShimInstalledReturnsHandleError) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(HAL_SetJoystickOutputs(0, 1, 2, 3), kHalHandleError);
+}
+
+// C36-3. Fresh shims have no recorded joystick output states.
+TEST(HalSetJoystickOutputs, FreshShimHasNoJoystickOutputsRecorded) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  for (std::int32_t joystick = 0; joystick < HAL_kMaxJoysticks; ++joystick) {
+    EXPECT_FALSE(shim.joystick_outputs(joystick).has_value()) << "joystick " << joystick;
+  }
+}
+
+// C36-4. Invalid host accessor indices return nullopt.
+TEST(HalSetJoystickOutputs, AccessorInvalidIndicesReturnNullopt) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_FALSE(shim.joystick_outputs(-1).has_value());
+  EXPECT_FALSE(shim.joystick_outputs(HAL_kMaxJoysticks).has_value());
+}
+
+// C36-5. Valid slots record exact output bitmask and rumble values.
+TEST(HalSetJoystickOutputs, ValidSlotsRecordExactOutputAndRumbleValues) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_SetJoystickOutputs(0, 0x1'0000'0001ll, 0, 0xFFFF), kHalSuccess);
+  EXPECT_EQ(HAL_SetJoystickOutputs(5, -1, 0x1234, 0x5678), kHalSuccess);
+
+  ASSERT_TRUE(shim.joystick_outputs(0).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(0), 0x1'0000'0001ll, 0, 0xFFFF);
+  ASSERT_TRUE(shim.joystick_outputs(5).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(5), -1, 0x1234, 0x5678);
+
+  for (std::int32_t joystick = 1; joystick < 5; ++joystick) {
+    EXPECT_FALSE(shim.joystick_outputs(joystick).has_value()) << "joystick " << joystick;
+  }
+}
+
+// C36-6. Invalid joystick indices report handle error and preserve state.
+TEST(HalSetJoystickOutputs, InvalidJoystickIndicesReportHandleErrorAndPreserveState) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(0, 0x55, 0x1111, 0x2222), kHalSuccess);
+
+  EXPECT_EQ(HAL_SetJoystickOutputs(-1, 0x66, 0x3333, 0x4444), kHalHandleError);
+  EXPECT_EQ(HAL_SetJoystickOutputs(6, 0x77, 0x5555, 0x6666), kHalHandleError);
+
+  ASSERT_TRUE(shim.joystick_outputs(0).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(0), 0x55, 0x1111, 0x2222);
+  for (std::int32_t joystick = 1; joystick < HAL_kMaxJoysticks; ++joystick) {
+    EXPECT_FALSE(shim.joystick_outputs(joystick).has_value()) << "joystick " << joystick;
+  }
+}
+
+// C36-7. Repeated writes replace only the addressed joystick slot.
+TEST(HalSetJoystickOutputs, RepeatedWritesAreLatestWinsPerSlot) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(2, 0x10, 0x1000, 0x2000), kHalSuccess);
+  ASSERT_EQ(HAL_SetJoystickOutputs(3, 0x20, 0x3000, 0x4000), kHalSuccess);
+  ASSERT_EQ(HAL_SetJoystickOutputs(2, 0x30, 0x5000, 0x6000), kHalSuccess);
+
+  ASSERT_TRUE(shim.joystick_outputs(2).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(2), 0x30, 0x5000, 0x6000);
+  ASSERT_TRUE(shim.joystick_outputs(3).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(3), 0x20, 0x3000, 0x4000);
+}
+
+// C36-8. Raw C ABI values are preserved without clamping or narrowing.
+TEST(HalSetJoystickOutputs, RawRumbleAndOutputValuesArePreserved) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  constexpr std::int64_t kHighBitMask = static_cast<std::int64_t>(0x8000'0000'0000'0001ull);
+  EXPECT_EQ(HAL_SetJoystickOutputs(1, kHighBitMask, -1, 0x1'0000), kHalSuccess);
+
+  ASSERT_TRUE(shim.joystick_outputs(1).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(1), kHighBitMask, -1, 0x1'0000);
+}
+
+// C36-9. Joystick output state belongs to each shim object.
+TEST(HalSetJoystickOutputs, StateIsPerShimObject) {
+  tier1_shared_region region_a{};
+  tier1_endpoint core_a{tier1_endpoint::make(region_a, direction::core_to_backend).value()};
+  auto shim_a = make_connected_shim(region_a, core_a);
+  shim_global_install_guard guard{shim_a};
+  ASSERT_EQ(HAL_SetJoystickOutputs(4, 0x44, 0x1111, 0x2222), kHalSuccess);
+
+  tier1_shared_region region_b{};
+  tier1_endpoint core_b{tier1_endpoint::make(region_b, direction::core_to_backend).value()};
+  auto shim_b = make_connected_shim(region_b, core_b);
+  shim_core::install_global(&shim_b);
+  ASSERT_EQ(HAL_SetJoystickOutputs(4, 0x88, 0x3333, 0x4444), kHalSuccess);
+
+  ASSERT_TRUE(shim_a.joystick_outputs(4).has_value());
+  expect_joystick_output_state_eq(*shim_a.joystick_outputs(4), 0x44, 0x1111, 0x2222);
+  ASSERT_TRUE(shim_b.joystick_outputs(4).has_value());
+  expect_joystick_output_state_eq(*shim_b.joystick_outputs(4), 0x88, 0x3333, 0x4444);
+}
+
+// C36-10. Valid calls do not publish into existing outbound schemas.
+TEST(HalSetJoystickOutputs, CallsDoNotPublishOutboundMessages) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+  ASSERT_FALSE(core.try_receive().has_value());
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_SetJoystickOutputs(0, 0xAA, 0xBBBB, 0xCCCC), kHalSuccess);
+
+  ASSERT_TRUE(shim.joystick_outputs(0).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(0), 0xAA, 0xBBBB, 0xCCCC);
+  EXPECT_FALSE(core.try_receive().has_value());
+}
+
+// C36-11. Shutdown detaches the shim, so later calls fail and do not mutate.
+TEST(HalSetJoystickOutputs, ShutdownMakesLaterCallsFailWithoutMutatingOldShim) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(0, 0x11, 0x2222, 0x3333), kHalSuccess);
+
+  HAL_Shutdown();
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(HAL_SetJoystickOutputs(0, 0x44, 0x5555, 0x6666), kHalHandleError);
+
+  ASSERT_TRUE(shim.joystick_outputs(0).has_value());
+  expect_joystick_output_state_eq(*shim.joystick_outputs(0), 0x11, 0x2222, 0x3333);
+}
+
 }  // namespace robosim::backend::shim

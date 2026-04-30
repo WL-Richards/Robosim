@@ -60,6 +60,15 @@ enum class user_program_observer_state {
   test,
 };
 
+/** Latest joystick output command reported through HAL_SetJoystickOutputs. */
+struct joystick_output_state {
+  std::int64_t outputs;
+  std::int32_t left_rumble;
+  std::int32_t right_rumble;
+
+  bool operator==(const joystick_output_state&) const = default;
+};
+
 /**
  * In-process backend-side orchestrator for the HAL <-> Sim Core protocol.
  *
@@ -105,6 +114,12 @@ class shim_core {
 
   /** Records the latest user-program observer state for host-side v0 use. */
   void observe_user_program(user_program_observer_state state) noexcept;
+
+  /** Records the latest joystick outputs for one valid joystick slot. */
+  [[nodiscard]] std::int32_t set_joystick_outputs(std::int32_t joystick_num,
+                                                  std::int64_t outputs,
+                                                  std::int32_t left_rumble,
+                                                  std::int32_t right_rumble) noexcept;
 
   /**
    * Publishes a CAN frame batch using active-prefix serialization.
@@ -216,6 +231,9 @@ class shim_core {
   [[nodiscard]] const std::optional<error_message_batch>& latest_error_message_batch() const;
   /** Latest user-program observer state reported by robot code. */
   [[nodiscard]] user_program_observer_state user_program_observer_state() const noexcept;
+  /** Latest joystick output state for a valid slot, if one has been written. */
+  [[nodiscard]] std::optional<joystick_output_state> joystick_outputs(
+      std::int32_t joystick_num) const noexcept;
 
   shim_core(const shim_core&) = delete;
   shim_core& operator=(const shim_core&) = delete;
@@ -261,6 +279,7 @@ class shim_core {
   std::uint32_t pending_can_frame_count_ = 0;
   enum user_program_observer_state user_program_observer_state_ =
       static_cast<enum user_program_observer_state>(0);
+  std::array<std::optional<joystick_output_state>, kMaxJoysticks> joystick_outputs_{};
 
   struct can_stream_session {
     bool active = false;

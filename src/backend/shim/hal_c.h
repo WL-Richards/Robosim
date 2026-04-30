@@ -343,6 +343,17 @@ void HAL_ObserveUserProgramTeleop(void);
 void HAL_ObserveUserProgramTest(void);
 
 /**
+ * Mirrors WPILib HAL_SetJoystickOutputs from DriverStation.h.
+ *
+ * Stores the latest output bitmask and rumble values for one joystick slot.
+ * No installed shim or invalid joystick index returns kHalHandleError.
+ */
+std::int32_t HAL_SetJoystickOutputs(std::int32_t joystickNum,
+                                    std::int64_t outputs,
+                                    std::int32_t leftRumble,
+                                    std::int32_t rightRumble);
+
+/**
  * Mirrors WPILib HAL_SendError from hal/include/hal/DriverStation.h.
  *
  * Translates the C ABI arguments into error_message and buffers them on the

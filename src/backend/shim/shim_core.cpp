@@ -238,6 +238,18 @@ void shim_core::observe_user_program(enum user_program_observer_state state) noe
   user_program_observer_state_ = state;
 }
 
+std::int32_t shim_core::set_joystick_outputs(std::int32_t joystick_num,
+                                             std::int64_t outputs,
+                                             std::int32_t left_rumble,
+                                             std::int32_t right_rumble) noexcept {
+  if (joystick_num < 0 || joystick_num >= static_cast<std::int32_t>(kMaxJoysticks)) {
+    return kHalHandleError;
+  }
+  joystick_outputs_[static_cast<std::size_t>(joystick_num)] =
+      joystick_output_state{outputs, left_rumble, right_rumble};
+  return kHalSuccess;
+}
+
 void shim_core::wake_new_data_event_handles() const {
   if (WPI_SetEvent == nullptr) {
     return;
@@ -719,6 +731,14 @@ const std::optional<error_message_batch>& shim_core::latest_error_message_batch(
 
 user_program_observer_state shim_core::user_program_observer_state() const noexcept {
   return user_program_observer_state_;
+}
+
+std::optional<joystick_output_state> shim_core::joystick_outputs(
+    std::int32_t joystick_num) const noexcept {
+  if (joystick_num < 0 || joystick_num >= static_cast<std::int32_t>(kMaxJoysticks)) {
+    return std::nullopt;
+  }
+  return joystick_outputs_[static_cast<std::size_t>(joystick_num)];
 }
 
 }  // namespace robosim::backend::shim

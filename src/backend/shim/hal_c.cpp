@@ -704,6 +704,20 @@ void HAL_ObserveUserProgramTest(void) {
   shim->observe_user_program(user_program_observer_state::test);
 }
 
+std::int32_t HAL_SetJoystickOutputs(std::int32_t joystickNum,
+                                    std::int64_t outputs,
+                                    std::int32_t leftRumble,
+                                    std::int32_t rightRumble) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return kHalHandleError;
+  }
+  return shim->set_joystick_outputs(joystickNum, outputs, leftRumble, rightRumble);
+}
+
 std::int32_t HAL_SendError(HAL_Bool isError,
                            std::int32_t errorCode,
                            HAL_Bool isLVCode,

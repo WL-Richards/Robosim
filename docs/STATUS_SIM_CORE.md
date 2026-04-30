@@ -7,9 +7,9 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
 
 ## Headline
 
-- Full project baseline through cycle 35: **ctest 634/634 green** under
-  `build`. Cycle 35 focused shim suite: **319/319 green**.
-- HAL shim through **cycle 35** (power_state read surface closed +
+- Full project baseline through cycle 36: **ctest 645/645 green** under
+  `build`. Cycle 36 focused shim suite: **330/330 green**.
+- HAL shim through **cycle 36** (power_state read surface closed +
   clock_state read surface fully closed — all 7 fields wired; first
   two C HAL write surfaces landed; CAN stream RX and CAN status read
   landed; Driver Station scalar and joystick reads landed; Notifier
@@ -51,7 +51,8 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
   **`HAL_ObserveUserProgramDisabled`** /
   **`HAL_ObserveUserProgramAutonomous`** /
   **`HAL_ObserveUserProgramTeleop`** /
-  **`HAL_ObserveUserProgramTest`** (cycle 35). The three
+  **`HAL_ObserveUserProgramTest`** (cycle 35), plus
+  **`HAL_SetJoystickOutputs`** (cycle 36). The three
   power_state float readers widen float→double via
   D-C13-FLOAT-TO-DOUBLE-CAST. With cycle 16 the **power_state read
   surface is closed** — all three float fields wired.
@@ -809,17 +810,40 @@ observer calls do not publish into existing outbound schemas, and calls after
 coverage, and not naming the state accessor as host-facing v0 API; the
 revised plan reached `ready-to-implement`.
 
+### Cycle 36 — HAL_SetJoystickOutputs
+
+`HAL_SetJoystickOutputs` is now exported with the WPILib ABI:
+`int32_t HAL_SetJoystickOutputs(int32_t, int64_t, int32_t, int32_t)`.
+No installed shim returns `kHalHandleError`. Valid joystick indices are
+`0..5`; invalid write indices return `kHalHandleError` and do not mutate
+stored state.
+
+Because no protocol schema exists yet for publishing joystick output and
+rumble commands to Sim Core, v0 records the latest command per valid slot as
+a documented host-facing `shim_core::joystick_outputs(joystickNum)` optional
+`joystick_output_state`. Fresh shims and invalid accessor indices return
+`std::nullopt`. Repeated writes are latest-wins per slot, state is per shim
+object, raw signed C ABI values are preserved without clamping or narrowing,
+and calls do not publish into existing outbound schemas. Calls after
+`HAL_Shutdown` fail with `kHalHandleError` because shutdown detaches the
+process-global shim.
+
+**+11 tests** in `HalSetJoystickOutputs`. The first test-reviewer pass was
+`not-ready` for missing invalid-accessor behavior and missing ABI signature
+coverage; the revised plan reached `ready-to-implement`.
+
 ## What's next
 
 The C HAL ABI is the **largest remaining shim chunk** and is now in
-progress — cycles 12–35 wired the first read surfaces, the global shim
+progress — cycles 12–36 wired the first read surfaces, the global shim
 accessor, the first two write surfaces (`HAL_SendError` and
 `HAL_CAN_SendMessage`), CAN one-shot/stream RX, CAN status reads, and DS
 scalar and joystick/match/descriptor reads plus DS refresh/new-data
-events, outputs-enabled, user-program observers, plus the Notifier
+events, outputs-enabled, user-program observers, joystick outputs/rumble,
+plus the Notifier
 control-plane/wait and lifecycle slices. Each
 remaining surface is its own TDD cycle:
-- Remaining DS output surfaces (joystick outputs/rumble).
+- Protocol publication for DS output/observer host state.
 
 Other shim concerns:
 - Shim-initiated `shutdown`.
