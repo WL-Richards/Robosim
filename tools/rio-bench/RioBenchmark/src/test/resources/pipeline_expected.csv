@@ -1,0 +1,29 @@
+# rio-bench v0
+# wpilib_version=2026.2.1
+# rio_firmware=9.0.0
+# rio_image=2026_v3.0
+# git_sha=abc123def456
+# run_timestamp_iso8601=2026-04-29T20:00:00Z
+# warmup_samples=1000
+# samples_per_block=10000
+# block_size=100
+# validated=false
+call_class,operating_point,sample_count,mean_us,stddev_us,p99_us,outlier_rate
+can_frame_read,idle_bus,4,4.000,0.000,4.000,0.000000
+can_frame_read,multi_thread,4,16.000,0.000,16.000,0.000000
+can_frame_read,saturated_bus,4,10.000,0.000,10.000,0.000000
+can_frame_write,idle_bus,4,5.000,0.000,5.000,0.000000
+can_frame_write,multi_thread,4,17.000,0.000,17.000,0.000000
+can_frame_write,saturated_bus,4,11.000,0.000,11.000,0.000000
+ds_state_read,idle_bus,4,0.200,0.000,0.200,0.000000
+ds_state_read,multi_thread,4,1.400,0.000,1.400,0.000000
+ds_state_read,saturated_bus,4,0.800,0.000,0.800,0.000000
+hal_get_fpga_time,idle_bus,4,0.000,0.000,0.000,0.000000
+hal_get_fpga_time,multi_thread,4,0.120,0.000,0.120,0.000000
+hal_get_fpga_time,saturated_bus,4,0.060,0.000,0.060,0.000000
+hal_notifier_wait,idle_bus,4,1.000,0.000,1.000,0.000000
+hal_notifier_wait,multi_thread,4,13.000,0.000,13.000,0.000000
+hal_notifier_wait,saturated_bus,4,7.000,0.000,7.000,0.000000
+power_state_read,idle_bus,4,0.300,0.000,0.300,0.000000
+power_state_read,multi_thread,4,1.500,0.000,1.500,0.000000
+power_state_read,saturated_bus,4,0.900,0.000,0.900,0.000000

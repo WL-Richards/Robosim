@@ -52,6 +52,9 @@ enough."
   - `hal-shim.md` — in-process HAL shim core: boot handshake,
     inbound state caches, dispatch by `(envelope_kind, schema_id)`
   - `visualizer.md` — `src/viz/` 3D viewer (Edit / Live / Replay)
+  - `rio-bench.md` — `tools/rio-bench/` WPILib robot project that
+    benchmarks RIO 2 HAL call costs and emits the CSV fixture the
+    sim core's tier-1 backend will consume
 - `.claude/agents/test-reviewer.md` — TDD test-design gatekeeper
 
 ## Status
@@ -136,5 +139,21 @@ description tests green across the build matrix. v0 visualizer Edit
 mode is functionally complete. See `.claude/skills/visualizer.md`,
 `.claude/skills/robot-description-loader.md`, `tests/viz/TEST_PLAN.md`,
 `tests/description/TEST_PLAN_VC.md`, and `tests/viz/TEST_PLAN_VD.md`.
+
+Also in parallel, the `tools/rio-bench/` WPILib 2026 Java/Gradle
+robot project (the v0 tooling deliverable that benchmarks RoboRIO
+2 HAL call costs and emits the CSV fixture the sim core's tier-1
+backend will consume) has all pure-Java logic implemented and
+41/41 green under `./gradlew test` on JDK 17 with no HAL JNI
+required. Test plan went through 4 review rounds with
+`test-reviewer`; revision 4 + a P1 wording fix landed
+`ready-to-implement`. HAL-bound code (`BenchmarkRunner`,
+`CallBindings`, `RioFileSink`, `Robot.autonomousInit` wiring)
+compiles against WPILib 2026.2.1 and is ready for the first
+hardware run; the produced CSV is tagged `validated=false` until
+the operator runs the sweep on a physical RIO 2 and commits the
+result to `references/rio2-hal-costs/`. See
+`.claude/skills/rio-bench.md` and
+`tools/rio-bench/RioBenchmark/TEST_PLAN.md`.
 
 Repo: `git@github.com:WL-Richards/Robosim.git`.
