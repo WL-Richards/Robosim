@@ -1,6 +1,6 @@
 ---
 name: hal-shim
-description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 5: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` cache slots (`can_frame_batch` is variable-size with active-prefix memcpy and zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path. Does not yet cover the C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`, etc.), outbound traffic past boot, schemas other than `clock_state`/`power_state`/`ds_state`/`can_frame_batch`/`can_status`/`none`, CAN RX queueing semantics (deferred to whichever cycle wires the C HAL CAN consumer), threading, or reset/reconnect.
+description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 8: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` / `notifier_state` / `notifier_alarm_batch` / `error_message_batch` cache slots (the four variable-size — `can_frame_batch`, `notifier_state`, `notifier_alarm_batch`, `error_message_batch` — use active-prefix memcpy with zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path. **All 8 per-tick payload schemas are now wired**; the per-tick set is closed. Does not yet cover the C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`, `HAL_Notifier*`, `HAL_SendError`, etc.), outbound traffic past boot, on-demand request/reply, CAN RX queueing semantics (deferred to whichever cycle wires the C HAL CAN consumer), threading, or reset/reconnect.
 ---
 
 # HAL shim core
@@ -17,15 +17,38 @@ a third peer, with explicit padding-byte determinism pinned via
 as a fourth peer — **the first variable-size schema** (active-prefix
 memcpy with zero-init before every write so a shrinking batch leaves
 unused frame slots byte-zero rather than stale; per-frame padding-
-byte determinism extends D-C3-7); cycle 5 adds the inbound
+byte determinism extends D-C3-7); cycle 5 added the inbound
 `can_status` cache slot as a fifth peer — back to the fixed-size,
-no-padding shape of cycles 1/2/3. Future cycles add the remaining
-inbound schemas, outbound traffic, the C HAL ABI, threading, and
-reset/reconnect.
+no-padding shape of cycles 1/2/3; cycle 6 added the inbound
+`notifier_state` cache slot as a sixth peer — **the second
+variable-size schema** with the most implicit padding of any cached
+schema so far (the 4-byte interior `count → slots` pad pinned by
+`offsetof(notifier_state, slots) == 8`, plus 4 trailing pad bytes
+per `notifier_slot` × 32 slots = 132 padding bytes total, all
+covered by zero-init-before-write); cycle 7 added the inbound
+`notifier_alarm_batch` cache slot as a seventh peer — **the third
+variable-size schema**, sharing the 8-byte header layout of
+`notifier_state` but with a *named* `reserved_pad` field per
+`notifier_alarm_event` (so each event has no implicit padding; only
+the 4-byte interior `count → events` pad in the batch is implicit);
+cycle 8 added the inbound `error_message_batch` cache slot as the
+**eighth and final** per-tick peer — the fourth variable-size
+schema, distinguished by having **zero implicit C++ padding** (its
+4-byte interior between `count` and `messages` is a *named*
+`reserved_pad[4]` field, and `error_message`'s 3-byte gap after
+`truncation_flags` is a *named* `reserved_pad[3]` field; defaulted
+`operator==` covers every byte). Cycle 8 also retired test 10
+(D-C8-PROBE-RETIRED) since no per-tick schema remains unsupported
+and closed a pre-existing C7-6 determinism gap where
+`notifier_alarm_batch` had been inadvertently omitted from the
+"AllSevenSlots" replay despite the test name. Future cycles cover
+outbound traffic past `boot`, on-demand request/reply, the C HAL
+ABI, threading, and reset/reconnect — the per-tick payload schema
+set is closed.
 
 ## Scope
 
-**In (cycles 1–5):**
+**In (cycles 1–8):**
 - `shim_core::make(endpoint, desc, sim_time_us)` — moves the caller-
   owned `tier1_endpoint` into the shim and immediately publishes one
   `boot` envelope carrying `desc` via `endpoint.send`.
@@ -54,10 +77,52 @@ reset/reconnect.
     payload into the `latest_can_status_` cache slot (cycle 5).
     Fixed-size, no padding (5 × 4-byte fields all naturally
     aligned). Storage is independent of all other slots.
+  - `tick_boundary` + `notifier_state` → zero-inits a destination
+    `notifier_state{}`, then byte-copies exactly
+    `received->payload.size()` bytes (the active prefix the
+    `protocol_session` validator has already verified) into it
+    (cycle 6). The zero-init covers the 4-byte interior `count →
+    slots` pad, the 4 trailing pad bytes per `notifier_slot`, and
+    any slots `slots[count..31]` not in the active prefix — so a
+    shrinking batch leaves no stale slots and all 132 implicit
+    padding bytes deterministically zero. Storage is independent
+    of all other slots.
+  - `tick_boundary` + `notifier_alarm_batch` → zero-inits a
+    destination `notifier_alarm_batch{}`, then byte-copies exactly
+    `received->payload.size()` bytes into it (cycle 7). The
+    zero-init covers the 4-byte interior `count → events` pad and
+    any events `events[count..31]` not in the active prefix.
+    `notifier_alarm_event` has no implicit padding (its
+    `reserved_pad` is a *named* field), so per-event padding
+    determinism falls out of `operator==` directly — but C8-6's
+    determinism replay (which replaced the landed-but-incomplete
+    C7-6) adds a `std::memcmp` companion over
+    `sizeof(notifier_alarm_batch)` (520 bytes) to pin the 4
+    interior pad bytes plus all 32 event slots' contents.
+    Storage is independent of all other slots.
+  - `tick_boundary` + `error_message_batch` → zero-inits a
+    destination `error_message_batch{}`, then byte-copies exactly
+    `received->payload.size()` bytes into it (cycle 8). Unique
+    among the cached schemas in having **zero implicit C++
+    padding** — the 4-byte gap between `count` and `messages` is
+    a *named* `reserved_pad[4]` field, and `error_message`'s
+    3-byte gap after `truncation_flags` is a *named*
+    `reserved_pad[3]` field. Defaulted `operator==` covers every
+    byte, so C8-6's determinism replay does not add a memcmp
+    companion for this schema. Zero-init still applies for the
+    shrinking-batch contract (D-C8-VARIABLE-SIZE) — unused
+    `messages[count..7]` stay byte-zero rather than stale.
+    Storage is independent of all other slots.
   - `tick_boundary` + any other schema → returns
-    `unsupported_payload_schema`. The `protocol_session` has already
-    accepted the framing and advanced the receive counter, so the
-    next valid envelope is unaffected.
+    `unsupported_payload_schema`. At cycle 8 the per-tick payload
+    set is closed (8 schemas wired), so this branch is unreachable
+    from valid traffic. Retained as a defensive forward-compat
+    structural guard (D-C8-DEAD-BRANCH): a future schema added to
+    `protocol_version.h` and the validator's allowed set but not
+    yet wired here will fail loudly rather than silently
+    discarded. The `protocol_session` has already accepted the
+    framing and advanced the receive counter, so the next valid
+    envelope is unaffected.
   - `shutdown` → flips `is_shutting_down()` to true.
   - any other `envelope_kind` → returns `unsupported_envelope_kind`.
 - Terminal post-shutdown short-circuit: once `is_shutting_down()` is
@@ -66,13 +131,19 @@ reset/reconnect.
 - Observers: `is_connected()`, `is_shutting_down()`,
   `latest_clock_state()`, `latest_power_state()`,
   `latest_ds_state()`, `latest_can_frame_batch()`,
-  `latest_can_status()`.
+  `latest_can_status()`, `latest_notifier_state()`,
+  `latest_notifier_alarm_batch()`,
+  `latest_error_message_batch()`.
 
 **Out:**
-- All inbound schemas other than `clock_state`, `power_state`,
-  `ds_state`, `can_frame_batch`, `can_status`, and `none`. Cycle
-  6+ adds `notifier_state`, then `notifier_alarm_batch`,
-  `error_message_batch`, on-demand replies.
+- The per-tick payload schema set is closed at cycle 8 (all 8
+  schemas wired). On-demand replies (`on_demand_request` /
+  `on_demand_reply`) and outbound traffic follow as separate
+  cycles. The `unsupported_payload_schema` arm is retained as
+  a defensive forward-compat guard; if a post-v0 schema is
+  added to `protocol_version.h` and the validator's allowed set
+  but not yet wired in dispatch, the loud reject path still
+  fires.
 - **CAN RX queueing semantics.** `latest_can_frame_batch_` uses
   latest-wins (D-C4-LATEST-WINS) — a deferred decision pinned by
   the cycle-4 tests. Cycle-1 D #7 anticipated that CAN RX may
@@ -109,7 +180,9 @@ reset/reconnect.
 - `shim_core::is_connected()`, `is_shutting_down()`,
   `latest_clock_state()`, `latest_power_state()`,
   `latest_ds_state()`, `latest_can_frame_batch()`,
-  `latest_can_status()` — observers.
+  `latest_can_status()`, `latest_notifier_state()`,
+  `latest_notifier_alarm_batch()`,
+  `latest_error_message_batch()` — observers.
 
 `shim_core` is move-only; the wrapped `tier1_endpoint` is move-only.
 
@@ -155,34 +228,75 @@ reset/reconnect.
    tests (`ClockAndPowerCachesAreIndependentlyMaintained`,
    `ClockPowerAndDsCachesAreIndependentlyMaintained`).
 10. **Padding-byte determinism for variable-padding structs.**
-    `ds_state` (cycle 3) and `can_frame_batch` (cycle 4) are
-    the cached schemas with padding. `ds_state` has 5 interior
-    padding bytes; `can_frame_batch` has 3 trailing padding
-    bytes per `can_frame` × 64 frame slots. The shim's
-    `std::memcpy` byte-copy preserves padding verbatim; the
-    test fixtures' `ds_state{}` / `can_frame_batch{}` /
-    `can_frame{}` zero-init patterns ensure source padding is
-    zero on both runs. The current determinism test
-    (`RepeatedRunsProduceByteIdenticalAllFourSlots`) asserts
-    `std::memcmp == 0` directly on both `latest_ds_state()`
-    and `latest_can_frame_batch()`, in addition to `operator==`,
-    because defaulted `operator==` is field-by-field and does
-    not pin padding bytes. CLAUDE.md non-negotiable #5
-    ("byte-identical logs") demands this. `clock_state` and
-    `power_state` are padding-free by their field layouts and
-    don't need a `memcmp` companion.
+    `ds_state` (cycle 3), `can_frame_batch` (cycle 4),
+    `notifier_state` (cycle 6), and `notifier_alarm_batch`
+    (cycle 7) are the cached schemas with implicit padding.
+    `ds_state` has 5 interior padding bytes; `can_frame_batch`
+    has 3 trailing padding bytes per `can_frame` × 64 frame
+    slots; `notifier_state` has 4 interior pad bytes (the
+    `count → slots` word, pinned by `offsetof(notifier_state,
+    slots) == 8`) plus 4 trailing pad bytes per `notifier_slot`
+    × 32 slots = 132 implicit pad bytes total;
+    `notifier_alarm_batch` has just the 4-byte interior
+    `count → events` pad (its `notifier_alarm_event` carries a
+    *named* `reserved_pad`, not implicit padding).
+    `error_message_batch` (cycle 8) has **zero implicit
+    padding** — both its interior `count → messages` 4-byte
+    gap and `error_message`'s 3-byte gap after
+    `truncation_flags` are *named* `reserved_pad` fields, so
+    defaulted `operator==` covers every byte and no `memcmp`
+    companion is added. The shim's `std::memcpy` byte-copy
+    preserves padding verbatim; the test fixtures' value-init
+    patterns ensure source padding is zero on both runs. The
+    current determinism test
+    (`RepeatedRunsProduceByteIdenticalAllEightSlots`,
+    introduced at cycle 8 to replace the landed-but-incomplete
+    cycle-7 test) asserts `std::memcmp == 0` directly on
+    `latest_ds_state()`, `latest_can_frame_batch()`,
+    `latest_notifier_state()`, and
+    `latest_notifier_alarm_batch()`, in addition to
+    `operator==` on all 8 cached slots. `clock_state`,
+    `power_state`, `can_status`, and `error_message_batch` are
+    padding-free by their field layouts and don't need a
+    `memcmp` companion. CLAUDE.md non-negotiable #5
+    ("byte-identical logs") demands this.
 
 11. **Variable-size schemas use active-prefix memcpy with
-    zero-init before every write** (cycle 4, `can_frame_batch`).
+    zero-init before every write** (cycle 4 `can_frame_batch`,
+    cycle 6 `notifier_state`, cycle 7 `notifier_alarm_batch`,
+    cycle 8 `error_message_batch`).
     The dispatch arm reads `received->payload.size()` bytes
-    (not `sizeof(can_frame_batch)`); the protocol_session
-    validator has already verified the count↔length contract.
-    The destination is freshly zero-initialized before every
-    memcpy so a shrinking batch (M-frame batch replacing an
-    N-frame batch with M < N) leaves `frames[M..63]`
-    byte-zero, not stale. The naive
-    "memcpy directly into the existing optional's storage"
-    implementation leaks stale frames; pinned by C4-2b.
+    (not `sizeof(...)`); the protocol_session validator has
+    already verified the count↔length contract. The
+    destination is freshly zero-initialized before every
+    memcpy so a shrinking batch (M-element batch replacing an
+    N-element batch with M < N) leaves
+    `frames[M..63]` / `slots[M..31]` / `events[M..31]` /
+    `messages[M..7]` byte-zero, not stale. The same zero-init
+    also covers the 4-byte interior `count → slots`
+    (`notifier_state`) / `count → events`
+    (`notifier_alarm_batch`) implicit pad word that
+    `operator==` cannot see. The naive "memcpy directly into
+    the existing optional's storage" implementation leaks
+    stale elements; pinned by C4-2b, C6-2b, C7-2b, and C8-2b.
+
+12. **`unsupported_payload_schema` is dead code at cycle 8 —
+    intentionally retained.** All 8 per-tick payload schemas
+    are wired, so the fall-through return from the
+    `tick_boundary` dispatch switch is unreachable from valid
+    traffic. The branch stays as a defensive forward-compat
+    structural guard (D-C8-DEAD-BRANCH): if a post-v0 schema
+    is added to `protocol_version.h` and to the validator's
+    allowed set but not yet wired in dispatch, the branch
+    surfaces `unsupported_payload_schema` rather than silently
+    discarding. Removing the branch would force a future
+    cycle to re-add it AND its dispatch arm together — the
+    "no shortcuts" non-negotiable is what keeps it in place.
+    No test exercises this branch directly at cycle 8; the
+    cycles-2-through-7 test-10 set covered it across the
+    seven probe-schemas as they were progressively wired, and
+    cycle 8 retired test 10 (D-C8-PROBE-RETIRED) since no
+    probe schema remains.
 
 12. **Latest-wins is the cache contract for every schema,
     including CAN.** Cycle-1 D #7 anticipated that CAN RX may
@@ -235,39 +349,77 @@ Structural feature; no physical source data applies.
   was C5-R10's deferred variable-size determination for
   `notifier_state` (`offsetof(notifier_state, slots) == 8`, not 4,
   due to `alignof(notifier_slot) == 8`).
+- Cycle-6 plan approved by the `test-reviewer` agent on 2026-04-29
+  after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE6.md`).
+- Cycle-7 plan approved by the `test-reviewer` agent on 2026-04-29
+  after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE7.md`); test logic
+  approved with two plan-text clarifications (C7-2 full-struct
+  equality form; C7-3 family suite placement) and a
+  non-blocking `sizeof(notifier_alarm_batch)`-not-literal-520
+  recommendation that landed. **Note:** the landed C7-6
+  determinism replay implementation inadvertently omitted the
+  `notifier_alarm_batch` schema from the scenario, gates,
+  `operator==` checks, and memcmp companion (despite the test
+  name "AllSevenSlots"). Cycle 8's C8-6 corrects this gap.
+- Cycle-8 plan approved by the `test-reviewer` agent on
+  2026-04-29 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE8.md`); round-1 blocker
+  was C8-6's framing (must explicitly correct the C7-6
+  notifier_alarm_batch gap rather than presenting as a
+  strict superset) plus several non-blocking clarifications
+  (C8-2b memcmp purpose, C8-5 step-8 snapshot, test_helpers.h
+  include note, error_message_batch sizeof static_assert
+  recommendation), all addressed in rev 2. Cycle 8 retires
+  test 10 outright (D-C8-PROBE-RETIRED) since no per-tick
+  schema remains unsupported.
 - `tests/backend/shim/shim_core_test.cpp` covers, across cycles
-  1–5, 50 tests: boot publish layout, make-failure-atomicity (lane
+  1–8, 91 tests: boot publish layout, make-failure-atomicity (lane
   busy), wrong-direction endpoint surfacing
   `boot_wrong_direction`, post-make observer initial state for all
-  four cache slots, empty-poll no-op, boot_ack handshake,
+  eight cache slots, empty-poll no-op, boot_ack handshake,
   post-connect byte-equal caching for `clock_state` / `power_state`
-  / `ds_state` / `can_frame_batch` (the last via active-prefix
-  memcpy of variable-size payloads, including the empty-batch
-  count=0 boundary), latest-wins for each slot, the cycle-4-only
-  shrinking-batch zero-fill contract, out-of-order rejection of
-  all four schemas, cross-slot non-contamination across the full
-  pairwise matrix (boot_ack/clock/power/ds → cf-slot stays
-  nullopt; interleaved 7-step scenario with all four slots
-  asserted at every step covers the 6 new cycle-4 cross-population
-  directions), unsupported-schema reject + recovery (probe schema
-  is `can_status`; cycle 5 will migrate it forward to
-  `notifier_state`), shutdown handling, post-shutdown terminal,
-  `lane_in_progress` error wrapping, and an interleaved-scenario
-  determinism replay asserting byte-identical contents for all
-  four slots — including direct `std::memcmp` on both
-  `latest_ds_state()` and `latest_can_frame_batch()` to pin
-  padding-byte determinism.
+  / `ds_state` / `can_frame_batch` / `can_status` /
+  `notifier_state` / `notifier_alarm_batch` /
+  `error_message_batch` (the four variable-size schemas via
+  active-prefix memcpy, including the empty-batch count=0
+  boundary for each), latest-wins for each slot, the
+  shrinking-batch zero-fill contract for each variable-size
+  schema (C4-2b, C6-2b, C7-2b, C8-2b), out-of-order rejection
+  of all eight schemas, cross-slot non-contamination across
+  the full 8-slot interleaved scenario (15-step `2N-1` walk
+  with all eight slots asserted at every step, covering 14
+  cross-population directions added at cycle 8), shutdown
+  handling, post-shutdown terminal, `lane_in_progress` error
+  wrapping, and a 10-step interleaved-scenario determinism
+  replay (`RepeatedRunsProduceByteIdenticalAllEightSlots`,
+  introduced at cycle 8 to replace and correct the landed
+  C7-6) asserting byte-identical contents for all eight
+  slots — including direct `std::memcmp` on
+  `latest_ds_state()`, `latest_can_frame_batch()`,
+  `latest_notifier_state()`, and
+  `latest_notifier_alarm_batch()` to pin padding-byte
+  determinism (no memcmp on `error_message_batch` per
+  D-C8-PADDING-FREE). Test 10 (the cycles-2-through-7
+  unsupported-schema reject + recovery probe) was retired at
+  cycle 8 (D-C8-PROBE-RETIRED) since no still-unsupported
+  per-tick schema remains; the production-code dispatch arm
+  for `unsupported_payload_schema` is retained as a defensive
+  forward-compat structural guard (D-C8-DEAD-BRANCH).
 - Verification run: `ctest --test-dir build` and `ctest --test-dir
-  build-asan` both green for the 50-test shim suite under clang
-  Debug and GCC Debug + ASan + UBSan respectively.
+  build-asan` both green for the 91-test shim suite under clang
+  Debug and GCC Debug + ASan + UBSan respectively (and
+  406/406 across the full project ctest under both toolchains).
 
 ## Known Limits
 
-- Five inbound state schemas wired (`clock_state`, `power_state`,
-  `ds_state`, `can_frame_batch`, `can_status`); other schemas are
-  loud failures. Cycle 6+ will add `notifier_state`, then
-  `notifier_alarm_batch`, `error_message_batch`, on-demand
-  replies, one at a time, each as its own TDD cycle.
+- All eight inbound per-tick state schemas wired (`clock_state`,
+  `power_state`, `ds_state`, `can_frame_batch`, `can_status`,
+  `notifier_state`, `notifier_alarm_batch`,
+  `error_message_batch`); the per-tick set is closed.
+  On-demand replies (via `on_demand_reply`) and outbound
+  traffic past `boot` follow as their own TDD cycle(s).
 - CAN RX queueing is **not implemented**; `latest_can_frame_batch_`
   is latest-wins. Per D-C4-LATEST-WINS this is deferred until the
   cycle that wires `HAL_CAN_ReadStreamSession`.
@@ -310,8 +462,35 @@ Structural feature; no physical source data applies.
   interleaved cross-population coverage, probe migration to
   `notifier_state` with the `offsetof(notifier_state, slots) ==
   8` pin for cycle 6).
+- `tests/backend/shim/TEST_PLAN_CYCLE6.md` — approved cycle-6
+  addendum (notifier_state second variable-size cache slot,
+  132-byte padding determinism via direct `std::memcmp`,
+  six-slot interleaved cross-population coverage,
+  zero-init-before-write shrinking contract for the
+  variable-prefix `slots[]` array, probe migration to
+  `notifier_alarm_batch` for cycle 7).
+- `tests/backend/shim/TEST_PLAN_CYCLE7.md` — approved cycle-7
+  addendum (notifier_alarm_batch third variable-size cache slot,
+  4-byte interior padding determinism, seven-slot interleaved
+  cross-population coverage with 12 new direction-pairs,
+  zero-init-before-write shrinking contract for `events[]`,
+  probe migration to `error_message_batch` for cycle 8 with the
+  forward-reference note that cycle 8 must replace test 10
+  outright since no still-unsupported per-tick schema remains).
+- `tests/backend/shim/TEST_PLAN_CYCLE8.md` — approved cycle-8
+  addendum (error_message_batch fourth variable-size cache slot
+  and last per-tick payload schema; D-C8-PADDING-FREE because
+  both `reserved_pad` fields are named, so `operator==` covers
+  every byte and no memcmp companion is added; eight-slot
+  interleaved cross-population coverage with 14 new
+  direction-pairs; zero-init-before-write shrinking contract for
+  `messages[]`; D-C8-PROBE-RETIRED deleting test 10 outright;
+  D-C8-DEAD-BRANCH retaining the production-code reject arm as
+  forward-compat structural guard; C8-6 corrected the landed
+  C7-6's silent omission of `notifier_alarm_batch` from the
+  determinism replay).
 - `tests/backend/shim/shim_core_test.cpp` — implementation of the
-  approved cycle-1 + cycle-2 + cycle-3 + cycle-4 + cycle-5 tests.
+  approved cycle-1 through cycle-8 tests.
 - `tests/backend/tier1/test_helpers.h` — shared test helpers
   (`manually_fill_lane`, `make_envelope`, payload constructors,
   endpoint factories, `complete_handshake`) consumed by both the

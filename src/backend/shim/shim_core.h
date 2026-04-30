@@ -5,6 +5,8 @@
 #include "can_status.h"
 #include "clock_state.h"
 #include "ds_state.h"
+#include "error_message.h"
+#include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_session.h"
 #include "shared_memory_transport.h"
@@ -57,6 +59,9 @@ class shim_core {
   [[nodiscard]] const std::optional<ds_state>& latest_ds_state() const;
   [[nodiscard]] const std::optional<can_frame_batch>& latest_can_frame_batch() const;
   [[nodiscard]] const std::optional<can_status>& latest_can_status() const;
+  [[nodiscard]] const std::optional<notifier_state>& latest_notifier_state() const;
+  [[nodiscard]] const std::optional<notifier_alarm_batch>& latest_notifier_alarm_batch() const;
+  [[nodiscard]] const std::optional<error_message_batch>& latest_error_message_batch() const;
 
   shim_core(const shim_core&) = delete;
   shim_core& operator=(const shim_core&) = delete;
@@ -74,6 +79,9 @@ class shim_core {
   std::optional<ds_state> latest_ds_state_;
   std::optional<can_frame_batch> latest_can_frame_batch_;
   std::optional<can_status> latest_can_status_;
+  std::optional<notifier_state> latest_notifier_state_;
+  std::optional<notifier_alarm_batch> latest_notifier_alarm_batch_;
+  std::optional<error_message_batch> latest_error_message_batch_;
 };
 
 }  // namespace robosim::backend::shim

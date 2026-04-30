@@ -235,37 +235,56 @@ move-only fd/mapping RAII. Blocking waits, cross-process stress,
 named shared-memory discovery, and reset/reconnect behavior remain
 future cycles.
 
-The **HAL shim core (cycles 1–5)** is implemented and 50-test
-green. See `.claude/skills/hal-shim.md` for the working knowledge:
-boot publish on construction, single-threaded `poll()`-driven
-inbound drain, dispatch by `(envelope_kind, schema_id)`, five
-independent latest-wins state-cache slots (`latest_clock_state_`,
-`latest_power_state_`, `latest_ds_state_`,
-`latest_can_frame_batch_`, `latest_can_status_`), variable-size
-active-prefix memcpy with zero-init-before-write for
-`can_frame_batch`, explicit reject for still-unsupported schemas
-with session-counter advance through dispatch, terminal
-post-shutdown short-circuit, and direct `std::memcmp` padding-byte
-determinism on both `ds_state` and `can_frame_batch`. The shim's
-surface is a C++ API; the C HAL ABI (`HAL_GetFPGATime`,
+The **HAL shim core (cycles 1–8)** is implemented and 91-test
+green; full project ctest 406/406 green under both clang Debug
+and gcc Debug + ASan + UBSan. See `.claude/skills/hal-shim.md`
+for the working knowledge: boot publish on construction,
+single-threaded `poll()`-driven inbound drain, dispatch by
+`(envelope_kind, schema_id)`, **all eight per-tick payload
+schemas wired** as independent latest-wins state-cache slots
+(`latest_clock_state_`, `latest_power_state_`,
+`latest_ds_state_`, `latest_can_frame_batch_`,
+`latest_can_status_`, `latest_notifier_state_`,
+`latest_notifier_alarm_batch_`, `latest_error_message_batch_`),
+variable-size active-prefix memcpy with zero-init-before-write
+for the four variable-size schemas (`can_frame_batch`,
+`notifier_state`, `notifier_alarm_batch`,
+`error_message_batch`), terminal post-shutdown short-circuit,
+direct `std::memcmp` padding-byte determinism on the four
+padding-bearing schemas (`ds_state`, `can_frame_batch`,
+`notifier_state`, `notifier_alarm_batch` — `error_message_batch`
+is padding-free per D-C8-PADDING-FREE because both its
+`reserved_pad` fields are named), and a defensively-retained
+`unsupported_payload_schema` reject branch (D-C8-DEAD-BRANCH)
+that becomes unreachable from valid traffic at cycle 8 but
+remains a forward-compat structural guard. The shim's surface
+is a C++ API; the C HAL ABI (`HAL_GetFPGATime`,
 `HAL_GetVinVoltage`, `HAL_GetControlWord`,
 `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`,
-`HAL_Initialize`, etc.), the three inbound schemas other than
-`clock_state` / `power_state` / `ds_state` / `can_frame_batch` /
-`can_status`, CAN RX queueing semantics (deferred per
-D-C4-LATEST-WINS), all outbound traffic past `boot`, and threading
-remain future cycles.
+`HAL_Initialize`, `HAL_Notifier*`, `HAL_SendError`, etc.), CAN
+RX queueing semantics (deferred per D-C4-LATEST-WINS), all
+outbound traffic past `boot`, on-demand request/reply, and
+threading remain future cycles.
 
 Still ahead, each its own TDD cycle:
-- HAL shim cycles 6+: additional inbound schemas
-  (`notifier_state` next — variable-size with `offsetof(notifier_state,
-  slots) == 8`, then `notifier_alarm_batch`, `error_message_batch`,
-  on-demand replies), outbound traffic past boot, and the
-  exported C HAL ABI surfaces.
-- Transport lifecycle: T1 waits/reset/named discovery and T2 socket
-  framing + reconnect.
-- LD_PRELOAD libc shim for `clock_gettime` / `nanosleep` / etc.
-- `tools/rio-bench/` HAL-cost fixture.
+- Outbound traffic past `boot` — shim-side `tick_boundary`
+  (notifier registrations, CAN TX, error reporting) and
+  shim-initiated `shutdown`.
+- On-demand request/reply (`on_demand_request` from shim,
+  `on_demand_reply` from sim core), driving the
+  protocol_session's pairing surface.
+- Exported C HAL ABI surfaces — the largest remaining shim
+  chunk; promotes `latest_can_frame_batch_` from latest-wins
+  to a queue when `HAL_CAN_ReadStreamSession` lands
+  (D-C4-LATEST-WINS deferral cashes in here).
+- Threading model — single-threaded today, but the C HAL
+  surface is callable from any robot thread.
+- Transport lifecycle: T1 waits/reset/named discovery and T2
+  socket framing + reconnect.
+- LD_PRELOAD libc shim for `clock_gettime` / `nanosleep` /
+  etc.
+- `tools/rio-bench/` validated CSV from a physical RIO 2 run
+  (Java side complete; awaiting hardware sweep).
 
 ## Cross-references
 
@@ -280,12 +299,16 @@ Still ahead, each its own TDD cycle:
 - `tier1-shared-memory-transport.md` — native shared-region ABI,
   endpoint wrapper, and Linux memfd/mmap lifecycle for T1 protocol
   bytes.
-- `hal-shim.md` — in-process HAL shim core: boot handshake, inbound
-  state caches (`clock_state`, `power_state`, `ds_state`,
-  `can_frame_batch`, `can_status`), dispatch by `(envelope_kind,
-  schema_id)`, variable-size active-prefix memcpy with
-  zero-init-before-write, padding-byte determinism. Cycles 1–5
-  covered; cycle 6 (`notifier_state`) is next.
+- `hal-shim.md` — in-process HAL shim core: boot handshake, all
+  eight inbound state caches (`clock_state`, `power_state`,
+  `ds_state`, `can_frame_batch`, `can_status`, `notifier_state`,
+  `notifier_alarm_batch`, `error_message_batch`), dispatch by
+  `(envelope_kind, schema_id)`, variable-size active-prefix
+  memcpy with zero-init-before-write for the four variable-size
+  schemas, padding-byte determinism. Cycles 1–8 landed (the
+  per-tick payload set is closed); next major work is outbound
+  traffic past `boot`, on-demand request/reply, and the C HAL
+  ABI surfaces.
 - `robot-description-loader.md` — what we read to enumerate CAN IDs
   and pin firmware versions.
 - `docs/ARCHITECTURE.md` — process model, HAL boundary protocol,

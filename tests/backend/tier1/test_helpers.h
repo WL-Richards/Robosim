@@ -17,6 +17,8 @@
 #include "can_status.h"
 #include "clock_state.h"
 #include "ds_state.h"
+#include "error_message.h"
+#include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_version.h"
 #include "shared_memory_transport.h"
@@ -30,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -170,6 +173,141 @@ inline can_status valid_can_status(
   return can_status{percent_bus_utilization, bus_off_count,
                     tx_full_count, receive_error_count,
                     transmit_error_count};
+}
+
+// Cycle-6 helpers. notifier_slot has 4 trailing implicit pad bytes
+// (sizeof = 88 vs. named-field sum = 84). The notifier_slot{} zero-
+// init covers them so byte-equality on the wire holds (D-C6-PADDING).
+inline notifier_slot valid_notifier_slot(
+    std::uint64_t trigger_time_us = 1'000'000,
+    hal_handle handle             = 42,
+    hal_bool alarm_active         = 1,
+    hal_bool canceled             = 0,
+    const char* name              = "notifier") {
+  notifier_slot s{};
+  s.trigger_time_us = trigger_time_us;
+  s.handle = handle;
+  s.alarm_active = alarm_active;
+  s.canceled = canceled;
+  if (name != nullptr) {
+    const std::size_t n = std::min(std::strlen(name), s.name.size() - 1);
+    std::memcpy(s.name.data(), name, n);
+  }
+  return s;
+}
+
+// Builds a notifier_state holding `slots.size()` elements with the
+// `count` field set accordingly. Unused slots[count..31] left at the
+// notifier_state{} zero-init default — important for the shrinking-
+// batch contract (D-C6-VARIABLE-SIZE) and padding-byte determinism
+// (D-C6-PADDING; covers the 4-byte interior count→slots pad and all
+// per-slot trailing pad).
+inline notifier_state valid_notifier_state(
+    std::span<const notifier_slot> slots = {}) {
+  notifier_state state{};
+  state.count = static_cast<std::uint32_t>(slots.size());
+  for (std::size_t i = 0; i < slots.size() && i < state.slots.size(); ++i) {
+    state.slots[i] = slots[i];
+  }
+  return state;
+}
+
+// Returns a span over the active prefix of a notifier_state — the
+// bytes that the wire payload should carry. notifier_state's header
+// is offsetof(notifier_state, slots) == 8 (not 4) because notifier_slot
+// has alignof == 8 from its uint64_t trigger_time_us field.
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const notifier_state& state) {
+  const std::size_t active_size =
+      offsetof(notifier_state, slots) +
+      static_cast<std::size_t>(state.count) * sizeof(notifier_slot);
+  return {reinterpret_cast<const std::uint8_t*>(&state), active_size};
+}
+
+// Cycle-7 helpers. notifier_alarm_event has a NAMED reserved_pad field
+// (not implicit padding); operator== covers all bytes of an event.
+inline notifier_alarm_event valid_notifier_alarm_event(
+    std::uint64_t fired_at_us = 1'000'000,
+    hal_handle handle         = 42) {
+  notifier_alarm_event event{};
+  event.fired_at_us = fired_at_us;
+  event.handle = handle;
+  // reserved_pad stays zero from zero-init.
+  return event;
+}
+
+// notifier_alarm_batch: count + array<notifier_alarm_event, 32>.
+// Implicit padding: 4 bytes between count and events (events has
+// alignof 8). zero-init covers it (D-C7-PADDING).
+inline notifier_alarm_batch valid_notifier_alarm_batch(
+    std::span<const notifier_alarm_event> events = {}) {
+  notifier_alarm_batch batch{};
+  batch.count = static_cast<std::uint32_t>(events.size());
+  for (std::size_t i = 0; i < events.size() && i < batch.events.size(); ++i) {
+    batch.events[i] = events[i];
+  }
+  return batch;
+}
+
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const notifier_alarm_batch& batch) {
+  const std::size_t active_size =
+      offsetof(notifier_alarm_batch, events) +
+      static_cast<std::size_t>(batch.count) * sizeof(notifier_alarm_event);
+  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
+}
+
+// Cycle-8 helpers. error_message has a NAMED reserved_pad[3] field
+// after truncation_flags, and error_message_batch has a NAMED
+// reserved_pad[4] field between count and messages. Both are part of
+// the schema layout, not implicit C++ padding; defaulted operator==
+// covers every byte.
+inline error_message valid_error_message(
+    std::int32_t error_code             = 1,
+    hal_bool severity                   = 1,
+    hal_bool is_lv_code                 = 0,
+    hal_bool print_msg                  = 1,
+    std::uint8_t truncation_flags       = 0,
+    std::string_view details_text       = "",
+    std::string_view location_text      = "",
+    std::string_view call_stack_text    = "") {
+  error_message msg{};  // zero-init covers reserved_pad and the tail
+                        // of every fixed-size buffer (NUL-terminated).
+  msg.error_code       = error_code;
+  msg.severity         = severity;
+  msg.is_lv_code       = is_lv_code;
+  msg.print_msg        = print_msg;
+  msg.truncation_flags = truncation_flags;
+  // reserved_pad stays zero from zero-init.
+  const auto copy_into = [](auto& buf, std::string_view s) {
+    const std::size_t n = std::min(s.size(), buf.size() - 1);
+    std::memcpy(buf.data(), s.data(), n);
+  };
+  copy_into(msg.details,    details_text);
+  copy_into(msg.location,   location_text);
+  copy_into(msg.call_stack, call_stack_text);
+  return msg;
+}
+
+inline error_message_batch valid_error_message_batch(
+    std::span<const error_message> messages = {}) {
+  error_message_batch batch{};
+  batch.count = static_cast<std::uint32_t>(messages.size());
+  for (std::size_t i = 0;
+       i < messages.size() && i < batch.messages.size();
+       ++i) {
+    batch.messages[i] = messages[i];
+  }
+  // batch.reserved_pad stays zero from zero-init.
+  return batch;
+}
+
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const error_message_batch& batch) {
+  const std::size_t active_size =
+      offsetof(error_message_batch, messages) +
+      static_cast<std::size_t>(batch.count) * sizeof(error_message);
+  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
 }
 
 inline std::vector<std::uint8_t> boot_payload() {

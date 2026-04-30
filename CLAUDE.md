@@ -71,30 +71,48 @@ transport (fixed two-lane region, nonblocking endpoint,
 protocol-session integration, Linux memfd/mmap lifecycle) is
 implemented and adds 24 targeted tests; see
 `.claude/skills/tier1-shared-memory-transport.md`. The HAL shim core
-through cycle 5 (boot handshake; inbound `clock_state`, `power_state`,
-`ds_state`, `can_frame_batch`, and `can_status` cache slots, each
-independently maintained with latest-wins replacement;
-`can_frame_batch` uses variable-size active-prefix memcpy with
-zero-init-before-write so a shrinking batch leaves unused frame
-slots byte-zero; shutdown terminal receive path; single-threaded
-`poll()`-driven; loud reject for the three schemas not yet wired
-with session-counter advance through dispatch; padding-byte
-determinism for both `ds_state` and `can_frame_batch` pinned by
-direct `std::memcmp`) is implemented and the suite covers 50 shim
-tests; see `.claude/skills/hal-shim.md`,
+through cycle 8 (boot handshake; inbound `clock_state`, `power_state`,
+`ds_state`, `can_frame_batch`, `can_status`, `notifier_state`,
+`notifier_alarm_batch`, and `error_message_batch` cache slots —
+**all 8 per-tick payload schemas wired**, each independently
+maintained with latest-wins replacement; the four variable-size
+schemas (`can_frame_batch`, `notifier_state`, `notifier_alarm_batch`,
+`error_message_batch`) use active-prefix memcpy with
+zero-init-before-write so a shrinking batch leaves unused element
+slots byte-zero, and zero-init also covers the 4-byte interior
+`count → events`/`count → slots` implicit padding word in the two
+notifier schemas (`error_message_batch` has zero implicit padding
+because its `reserved_pad[4]` between `count` and `messages` plus
+`error_message`'s `reserved_pad[3]` after `truncation_flags` are
+*named* fields covered by defaulted `operator==`); shutdown terminal
+receive path; single-threaded `poll()`-driven; the
+`unsupported_payload_schema` arm is now unreachable from valid
+traffic but retained as a defensive forward-compat structural guard
+(D-C8-DEAD-BRANCH); padding-byte determinism for `ds_state`,
+`can_frame_batch`, `notifier_state`, and `notifier_alarm_batch`
+pinned by direct `std::memcmp` — cycle 8's C8-6 also closed a
+pre-existing gap where the landed C7-6 implementation had silently
+omitted `notifier_alarm_batch` from the determinism replay despite
+its name "AllSevenSlots") is implemented and the suite covers 91
+shim tests green (full project ctest 406/406) under both clang
+Debug and GCC Debug + ASan + UBSan; see `.claude/skills/hal-shim.md`,
 `tests/backend/shim/TEST_PLAN.md`,
 `tests/backend/shim/TEST_PLAN_CYCLE2.md`,
 `tests/backend/shim/TEST_PLAN_CYCLE3.md`,
-`tests/backend/shim/TEST_PLAN_CYCLE4.md`, and
-`tests/backend/shim/TEST_PLAN_CYCLE5.md`. Cycle-6 (inbound
-`notifier_state` — variable-size with `offsetof(notifier_state,
-slots) == 8`) is the next TDD cycle. CAN RX queueing semantics are
-deferred per D-C4-LATEST-WINS until the cycle that wires
-`HAL_CAN_ReadStreamSession`. The remaining HAL shim work (additional
-inbound schemas, outbound traffic past boot, exported C HAL ABI
-surfaces, threading), T1 wait/reset/named-discovery work, T2 socket
-transport, and LD_PRELOAD libc shim each remain as future TDD
-cycles. Layer 3/4/5 work has not started.
+`tests/backend/shim/TEST_PLAN_CYCLE4.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE5.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE6.md`,
+`tests/backend/shim/TEST_PLAN_CYCLE7.md`, and
+`tests/backend/shim/TEST_PLAN_CYCLE8.md`. The per-tick payload
+schema set is now closed; the next major shim work is outbound
+traffic past `boot`, the exported C HAL ABI surfaces (`HAL_*`
+symbols), and threading. CAN RX queueing semantics are deferred
+per D-C4-LATEST-WINS until the cycle that wires
+`HAL_CAN_ReadStreamSession`. The remaining HAL shim work
+(outbound traffic, C HAL ABI, threading), T1
+wait/reset/named-discovery work, T2 socket transport, and
+LD_PRELOAD libc shim each remain as future TDD cycles. Layer
+3/4/5 work has not started.
 
 In parallel, the visualizer subsystem (`src/viz/`,
 `ROBOSIM_BUILD_VIZ=ON` opt-in) has Phase VA scaffold + Phase VB

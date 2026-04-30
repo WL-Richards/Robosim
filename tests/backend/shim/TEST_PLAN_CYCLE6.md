@@ -1,7 +1,9 @@
 # HAL shim core — cycle 6 test plan (notifier_state)
 
-**Status:** **`rev 1 / draft`** — awaiting first `test-reviewer` cycle.
-Do not write test code from this document yet.
+**Status:** **landed**. `ready-to-implement` per `test-reviewer`
+agent (2026-04-29, single review round). Cycle-6 production code
+and tests landed and 63-shim-test green under both clang Debug
+and GCC Debug + ASan + UBSan.
 
 **Implements:** the sixth TDD cycle of the HAL shim core. Cycles
 1–5 are landed and 50-shim-test green. Cycle 6 promotes
@@ -187,14 +189,39 @@ added for the 132 padding bytes.
 
 - D-C6-LATEST-WINS. Two batches with different slot counts and
   different per-slot fields. Full-struct equality after each.
+- **Fixture values must be bit-distinct from `notifier_slot{}`**
+  default-init in every named field — otherwise a "shim writes
+  zeros" bug would pass against an all-zero fixture. Concrete
+  example: first batch `valid_notifier_state(std::array{
+    valid_notifier_slot(100, 1, 1, 0, "alpha"),
+    valid_notifier_slot(200, 2, 0, 1, "beta")})`; second batch
+  `valid_notifier_state(std::array{
+    valid_notifier_slot(500, 5, 1, 1, "delta"),
+    valid_notifier_slot(600, 6, 0, 0, "epsilon"),
+    valid_notifier_slot(700, 7, 1, 0, "zeta")})`. Both batches
+  non-empty; second has a different slot count and every
+  distinguished field changes.
 
 ### C6-2b. `ShimCorePoll.ShrinkingNotifierStateClearsTrailingSlotsInCache`
 
 - D-C6-VARIABLE-SIZE — zero-init-before-write. 5-slot batch
   replaced by 2-slot batch; assert `slots[2..4] == notifier_slot{}`
-  individually plus a `std::memcmp` byte-level guard on slots[2]
-  vs `notifier_slot{}` (catches partial field-clear that leaves
-  the 4 trailing padding bytes intact).
+  individually plus a `std::memcmp` byte-level guard on slots[2].
+- **Memcmp size: `sizeof(notifier_slot)` (88 bytes)**, not just
+  the 4-byte trailing pad region. Using the full slot size catches
+  any partial-field-clear bug that zeros named fields while
+  preserving the 4-byte trailing pad — same rationale as cycle-4
+  C4-2b's `sizeof(can_frame)` choice. Concretely:
+  `EXPECT_EQ(std::memcmp(&shim.latest_notifier_state()->slots[2],
+  &empty_slot, sizeof(notifier_slot)), 0)` where
+  `const notifier_slot empty_slot{};`.
+- **The 4-byte interior `count → slots` pad** is also covered by
+  zero-init at every write, but C6-2b does not add a dedicated
+  assertion for it — the zero-init happens unconditionally before
+  every memcpy (not only on shrinking writes), so the cycle-1b
+  default test already verifies this property at the moment of
+  every write. C6-6's full-struct memcmp pins it across the
+  determinism scenario.
 
 ### C6-3 family.
 
@@ -242,6 +269,18 @@ Family count is now 7. Cycle-4-stated parameterization cutover at
   `ds_state`, `can_frame_batch`, AND `notifier_state`** (3
   padding-bearing schemas). No memcmp on the 3 padding-free
   schemas (`clock_state`, `power_state`, `can_status`).
+- **Memcmp size for `notifier_state` is `sizeof(notifier_state)`
+  (2824 bytes), NOT the active-prefix size of the 3-slot scenario
+  (272 bytes).** Using the full struct size pins every padding
+  byte across all 32 slot entries (active and unused) plus the
+  4-byte interior `count → slots` pad. `notifier_state::operator==`
+  is field-by-field and pins none of these 132 implicit padding
+  bytes; only `std::memcmp` over `sizeof(notifier_state)` does.
+  Concretely:
+  `EXPECT_EQ(std::memcmp(&*shim_a.latest_notifier_state(),
+  &*shim_b.latest_notifier_state(), sizeof(notifier_state)), 0)`.
+  Same rationale as cycle-3 C3-6's `sizeof(ds_state)` and cycle-4
+  C4-6's `sizeof(can_frame_batch)` choices.
 
 ---
 

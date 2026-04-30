@@ -3,6 +3,7 @@
 #include "types.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -68,5 +69,14 @@ struct error_message_batch {
 
 static_assert(std::is_trivially_copyable_v<error_message_batch>);
 static_assert(std::is_standard_layout_v<error_message_batch>);
+static_assert(sizeof(error_message_batch) ==
+              offsetof(error_message_batch, messages) +
+                  kMaxErrorsPerBatch * sizeof(error_message),
+              "error_message_batch is 8-byte header + 8 * 2324 = 18600 "
+              "bytes; if this fires the layout shifted (named "
+              "reserved_pad[4] grew or shrank, or sizeof(error_message) "
+              "changed) and validator's offsetof-based active-prefix "
+              "math plus shim cycle-8 dispatch arm need re-verifying.");
+static_assert(sizeof(error_message_batch) == 18600);
 
 }  // namespace robosim::backend

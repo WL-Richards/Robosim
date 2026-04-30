@@ -102,6 +102,45 @@ std::expected<void, shim_error> shim_core::poll() {
         latest_can_status_ = state;
         return {};
       }
+      if (env.payload_schema == schema_id::notifier_state) {
+        // Variable-size: copy received->payload.size() bytes (active prefix),
+        // not sizeof(notifier_state). The state{} zero-init covers the
+        // 4-byte interior count→slots pad and per-slot trailing pad
+        // (D-C6-VARIABLE-SIZE / D-C6-PADDING).
+        notifier_state state{};
+        std::memcpy(&state, received->payload.data(), received->payload.size());
+        latest_notifier_state_ = state;
+        return {};
+      }
+      if (env.payload_schema == schema_id::notifier_alarm_batch) {
+        // Variable-size: copy received->payload.size() bytes (active prefix),
+        // not sizeof(notifier_alarm_batch). The state{} zero-init covers the
+        // 4-byte interior count→events pad and unused events[count..31]
+        // (D-C7-VARIABLE-SIZE / D-C7-PADDING). notifier_alarm_event has no
+        // implicit padding (its reserved_pad is a named field).
+        notifier_alarm_batch state{};
+        std::memcpy(&state, received->payload.data(), received->payload.size());
+        latest_notifier_alarm_batch_ = state;
+        return {};
+      }
+      if (env.payload_schema == schema_id::error_message_batch) {
+        // Variable-size: copy received->payload.size() bytes (active prefix).
+        // error_message_batch has zero implicit C++ padding — both its 4-byte
+        // interior count→messages reserved_pad and error_message's 3-byte
+        // post-truncation_flags reserved_pad are NAMED fields (D-C8-PADDING-
+        // FREE). The state{} zero-init still applies, covering unused
+        // messages[count..7] for the shrinking-batch contract
+        // (D-C8-VARIABLE-SIZE).
+        error_message_batch state{};
+        std::memcpy(&state, received->payload.data(), received->payload.size());
+        latest_error_message_batch_ = state;
+        return {};
+      }
+      // D-C8-DEAD-BRANCH: at cycle 8 every per-tick payload schema is wired,
+      // so this fall-through is unreachable from valid traffic. Kept as a
+      // defensive forward-compat structural guard — a future schema added
+      // to protocol_version.h and the validator's allowed set but not yet
+      // wired here will fail loudly rather than silently discarded.
       return std::unexpected(shim_error{shim_error_kind::unsupported_payload_schema,
                                         std::nullopt,
                                         "payload_schema",
@@ -145,6 +184,18 @@ const std::optional<can_frame_batch>& shim_core::latest_can_frame_batch() const 
 
 const std::optional<can_status>& shim_core::latest_can_status() const {
   return latest_can_status_;
+}
+
+const std::optional<notifier_state>& shim_core::latest_notifier_state() const {
+  return latest_notifier_state_;
+}
+
+const std::optional<notifier_alarm_batch>& shim_core::latest_notifier_alarm_batch() const {
+  return latest_notifier_alarm_batch_;
+}
+
+const std::optional<error_message_batch>& shim_core::latest_error_message_batch() const {
+  return latest_error_message_batch_;
 }
 
 }  // namespace robosim::backend::shim
