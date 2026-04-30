@@ -8,6 +8,7 @@
 
 add_library(robosim_backend_shim STATIC
   shim_core.cpp
+  hal_c.cpp
 )
 
 target_include_directories(robosim_backend_shim PUBLIC

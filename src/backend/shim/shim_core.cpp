@@ -1,5 +1,8 @@
 #include "shim_core.h"
 
+#include "hal_c.h"
+
+#include <algorithm>
 #include <cstring>
 #include <span>
 #include <utility>
@@ -94,6 +97,9 @@ std::expected<void, shim_error> shim_core::poll() {
         can_frame_batch state{};
         std::memcpy(&state, received->payload.data(), received->payload.size());
         latest_can_frame_batch_ = state;
+        for (std::uint32_t i = 0; i < state.count; ++i) {
+          enqueue_can_rx_frame_for_streams(state.frames[i]);
+        }
         return {};
       }
       if (env.payload_schema == schema_id::can_status) {
@@ -210,6 +216,177 @@ std::expected<void, shim_error> shim_core::send_error_message_batch(
     return std::unexpected(wrap_send_error(std::move(sent.error())));
   }
   return {};
+}
+
+void shim_core::enqueue_error(const error_message& msg) noexcept {
+  if (pending_error_count_ >= kMaxErrorsPerBatch) {
+    return;
+  }
+  pending_error_messages_[pending_error_count_] = msg;
+  ++pending_error_count_;
+}
+
+void shim_core::enqueue_can_frame(const can_frame& frame) noexcept {
+  if (pending_can_frame_count_ >= kMaxCanFramesPerBatch) {
+    return;
+  }
+  pending_can_frames_[pending_can_frame_count_] = frame;
+  ++pending_can_frame_count_;
+}
+
+std::expected<void, shim_error> shim_core::flush_pending_errors(
+    std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  if (pending_error_count_ == 0) {
+    return {};
+  }
+
+  error_message_batch batch{};
+  batch.count = pending_error_count_;
+  std::copy_n(pending_error_messages_.begin(),
+              pending_error_count_,
+              batch.messages.begin());
+
+  auto sent = send_error_message_batch(batch, sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(std::move(sent.error()));
+  }
+  pending_error_count_ = 0;
+  return {};
+}
+
+std::span<const error_message> shim_core::pending_error_messages() const noexcept {
+  return {pending_error_messages_.data(), pending_error_count_};
+}
+
+std::expected<void, shim_error> shim_core::flush_pending_can_frames(
+    std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  if (pending_can_frame_count_ == 0) {
+    return {};
+  }
+
+  can_frame_batch batch{};
+  batch.count = pending_can_frame_count_;
+  std::copy_n(pending_can_frames_.begin(),
+              pending_can_frame_count_,
+              batch.frames.begin());
+  const auto timestamp_us = static_cast<std::uint32_t>(sim_time_us);
+  for (std::uint32_t i = 0; i < pending_can_frame_count_; ++i) {
+    batch.frames[i].timestamp_us = timestamp_us;
+  }
+
+  auto sent = send_can_frame_batch(batch, sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(std::move(sent.error()));
+  }
+  pending_can_frame_count_ = 0;
+  return {};
+}
+
+std::span<const can_frame> shim_core::pending_can_frames() const noexcept {
+  return {pending_can_frames_.data(), pending_can_frame_count_};
+}
+
+std::uint32_t shim_core::open_can_stream_session(
+    std::uint32_t message_id,
+    std::uint32_t message_id_mask,
+    std::uint32_t max_messages) {
+  auto slot = std::ranges::find_if(can_stream_sessions_, [](const auto& session) {
+    return !session.active;
+  });
+  if (slot == can_stream_sessions_.end()) {
+    return 0;
+  }
+
+  slot->active = true;
+  slot->handle = next_can_stream_handle_++;
+  if (slot->handle == 0) {
+    slot->handle = next_can_stream_handle_++;
+  }
+  slot->message_id = message_id;
+  slot->message_id_mask = message_id_mask;
+  slot->max_messages = max_messages;
+  slot->overrun = false;
+  slot->queued_frames.clear();
+  slot->queued_frames.reserve(max_messages);
+  return slot->handle;
+}
+
+void shim_core::close_can_stream_session(std::uint32_t handle) noexcept {
+  auto slot = std::ranges::find_if(can_stream_sessions_, [handle](const auto& session) {
+    return session.active && session.handle == handle;
+  });
+  if (slot == can_stream_sessions_.end()) {
+    return;
+  }
+  slot->active = false;
+  slot->handle = 0;
+  slot->message_id = 0;
+  slot->message_id_mask = 0;
+  slot->max_messages = 0;
+  slot->overrun = false;
+  slot->queued_frames.clear();
+}
+
+std::int32_t shim_core::read_can_stream_session(
+    std::uint32_t handle,
+    std::span<can_frame> messages,
+    std::uint32_t& messages_read) {
+  messages_read = 0;
+  auto slot = std::ranges::find_if(can_stream_sessions_, [handle](const auto& session) {
+    return session.active && session.handle == handle;
+  });
+  if (slot == can_stream_sessions_.end()) {
+    return kHalCanNotAllowed;
+  }
+
+  if (messages.empty()) {
+    return kHalSuccess;
+  }
+  if (slot->queued_frames.empty()) {
+    return kHalCanNoToken;
+  }
+
+  const auto count = std::min<std::size_t>(messages.size(), slot->queued_frames.size());
+  std::copy_n(slot->queued_frames.begin(), count, messages.begin());
+  slot->queued_frames.erase(slot->queued_frames.begin(),
+                            slot->queued_frames.begin() +
+                                static_cast<std::ptrdiff_t>(count));
+  messages_read = static_cast<std::uint32_t>(count);
+
+  if (slot->overrun) {
+    slot->overrun = false;
+    return kHalCanSessionOverrun;
+  }
+  return kHalSuccess;
+}
+
+void shim_core::enqueue_can_rx_frame_for_streams(const can_frame& frame) {
+  for (auto& session : can_stream_sessions_) {
+    if (!session.active) {
+      continue;
+    }
+    if ((frame.message_id & session.message_id_mask) !=
+        (session.message_id & session.message_id_mask)) {
+      continue;
+    }
+    if (session.queued_frames.size() >= session.max_messages) {
+      session.queued_frames.erase(session.queued_frames.begin());
+      session.overrun = true;
+    }
+    session.queued_frames.push_back(frame);
+  }
 }
 
 bool shim_core::is_connected() const {

@@ -92,9 +92,9 @@ sync_envelope make_envelope(envelope_kind kind, schema_id ps,
 // assert un-instantiable).
 // ---------------------------------------------------------------------------
 
-TEST(Types, HalBoolIsUint32) {
+TEST(Types, HalBoolIsInt32) {
   EXPECT_EQ(sizeof(hal_bool), 4u);
-  EXPECT_TRUE((std::is_same_v<hal_bool, std::uint32_t>));
+  EXPECT_TRUE((std::is_same_v<hal_bool, std::int32_t>));
 }
 
 TEST(Types, HalHandleIsInt32) {

@@ -6,6 +6,7 @@
 #include "clock_state.h"
 #include "ds_state.h"
 #include "error_message.h"
+#include "hal_c.h"
 #include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_session.h"
@@ -15,9 +16,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace robosim::backend::shim {
 namespace {
@@ -93,6 +99,26 @@ tier1::tier1_message receive_from_shim(tier1_endpoint& core) {
   EXPECT_TRUE(msg.has_value());
   return std::move(*msg);
 }
+
+// Cycle-12 helper. Installs `shim` as the C-HAL-ABI process-global for
+// the duration of the guard's scope, restoring nullptr on destruction.
+// Tests that exercise HAL_GetFPGATime (and future HAL_* surfaces)
+// construct one of these after make_connected_shim returns. The guard
+// is intentionally NOT used by the tests that exercise install_global
+// / current directly (C12-1, C12-2, C12-3) — those tests are about
+// the install surface itself; using the guard would test the fixture
+// rather than the surface.
+class shim_global_install_guard {
+ public:
+  explicit shim_global_install_guard(shim_core& shim) {
+    shim_core::install_global(&shim);
+  }
+  ~shim_global_install_guard() {
+    shim_core::install_global(nullptr);
+  }
+  shim_global_install_guard(const shim_global_install_guard&) = delete;
+  shim_global_install_guard& operator=(const shim_global_install_guard&) = delete;
+};
 
 }  // namespace
 
@@ -4360,6 +4386,2777 @@ TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundErrorMessageBa
                         second_b.payload.data(),
                         second_a.payload.size()),
             0);
+}
+
+// ============================================================================
+// Cycle 12 — C HAL ABI plumbing + HAL_GetFPGATime (8 tests).
+// ============================================================================
+
+// C12-1. The process-global shim accessor defaults to nullptr before
+// any install_global call. The unconditional install_global(nullptr)
+// precondition makes the test self-contained even if the suite is
+// reshuffled or a prior test failed to clean up.
+TEST(ShimCoreCurrent, DefaultsToNullptrBeforeAnyInstallCall) {
+  shim_core::install_global(nullptr);
+
+  auto* p = shim_core::current();
+
+  EXPECT_EQ(p, nullptr);
+}
+
+// C12-2. install_global(p) makes current() == p. The pre-clear ensures
+// the test starts from null state regardless of suite ordering; the
+// post-clear leaves null state for downstream tests.
+TEST(ShimCoreCurrent, AfterInstallGlobalReturnsTheInstalledPointer) {
+  shim_core::install_global(nullptr);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  shim_core::install_global(&shim);
+
+  auto* p = shim_core::current();
+  EXPECT_EQ(p, &shim);
+
+  shim_core::install_global(nullptr);
+}
+
+// C12-3. install_global(nullptr) clears current(). Catches the
+// "if (p) static_ = p" bug where the clear path is silently dropped,
+// leaving a dangling pointer to a destroyed shim — a critical
+// correctness bug that the threading cycle inherits.
+TEST(ShimCoreCurrent, InstallGlobalNullptrClearsCurrent) {
+  shim_core::install_global(nullptr);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_core::install_global(&shim);
+
+  shim_core::install_global(nullptr);
+
+  auto* p = shim_core::current();
+  EXPECT_EQ(p, nullptr);
+}
+
+// C12-4. With no shim installed, HAL_GetFPGATime sets *status to
+// kHalHandleError and returns 0. The status sentinel 999 catches a
+// "function only writes status on the success path" bug.
+TEST(HalGetFPGATime, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  std::uint64_t t = HAL_GetFPGATime(&status);
+
+  EXPECT_EQ(t, std::uint64_t{0});
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C12-5. With shim installed but cache empty (post-boot, pre-first-
+// clock_state), HAL_GetFPGATime returns 0 with kHalSuccess — matches
+// the WPILib contract that HAL_GetFPGATime always succeeds, plus the
+// sim-authoritative "sim_time starts at 0" model. Confirms the call
+// is a pure read with no cache mutation.
+TEST(HalGetFPGATime, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_clock_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  std::uint64_t t = HAL_GetFPGATime(&status);
+
+  EXPECT_EQ(t, std::uint64_t{0});
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+}
+
+// C12-6. End-to-end: a clock_state envelope arrives over the
+// transport, the shim caches it, and HAL_GetFPGATime returns the
+// cached sim_time_us with kHalSuccess. The magic value
+// 0xDEAD'BEEF'CAFE'BABE has no zero bytes and exercises the full
+// 64-bit width.
+TEST(HalGetFPGATime, WithCachedClockStateReturnsItsSimTimeUsAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  constexpr std::uint64_t kMagicSimTime = 0xDEAD'BEEF'CAFE'BABEull;
+  const auto state = valid_clock_state(kMagicSimTime);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        kMagicSimTime));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+
+  std::int32_t status = 999;
+  std::uint64_t t = HAL_GetFPGATime(&status);
+
+  EXPECT_EQ(t, kMagicSimTime);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C12-7. Latest-wins across two sequenced updates, observed through
+// the C ABI with HAL_GetFPGATime calls INTERLEAVED between the polls.
+// The interleaved structure is what catches "HAL_GetFPGATime caches
+// its own copy on first read" — a structure that calls only after
+// both polls would not.
+TEST(HalGetFPGATime, LatestWinsAcrossTwoUpdatesReturnsTheMostRecentSimTimeUs) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // First poll → first read.
+  const auto state_1 = valid_clock_state(100'000);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_1),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  std::uint64_t t1 = HAL_GetFPGATime(&status1);
+  EXPECT_EQ(t1, std::uint64_t{100'000});
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Second poll → second read.
+  const auto state_2 = valid_clock_state(200'000);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_2),
+                        200'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  std::uint64_t t2 = HAL_GetFPGATime(&status2);
+  EXPECT_EQ(t2, std::uint64_t{200'000});
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// C12-8. HAL_GetFPGATime is idempotent. Three sequential calls without
+// an intervening poll return the same value. Three distinct status
+// sentinels (999/888/777) ensure each call independently writes
+// status, catching a "first-call-only writes status" bug.
+TEST(HalGetFPGATime, MultipleCallsWithoutInterveningPollReturnTheSameValue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  constexpr std::uint64_t kMagicSimTime = 0xDEAD'BEEF'CAFE'BABEull;
+  const auto state = valid_clock_state(kMagicSimTime);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        kMagicSimTime));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  std::int32_t status2 = 888;
+  std::int32_t status3 = 777;
+  std::uint64_t t1 = HAL_GetFPGATime(&status1);
+  std::uint64_t t2 = HAL_GetFPGATime(&status2);
+  std::uint64_t t3 = HAL_GetFPGATime(&status3);
+
+  EXPECT_EQ(t1, kMagicSimTime);
+  EXPECT_EQ(t2, kMagicSimTime);
+  EXPECT_EQ(t3, kMagicSimTime);
+  EXPECT_EQ(status1, kHalSuccess);
+  EXPECT_EQ(status2, kHalSuccess);
+  EXPECT_EQ(status3, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 13 — HAL_GetVinVoltage (4 tests). Mirrors C12 patterns; new
+// D-C13-FLOAT-TO-DOUBLE-CAST is the only new design decision.
+// ============================================================================
+
+// C13-1. With no shim installed, HAL_GetVinVoltage sets *status to
+// kHalHandleError and returns 0.0. Per-function mirror of C12-4.
+TEST(HalGetVinVoltage, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  double v = HAL_GetVinVoltage(&status);
+
+  EXPECT_EQ(v, 0.0);
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C13-2. With shim installed but cache empty, HAL_GetVinVoltage
+// returns 0.0 with kHalSuccess. Per-function mirror of C12-5 for
+// latest_power_state_.
+TEST(HalGetVinVoltage, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_power_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  double v = HAL_GetVinVoltage(&status);
+
+  EXPECT_EQ(v, 0.0);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+}
+
+// C13-3. With cached power_state, HAL_GetVinVoltage returns the
+// vin_v field widened to double. The fixture values 12.5 / 99.25 /
+// 6.75 are pairwise distinct AND exactly representable in IEEE-754
+// single AND double precision (25/2, 397/4, 27/4 — all dyadic
+// rationals), so static_cast<double>(12.5f) == 12.5 holds bit-for-bit
+// and the test asserts exact equality rather than tolerance
+// (D-C13-FLOAT-TO-DOUBLE-CAST: float→double widening is lossless
+// for finite values). Wrong-field bug (reading vin_a or
+// brownout_voltage_v) fails because the values are pairwise distinct.
+TEST(HalGetVinVoltage, WithCachedPowerStateReturnsItsVinVoltageAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_power_state(/*vin_v=*/12.5f,
+                                       /*vin_a=*/99.25f,
+                                       /*brownout_voltage_v=*/6.75f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_power_state().has_value());
+
+  std::int32_t status = 999;
+  double v = HAL_GetVinVoltage(&status);
+
+  EXPECT_EQ(v, 12.5);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C13-4. Latest-wins across two sequenced power_state updates,
+// with HAL_GetVinVoltage calls INTERLEAVED between the polls.
+// Mirror of C12-7: the interleaved structure is what catches
+// "caches-on-first-call" bugs. The two pairs use distinct vin_a /
+// brownout values across the two updates so a wrong-field bug also
+// changes between calls and would not coincidentally pass.
+// 11.0 and 13.5 are both exactly representable in IEEE-754 single
+// and double precision (11/1 and 27/2).
+TEST(HalGetVinVoltage, LatestWinsAcrossTwoUpdatesReturnsTheMostRecentVinVoltage) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // First poll → first read.
+  const auto state_1 = valid_power_state(/*vin_v=*/11.0f,
+                                         /*vin_a=*/1.0f,
+                                         /*brownout_voltage_v=*/6.0f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_1),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  double v1 = HAL_GetVinVoltage(&status1);
+  EXPECT_EQ(v1, 11.0);
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Second poll → second read.
+  const auto state_2 = valid_power_state(/*vin_v=*/13.5f,
+                                         /*vin_a=*/2.0f,
+                                         /*brownout_voltage_v=*/7.0f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_2),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  double v2 = HAL_GetVinVoltage(&status2);
+  EXPECT_EQ(v2, 13.5);
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 14 — HAL_GetVinCurrent (4 tests). Pure mirror of cycle 13;
+// no new design decisions; D-C13-FLOAT-TO-DOUBLE-CAST inherits.
+// ============================================================================
+
+// C14-1. With no shim installed, HAL_GetVinCurrent sets *status to
+// kHalHandleError and returns 0.0.
+TEST(HalGetVinCurrent, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  double a = HAL_GetVinCurrent(&status);
+
+  EXPECT_EQ(a, 0.0);
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C14-2. With shim installed but cache empty, HAL_GetVinCurrent
+// returns 0.0 with kHalSuccess.
+TEST(HalGetVinCurrent, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_power_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  double a = HAL_GetVinCurrent(&status);
+
+  EXPECT_EQ(a, 0.0);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+}
+
+// C14-3. With cached power_state, HAL_GetVinCurrent returns vin_a
+// widened to double. Fixture values 7.5 / 42.25 / 6.5 are
+// deliberately different from C13-3's 12.5 / 99.25 / 6.75 so a
+// "copy-pasted HAL_GetVinVoltage's body and forgot to change vin_v
+// to vin_a" bug fails loudly: against C14-3's vin_v=7.5f the
+// wrong-field read returns 7.5 != 42.25; against C13-3's vin_v=12.5f
+// it returns 12.5 != 42.25. Either way caught.
+TEST(HalGetVinCurrent, WithCachedPowerStateReturnsItsVinCurrentAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_power_state(/*vin_v=*/7.5f,
+                                       /*vin_a=*/42.25f,
+                                       /*brownout_voltage_v=*/6.5f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_power_state().has_value());
+
+  std::int32_t status = 999;
+  double a = HAL_GetVinCurrent(&status);
+
+  EXPECT_EQ(a, 42.25);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C14-4. Latest-wins across two power_state updates with
+// HAL_GetVinCurrent calls interleaved between the polls. The two
+// updates also change vin_v / brownout, so a wrong-field read also
+// changes between calls and the test does not coincidentally pass.
+// 3.5 (= 7/2) and 8.25 (= 33/4) are exactly representable in IEEE-
+// 754 single and double precision.
+TEST(HalGetVinCurrent, LatestWinsAcrossTwoUpdatesReturnsTheMostRecentVinCurrent) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // First poll → first read.
+  const auto state_1 = valid_power_state(/*vin_v=*/10.0f,
+                                         /*vin_a=*/3.5f,
+                                         /*brownout_voltage_v=*/6.0f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_1),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  double a1 = HAL_GetVinCurrent(&status1);
+  EXPECT_EQ(a1, 3.5);
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Second poll → second read.
+  const auto state_2 = valid_power_state(/*vin_v=*/12.0f,
+                                         /*vin_a=*/8.25f,
+                                         /*brownout_voltage_v=*/7.0f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_2),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  double a2 = HAL_GetVinCurrent(&status2);
+  EXPECT_EQ(a2, 8.25);
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 15 — HAL_Bool parity + HAL_GetBrownedOut (4 tests).
+// hal_bool changed from uint32_t → int32_t (D-C15-HAL-BOOL-SIGNED-
+// PARITY) to match WPILib's HAL_Bool typedef. HAL_Bool is now exported
+// from hal_c.h as a transparent int32_t alias (D-C15-HAL-BOOL-
+// TYPEDEF-IN-HAL-C-H). HAL_GetBrownedOut is the first HAL_Bool-
+// returning C ABI surface.
+// ============================================================================
+
+// C15-1. With no shim installed, HAL_GetBrownedOut returns 0 with
+// kHalHandleError. Per-function mirror of C12-4 / C13-1 / C14-1.
+TEST(HalGetBrownedOut, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetBrownedOut(&status);
+
+  EXPECT_EQ(b, 0);
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C15-2. With shim installed but cache empty, HAL_GetBrownedOut
+// returns 0 with kHalSuccess. The WPILib contract is "always
+// succeeds"; surfacing kHalHandleError on empty cache would mislead
+// robot bootstrap as a brownout trip.
+TEST(HalGetBrownedOut, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_clock_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetBrownedOut(&status);
+
+  EXPECT_EQ(b, 0);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+}
+
+// C15-3. With cached clock_state where browned_out=1 and ALL FOUR
+// sibling hal_bool fields are 0, HAL_GetBrownedOut returns 1 with
+// kHalSuccess. The all-siblings-zero fixture closes wrong-field bugs
+// directly: a shim that erroneously reads system_active /
+// system_time_valid / fpga_button_latched / rsl_state instead of
+// browned_out returns 0, failing the b == 1 assertion.
+TEST(HalGetBrownedOut, WithCachedClockStateBrownedOutTrueReturnsOneAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.system_active       = 0;
+  state.browned_out         = 1;  // distinguished value
+  state.system_time_valid   = 0;
+  state.fpga_button_latched = 0;
+  state.rsl_state           = 0;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetBrownedOut(&status);
+
+  EXPECT_EQ(b, 1);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C15-4. Latest-wins across two clock_state updates with
+// HAL_GetBrownedOut calls interleaved between polls. The two updates
+// invert browned_out vs. all four sibling hal_bool fields, so a
+// "shim reads wrong hal_bool field" bug produces the wrong observable
+// at every step in opposite directions, AND a "caches-on-first-call"
+// bug shows b2 == 0 instead of expected 1.
+TEST(HalGetBrownedOut, LatestWinsAcrossTwoUpdatesIsolatesBrownedOutFromOtherHalBoolFields) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // Step 1: browned_out=0 while ALL siblings=1.
+  auto state_1 = valid_clock_state(/*sim_time_us=*/50'000);
+  state_1.system_active       = 1;
+  state_1.browned_out         = 0;
+  state_1.system_time_valid   = 1;
+  state_1.fpga_button_latched = 1;
+  state_1.rsl_state           = 1;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_1),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  HAL_Bool b1 = HAL_GetBrownedOut(&status1);
+  EXPECT_EQ(b1, 0);
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Step 2: browned_out=1 while ALL siblings=0 (inverted).
+  auto state_2 = valid_clock_state(/*sim_time_us=*/100'000);
+  state_2.system_active       = 0;
+  state_2.browned_out         = 1;
+  state_2.system_time_valid   = 0;
+  state_2.fpga_button_latched = 0;
+  state_2.rsl_state           = 0;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_2),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  HAL_Bool b2 = HAL_GetBrownedOut(&status2);
+  EXPECT_EQ(b2, 1);
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 16 — HAL_GetBrownoutVoltage (4 tests). Pure mirror of cycles
+// 13/14 against the third (and final) power_state float field; closes
+// the power_state read surface. No new design decisions.
+// ============================================================================
+
+// C16-1. With no shim installed, HAL_GetBrownoutVoltage returns 0.0
+// with kHalHandleError.
+TEST(HalGetBrownoutVoltage, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  double v = HAL_GetBrownoutVoltage(&status);
+
+  EXPECT_EQ(v, 0.0);
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C16-2. With shim installed but cache empty, HAL_GetBrownoutVoltage
+// returns 0.0 with kHalSuccess.
+TEST(HalGetBrownoutVoltage, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_power_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  double v = HAL_GetBrownoutVoltage(&status);
+
+  EXPECT_EQ(v, 0.0);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+}
+
+// C16-3. With cached power_state, HAL_GetBrownoutVoltage returns
+// brownout_voltage_v widened to double. Fixture values 14.5 / 2.5 /
+// 6.875 are pairwise distinct AND deliberately different from
+// cycle-13's 12.5/99.25/6.75 and cycle-14's 7.5/42.25/6.5 so a
+// "copy-pasted HAL_GetVinVoltage's body and forgot to change the
+// field" bug fails: wrong-field reads of vin_v return 14.5 != 6.875,
+// and wrong-field reads of vin_a return 2.5 != 6.875. All three
+// values are exactly representable in IEEE-754 single AND double
+// precision (29/2, 5/2, 55/8). All three positional args supplied
+// explicitly so the helper's defaults (12.5/2.0/6.8) are NOT in
+// effect — round-1 reviewer required change.
+TEST(HalGetBrownoutVoltage, WithCachedPowerStateReturnsItsBrownoutVoltageAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_power_state(/*vin_v=*/14.5f,
+                                       /*vin_a=*/2.5f,
+                                       /*brownout_voltage_v=*/6.875f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_power_state().has_value());
+
+  std::int32_t status = 999;
+  double v = HAL_GetBrownoutVoltage(&status);
+
+  EXPECT_EQ(v, 6.875);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C16-4. Latest-wins across two power_state updates with
+// HAL_GetBrownoutVoltage calls interleaved between polls. The two
+// updates also change vin_v / vin_a, so a wrong-field bug shifts
+// between calls and the test does not coincidentally pass. 6.25
+// (= 25/4) and 6.5 (= 13/2) are exactly representable in IEEE-754
+// single and double.
+TEST(HalGetBrownoutVoltage, LatestWinsAcrossTwoUpdatesReturnsTheMostRecentBrownoutVoltage) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // First poll → first read.
+  const auto state_1 = valid_power_state(/*vin_v=*/10.0f,
+                                         /*vin_a=*/4.0f,
+                                         /*brownout_voltage_v=*/6.25f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_1),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  double v1 = HAL_GetBrownoutVoltage(&status1);
+  EXPECT_EQ(v1, 6.25);
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Second poll → second read.
+  const auto state_2 = valid_power_state(/*vin_v=*/12.5f,
+                                         /*vin_a=*/5.5f,
+                                         /*brownout_voltage_v=*/6.5f);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::power_state,
+                        bytes_of(state_2),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  double v2 = HAL_GetBrownoutVoltage(&status2);
+  EXPECT_EQ(v2, 6.5);
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 17 — clock_state HAL_Bool readers (helper-lifted) + 4 new
+// surfaces. HAL_GetBrownedOut (cycle 15) was refactored to call the
+// new shared `clock_state_hal_bool_read` helper; these 4 tests pin
+// the per-wrapper "passes the correct &clock_state::field to the
+// helper" contract for the four new readers. Cycle-15's existing
+// HalGetBrownedOut tests cover the helper's null-shim / empty-cache
+// / latest-wins paths centrally.
+// ============================================================================
+
+// C17-1. HAL_GetSystemActive returns the system_active field (only
+// system_active = 1 in the fixture; all four siblings = 0 so a
+// wrong-field read returns 0 instead of expected 1).
+TEST(HalGetSystemActive, WithCachedClockStateSystemActiveTrueReturnsOneAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.system_active       = 1;  // distinguished
+  state.browned_out         = 0;
+  state.system_time_valid   = 0;
+  state.fpga_button_latched = 0;
+  state.rsl_state           = 0;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetSystemActive(&status);
+
+  EXPECT_EQ(b, 1);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C17-2. HAL_GetSystemTimeValid returns the system_time_valid field.
+TEST(HalGetSystemTimeValid, WithCachedClockStateSystemTimeValidTrueReturnsOneAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.system_active       = 0;
+  state.browned_out         = 0;
+  state.system_time_valid   = 1;  // distinguished
+  state.fpga_button_latched = 0;
+  state.rsl_state           = 0;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetSystemTimeValid(&status);
+
+  EXPECT_EQ(b, 1);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C17-3. HAL_GetFPGAButton returns the fpga_button_latched field.
+// Note: the WPILib function is named HAL_GetFPGAButton but the
+// schema field is `fpga_button_latched` — a wrapper that erroneously
+// references `&clock_state::fpga_button` would not compile (no such
+// field), so the realistic copy-paste-from-sibling bug is caught by
+// the all-siblings-zero fixture below.
+TEST(HalGetFPGAButton, WithCachedClockStateFpgaButtonLatchedTrueReturnsOneAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.system_active       = 0;
+  state.browned_out         = 0;
+  state.system_time_valid   = 0;
+  state.fpga_button_latched = 1;  // distinguished
+  state.rsl_state           = 0;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetFPGAButton(&status);
+
+  EXPECT_EQ(b, 1);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C17-4. HAL_GetRSLState returns the rsl_state field.
+TEST(HalGetRSLState, WithCachedClockStateRslStateTrueReturnsOneAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.system_active       = 0;
+  state.browned_out         = 0;
+  state.system_time_valid   = 0;
+  state.fpga_button_latched = 0;
+  state.rsl_state           = 1;  // distinguished
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status = 999;
+  HAL_Bool b = HAL_GetRSLState(&status);
+
+  EXPECT_EQ(b, 1);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 18 — HAL_GetCommsDisableCount (5 tests). Last clock_state
+// reader; closes the entire clock_state read surface. Schema field is
+// uint32_t; WPILib returns int32_t; shim casts at the C ABI seam per
+// D-C18-UINT32-TO-INT32-CAST. Test count is 5 (instead of cycle-13/14/
+// 16's 4) because the cast-wraparound branch warrants its own test
+// separate from the field-read correctness test, per round-1 reviewer.
+// ============================================================================
+
+// C18-1. With no shim installed, HAL_GetCommsDisableCount returns 0
+// with kHalHandleError.
+TEST(HalGetCommsDisableCount, WithNoShimInstalledSetsStatusToHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  std::int32_t n = HAL_GetCommsDisableCount(&status);
+
+  EXPECT_EQ(n, 0);
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C18-2. With shim installed but cache empty, HAL_GetCommsDisableCount
+// returns 0 with kHalSuccess.
+TEST(HalGetCommsDisableCount, WithShimInstalledButCacheEmptyReturnsZeroAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_clock_state().has_value());
+
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  std::int32_t n = HAL_GetCommsDisableCount(&status);
+
+  EXPECT_EQ(n, 0);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+}
+
+// C18-3. With cached clock_state, HAL_GetCommsDisableCount returns
+// comms_disable_count. Value 42 is in range for both uint32_t and
+// int32_t — the cast at the seam is identity. Wrong-field hygiene:
+// sim_time_us=50'000 (helper default) != 42; hal_bool fields are
+// 0 or 1 != 42. So a wrong-field read fails the n == 42 assertion.
+TEST(HalGetCommsDisableCount, WithCachedClockStateReturnsItsCommsDisableCountAndSetsSuccessStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.comms_disable_count = 42;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+
+  std::int32_t status = 999;
+  std::int32_t n = HAL_GetCommsDisableCount(&status);
+
+  EXPECT_EQ(n, 42);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C18-4. With cached clock_state and comms_disable_count > INT32_MAX,
+// HAL_GetCommsDisableCount returns the wraparound cast value per
+// D-C18-UINT32-TO-INT32-CAST. The expected value is spelled as
+// `static_cast<int32_t>(std::uint32_t{0xCAFEBABEu})` rather than the
+// hardcoded -889'275'714 so the assertion reads as a statement of
+// the C++20 modular-conversion rule.
+TEST(HalGetCommsDisableCount, WithCachedClockStateAndCountAboveInt32MaxReturnsWraparoundCastValue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_clock_state(/*sim_time_us=*/50'000);
+  state.comms_disable_count = 0xCAFEBABEu;  // > INT32_MAX
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status = 999;
+  std::int32_t n = HAL_GetCommsDisableCount(&status);
+
+  EXPECT_EQ(n, static_cast<std::int32_t>(std::uint32_t{0xCAFEBABEu}));
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+// C18-5. Latest-wins across two clock_state updates with
+// HAL_GetCommsDisableCount calls interleaved between the polls. The
+// values 7 and 42 are small, in-range, and distinct. Latest-wins is
+// a cache-management property, not a cast-behavior property — the
+// wraparound case is C18-4's job.
+TEST(HalGetCommsDisableCount, LatestWinsAcrossTwoUpdatesReturnsTheMostRecentCount) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  // First poll → first read.
+  auto state_1 = valid_clock_state(/*sim_time_us=*/50'000);
+  state_1.comms_disable_count = 7;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_1),
+                        50'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status1 = 999;
+  std::int32_t n1 = HAL_GetCommsDisableCount(&status1);
+  EXPECT_EQ(n1, 7);
+  EXPECT_EQ(status1, kHalSuccess);
+
+  // Second poll → second read.
+  auto state_2 = valid_clock_state(/*sim_time_us=*/100'000);
+  state_2.comms_disable_count = 42;
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state_2),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+
+  std::int32_t status2 = 888;
+  std::int32_t n2 = HAL_GetCommsDisableCount(&status2);
+  EXPECT_EQ(n2, 42);
+  EXPECT_EQ(status2, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 19 — HAL_SendError + pending outbound error buffering.
+// First C HAL ABI write surface. HAL_SendError constructs an
+// error_message and appends it to shim_core's fixed-capacity pending
+// buffer; the integrator explicitly flushes that buffer at tick
+// boundary.
+// ============================================================================
+
+// C19-1. With no shim installed, HAL_SendError returns kHalHandleError.
+TEST(HalSendError, WithNoShimInstalledReturnsHandleError) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  const std::int32_t r = HAL_SendError(/*isError=*/1,
+                                       /*errorCode=*/100,
+                                       /*isLVCode=*/0,
+                                       "details",
+                                       "loc",
+                                       "stack",
+                                       /*printMsg=*/1);
+
+  EXPECT_EQ(r, kHalHandleError);
+}
+
+// C19-2. enqueue_error appends a fully-formed message to the pending buffer.
+TEST(ShimCoreEnqueueError, AppendsMessageToPendingBuffer) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_EQ(shim.pending_error_messages().size(), 0u);
+
+  const auto msg = valid_error_message(/*error_code=*/42,
+                                       /*severity=*/1,
+                                       /*is_lv_code=*/0,
+                                       /*print_msg=*/1,
+                                       /*truncation_flags=*/0,
+                                       "details",
+                                       "loc",
+                                       "stack");
+  shim.enqueue_error(msg);
+
+  ASSERT_EQ(shim.pending_error_messages().size(), 1u);
+  EXPECT_EQ(shim.pending_error_messages()[0], msg);
+}
+
+// C19-3. HAL_SendError constructs the expected error_message and enqueues it.
+TEST(HalSendError, WithShimInstalledEnqueuesConstructedErrorMessage) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  ASSERT_EQ(shim.pending_error_messages().size(), 0u);
+
+  const std::int32_t r = HAL_SendError(/*isError=*/1,
+                                       /*errorCode=*/0xCAFE,
+                                       /*isLVCode=*/0,
+                                       "the details",
+                                       "the location",
+                                       "the call stack",
+                                       /*printMsg=*/1);
+
+  EXPECT_EQ(r, 0);
+  ASSERT_EQ(shim.pending_error_messages().size(), 1u);
+  const auto expected = valid_error_message(/*error_code=*/0xCAFE,
+                                            /*severity=*/1,
+                                            /*is_lv_code=*/0,
+                                            /*print_msg=*/1,
+                                            /*truncation_flags=*/0,
+                                            "the details",
+                                            "the location",
+                                            "the call stack");
+  EXPECT_EQ(shim.pending_error_messages()[0], expected);
+}
+
+// C19-4. Long strings are truncated to schema capacity and flagged per field.
+TEST(HalSendError, TruncatesLongStringsAndSetsTruncationFlags) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::string details_long(2000, 'A');
+  const std::string location_long(500, 'B');
+  const std::string call_stack_long(2000, 'C');
+
+  const std::int32_t r = HAL_SendError(/*isError=*/1,
+                                       /*errorCode=*/0xBABE,
+                                       /*isLVCode=*/0,
+                                       details_long.c_str(),
+                                       location_long.c_str(),
+                                       call_stack_long.c_str(),
+                                       /*printMsg=*/1);
+
+  EXPECT_EQ(r, 0);
+  ASSERT_EQ(shim.pending_error_messages().size(), 1u);
+  const auto& msg = shim.pending_error_messages()[0];
+  EXPECT_EQ(msg.truncation_flags,
+            kErrorTruncDetails | kErrorTruncLocation | kErrorTruncCallStack);
+  EXPECT_EQ(std::string_view(msg.details.data(), kErrorDetailsLen - 1),
+            std::string(kErrorDetailsLen - 1, 'A'));
+  EXPECT_EQ(msg.details[kErrorDetailsLen - 1], '\0');
+  EXPECT_EQ(std::string_view(msg.location.data(), kErrorLocationLen - 1),
+            std::string(kErrorLocationLen - 1, 'B'));
+  EXPECT_EQ(msg.location[kErrorLocationLen - 1], '\0');
+  EXPECT_EQ(std::string_view(msg.call_stack.data(), kErrorCallStackLen - 1),
+            std::string(kErrorCallStackLen - 1, 'C'));
+  EXPECT_EQ(msg.call_stack[kErrorCallStackLen - 1], '\0');
+}
+
+// C19-5. NULL string pointers are empty strings, not truncation.
+TEST(HalSendError, NullStringPointersAreTreatedAsEmptyAndDoNotSetTruncationFlags) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::int32_t r = HAL_SendError(/*isError=*/1,
+                                       /*errorCode=*/0x1234,
+                                       /*isLVCode=*/0,
+                                       /*details=*/nullptr,
+                                       /*location=*/nullptr,
+                                       /*callStack=*/nullptr,
+                                       /*printMsg=*/1);
+
+  EXPECT_EQ(r, 0);
+  ASSERT_EQ(shim.pending_error_messages().size(), 1u);
+  EXPECT_EQ(shim.pending_error_messages()[0],
+            valid_error_message(/*error_code=*/0x1234,
+                                /*severity=*/1,
+                                /*is_lv_code=*/0,
+                                /*print_msg=*/1,
+                                /*truncation_flags=*/0,
+                                "",
+                                "",
+                                ""));
+}
+
+// C19-6. Overflow drops new messages and keeps the first 8.
+TEST(ShimCoreEnqueueError, OverflowDropsNewMessagesAtCapacity) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  for (std::int32_t code = 1; code <= static_cast<std::int32_t>(kMaxErrorsPerBatch); ++code) {
+    shim.enqueue_error(valid_error_message(code));
+  }
+  ASSERT_EQ(shim.pending_error_messages().size(), kMaxErrorsPerBatch);
+
+  shim.enqueue_error(valid_error_message(/*error_code=*/999));
+
+  ASSERT_EQ(shim.pending_error_messages().size(), kMaxErrorsPerBatch);
+  EXPECT_EQ(shim.pending_error_messages()[kMaxErrorsPerBatch - 1].error_code,
+            static_cast<std::int32_t>(kMaxErrorsPerBatch));
+  EXPECT_TRUE(std::ranges::none_of(shim.pending_error_messages(),
+                                   [](const error_message& msg) {
+                                     return msg.error_code == 999;
+                                   }));
+}
+
+// C19-7. Empty flush succeeds without publishing an envelope.
+TEST(ShimCoreFlushPendingErrors, EmptyBufferIsSuccessNoOpWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_EQ(region.backend_to_core.state.load(),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  ASSERT_EQ(shim.pending_error_messages().size(), 0u);
+
+  auto r = shim.flush_pending_errors(/*sim_time_us=*/250'000);
+
+  EXPECT_TRUE(r.has_value());
+  EXPECT_EQ(region.backend_to_core.state.load(),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(shim.pending_error_messages().size(), 0u);
+}
+
+// C19-8. Flush publishes accumulated messages as one error_message_batch.
+TEST(ShimCoreFlushPendingErrors, PublishesAccumulatedMessagesAsTickBoundaryEnvelope) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<error_message, 3> messages{
+      valid_error_message(100, 1, 0, 1, 0,
+                          "first detail", "first location", "first call stack"),
+      valid_error_message(200, 0, 1, 0, kErrorTruncDetails,
+                          "second detail", "second location", "second call stack"),
+      valid_error_message(300, 1, 0, 1,
+                          kErrorTruncLocation | kErrorTruncCallStack,
+                          "third detail", "third location", "third call stack")};
+  for (const auto& msg : messages) {
+    shim.enqueue_error(msg);
+  }
+
+  auto r = shim.flush_pending_errors(/*sim_time_us=*/500'000);
+
+  ASSERT_TRUE(r.has_value());
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::error_message_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 500'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 6980u);
+  ASSERT_EQ(msg.payload.size(), 6980u);
+
+  error_message_batch destination{};
+  std::memcpy(&destination, msg.payload.data(), msg.payload.size());
+  EXPECT_EQ(destination, valid_error_message_batch(messages));
+  EXPECT_EQ(shim.pending_error_messages().size(), 0u);
+}
+
+// C19-8b. Full-capacity flush handles the 8-message boundary.
+TEST(ShimCoreFlushPendingErrors, PublishesFullCapacityBatchAtKMaxErrorsPerBatchBoundary) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  std::array<error_message, kMaxErrorsPerBatch> messages{};
+  for (std::size_t i = 0; i < messages.size(); ++i) {
+    messages[i] = valid_error_message(static_cast<std::int32_t>(i + 1),
+                                      static_cast<hal_bool>(i % 2),
+                                      static_cast<hal_bool>((i + 1) % 2),
+                                      static_cast<hal_bool>(i % 2),
+                                      static_cast<std::uint8_t>(i & 0x7),
+                                      "detail",
+                                      "location",
+                                      "stack");
+    shim.enqueue_error(messages[i]);
+  }
+  ASSERT_EQ(shim.pending_error_messages().size(), kMaxErrorsPerBatch);
+
+  auto r = shim.flush_pending_errors(/*sim_time_us=*/750'000);
+
+  ASSERT_TRUE(r.has_value());
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::error_message_batch);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 750'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 18600u);
+  ASSERT_EQ(msg.payload.size(), 18600u);
+
+  error_message_batch destination{};
+  std::memcpy(&destination, msg.payload.data(), msg.payload.size());
+  EXPECT_EQ(destination, valid_error_message_batch(messages));
+  EXPECT_EQ(shim.pending_error_messages().size(), 0u);
+}
+
+// C19-9. Failed flush retains the buffer and leaves the occupied lane intact.
+TEST(ShimCoreFlushPendingErrors, RetainsBufferOnTransportFailureAndPropagatesError) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  const auto desc = valid_boot_descriptor();
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+
+  std::vector<std::uint8_t> boot_bytes_before(sizeof(boot_descriptor));
+  std::memcpy(boot_bytes_before.data(), region.backend_to_core.payload.data(),
+              sizeof(boot_descriptor));
+  const auto boot_envelope_before = region.backend_to_core.envelope;
+  const auto msg0 = valid_error_message(10, 1, 0, 1, 0, "a", "b", "c");
+  const auto msg1 = valid_error_message(20, 0, 1, 0, kErrorTruncDetails, "d", "e", "f");
+  shim_or->enqueue_error(msg0);
+  shim_or->enqueue_error(msg1);
+  const std::vector<error_message> pending_before{
+      shim_or->pending_error_messages().begin(),
+      shim_or->pending_error_messages().end()};
+
+  auto r = shim_or->flush_pending_errors(/*sim_time_us=*/500'000);
+
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(r.error().transport_error.has_value());
+  EXPECT_EQ(r.error().transport_error->kind, tier1_transport_error_kind::lane_busy);
+  ASSERT_EQ(shim_or->pending_error_messages().size(), pending_before.size());
+  EXPECT_TRUE(std::ranges::equal(shim_or->pending_error_messages(), pending_before));
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region.backend_to_core.envelope, boot_envelope_before);
+  EXPECT_EQ(std::memcmp(region.backend_to_core.payload.data(),
+                        boot_bytes_before.data(),
+                        sizeof(boot_descriptor)),
+            0);
+}
+
+// C19-10. Post-shutdown flush returns the terminal error without touching state.
+TEST(ShimCoreFlushPendingErrors, PostShutdownReturnsTerminalErrorWithoutTouchingBufferOrLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+
+  const auto msg0 = valid_error_message(10);
+  const auto msg1 = valid_error_message(20);
+  shim.enqueue_error(msg0);
+  shim.enqueue_error(msg1);
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  auto r = shim.flush_pending_errors(/*sim_time_us=*/500'000);
+
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_FALSE(r.error().transport_error.has_value());
+  ASSERT_EQ(shim.pending_error_messages().size(), 2u);
+  EXPECT_EQ(shim.pending_error_messages()[0], msg0);
+  EXPECT_EQ(shim.pending_error_messages()[1], msg1);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// ============================================================================
+// Cycle 20 — HAL_CAN_SendMessage + pending outbound CAN buffering.
+// HAL_CAN_SendMessage constructs one can_frame and appends it to
+// shim_core's fixed-capacity CAN TX buffer; the integrator explicitly
+// flushes that buffer at tick boundary.
+// ============================================================================
+
+// C20-1. With no shim installed, HAL_CAN_SendMessage sets kHalHandleError.
+TEST(HalCanSendMessage, WithNoShimInstalledSetsStatusToHandleErrorAndDoesNotCrash) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  const std::array<std::uint8_t, 8> data{1, 2, 3, 4, 5, 6, 7, 8};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x101, data.data(), 8, 0, &status);
+
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C20-2. enqueue_can_frame appends a fully-formed frame.
+TEST(ShimCoreEnqueueCanFrame, AppendsFrameToPendingBuffer) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_EQ(shim.pending_can_frames().size(), 0u);
+
+  const auto frame = valid_can_frame(0x101, 0, 4, 0xA0);
+  shim.enqueue_can_frame(frame);
+
+  ASSERT_EQ(shim.pending_can_frames().size(), 1u);
+  EXPECT_EQ(shim.pending_can_frames()[0], frame);
+}
+
+// C20-3. HAL_CAN_SendMessage preserves CAN ID flags and copies data bytes.
+TEST(HalCanSendMessage, WithShimInstalledEnqueuesConstructedFrame) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::array<std::uint8_t, 8> data{0xA0, 0xA1, 0xA2, 0xA3,
+                                        0xA4, 0xA5, 0xA6, 0xA7};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(kCanFlagFrameRemote | kCanFlagFrame11Bit | 0x123,
+                      data.data(),
+                      8,
+                      0,
+                      &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(shim.pending_can_frames().size(), 1u);
+  can_frame expected{};
+  expected.message_id = kCanFlagFrameRemote | kCanFlagFrame11Bit | 0x123;
+  expected.data = data;
+  expected.data_size = 8;
+  EXPECT_EQ(shim.pending_can_frames()[0], expected);
+}
+
+// C20-4. dataSize > 8 is invalid and does not enqueue.
+TEST(HalCanSendMessage, DataSizeAboveEightSetsInvalidBufferAndDoesNotEnqueue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::array<std::uint8_t, 16> data{0, 1, 2, 3, 4, 5, 6, 7,
+                                         8, 9, 10, 11, 12, 13, 14, 15};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x222, data.data(), 16, 0, &status);
+
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-5. NULL data is valid for a zero-length frame.
+TEST(HalCanSendMessage, NullDataPointerWithZeroSizeEnqueuesZeroLengthFrame) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x555, nullptr, 0, 0, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(shim.pending_can_frames().size(), 1u);
+  can_frame expected{};
+  expected.message_id = 0x555;
+  expected.data_size = 0;
+  EXPECT_EQ(shim.pending_can_frames()[0], expected);
+}
+
+// C20-5b. NULL data with a nonzero size is invalid and does not enqueue.
+TEST(HalCanSendMessage, NullDataPointerWithNonzeroSizeSetsInvalidBufferAndDoesNotEnqueue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x555, nullptr, 4, 0, &status);
+
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-6. Overflow drops new CAN frames and keeps the first 64.
+TEST(ShimCoreEnqueueCanFrame, OverflowDropsNewFramesAtCapacity) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  for (std::uint32_t id = 1; id <= kMaxCanFramesPerBatch; ++id) {
+    shim.enqueue_can_frame(valid_can_frame(id, 0, 1, 0x10));
+  }
+  ASSERT_EQ(shim.pending_can_frames().size(), kMaxCanFramesPerBatch);
+
+  shim.enqueue_can_frame(valid_can_frame(999, 0, 1, 0x20));
+
+  ASSERT_EQ(shim.pending_can_frames().size(), kMaxCanFramesPerBatch);
+  EXPECT_EQ(shim.pending_can_frames()[kMaxCanFramesPerBatch - 1].message_id,
+            kMaxCanFramesPerBatch);
+  EXPECT_TRUE(std::ranges::none_of(shim.pending_can_frames(),
+                                   [](const can_frame& frame) {
+                                     return frame.message_id == 999;
+                                   }));
+}
+
+// C20-7. Empty CAN flush succeeds without publishing an envelope.
+TEST(ShimCoreFlushPendingCanFrames, EmptyBufferIsSuccessNoOpWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_EQ(region.backend_to_core.state.load(),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  ASSERT_EQ(shim.pending_can_frames().size(), 0u);
+
+  auto r = shim.flush_pending_can_frames(/*sim_time_us=*/250'000);
+
+  EXPECT_TRUE(r.has_value());
+  EXPECT_EQ(region.backend_to_core.state.load(),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-8. Flush publishes accumulated frames as one timestamped CAN batch.
+TEST(ShimCoreFlushPendingCanFrames, PublishesAccumulatedFramesAsTickBoundaryEnvelope) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  std::array<can_frame, 3> frames{
+      valid_can_frame(0x101, 0, 4, 0xA0),
+      valid_can_frame(0x202, 0, 8, 0xB0),
+      valid_can_frame(0x303, 0, 0, 0xC0)};
+  for (const auto& frame : frames) {
+    shim.enqueue_can_frame(frame);
+  }
+
+  auto r = shim.flush_pending_can_frames(/*sim_time_us=*/500'000);
+
+  ASSERT_TRUE(r.has_value());
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::can_frame_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 500'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 64u);
+  ASSERT_EQ(msg.payload.size(), 64u);
+
+  for (auto& frame : frames) {
+    frame.timestamp_us = 500'000;
+  }
+  can_frame_batch destination{};
+  std::memcpy(&destination, msg.payload.data(), msg.payload.size());
+  EXPECT_EQ(destination, valid_can_frame_batch(frames));
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-9. Full-capacity CAN flush handles the 64-frame boundary.
+TEST(ShimCoreFlushPendingCanFrames, PublishesFullCapacityBatchAtKMaxCanFramesPerBatchBoundary) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  std::array<can_frame, kMaxCanFramesPerBatch> frames{};
+  for (std::size_t i = 0; i < frames.size(); ++i) {
+    frames[i] = valid_can_frame(static_cast<std::uint32_t>(i + 1),
+                                0,
+                                static_cast<std::uint8_t>(i % 9),
+                                static_cast<std::uint8_t>(0x20 + i));
+    shim.enqueue_can_frame(frames[i]);
+  }
+  ASSERT_EQ(shim.pending_can_frames().size(), kMaxCanFramesPerBatch);
+
+  auto r = shim.flush_pending_can_frames(/*sim_time_us=*/750'000);
+
+  ASSERT_TRUE(r.has_value());
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::can_frame_batch);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 750'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, sizeof(can_frame_batch));
+  ASSERT_EQ(msg.payload.size(), sizeof(can_frame_batch));
+
+  for (auto& frame : frames) {
+    frame.timestamp_us = 750'000;
+  }
+  can_frame_batch destination{};
+  std::memcpy(&destination, msg.payload.data(), msg.payload.size());
+  EXPECT_EQ(destination, valid_can_frame_batch(frames));
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-10. Failed CAN flush retains the buffer and leaves the occupied lane intact.
+TEST(ShimCoreFlushPendingCanFrames, RetainsBufferOnTransportFailureAndPropagatesError) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  const auto desc = valid_boot_descriptor();
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+
+  std::vector<std::uint8_t> boot_bytes_before(sizeof(boot_descriptor));
+  std::memcpy(boot_bytes_before.data(), region.backend_to_core.payload.data(),
+              sizeof(boot_descriptor));
+  const auto boot_envelope_before = region.backend_to_core.envelope;
+  const auto frame0 = valid_can_frame(0x101, 0, 4, 0xA0);
+  const auto frame1 = valid_can_frame(0x202, 0, 8, 0xB0);
+  shim_or->enqueue_can_frame(frame0);
+  shim_or->enqueue_can_frame(frame1);
+  const std::vector<can_frame> pending_before{
+      shim_or->pending_can_frames().begin(),
+      shim_or->pending_can_frames().end()};
+
+  auto r = shim_or->flush_pending_can_frames(/*sim_time_us=*/500'000);
+
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(r.error().transport_error.has_value());
+  EXPECT_EQ(r.error().transport_error->kind, tier1_transport_error_kind::lane_busy);
+  ASSERT_EQ(shim_or->pending_can_frames().size(), pending_before.size());
+  EXPECT_TRUE(std::ranges::equal(shim_or->pending_can_frames(), pending_before));
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region.backend_to_core.envelope, boot_envelope_before);
+  EXPECT_EQ(std::memcmp(region.backend_to_core.payload.data(),
+                        boot_bytes_before.data(),
+                        sizeof(boot_descriptor)),
+            0);
+}
+
+// C20-11. Post-shutdown CAN flush returns terminal error and retains state.
+TEST(ShimCoreFlushPendingCanFrames, PostShutdownReturnsTerminalErrorWithoutTouchingBufferOrLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+
+  const auto frame0 = valid_can_frame(0x101);
+  const auto frame1 = valid_can_frame(0x202);
+  shim.enqueue_can_frame(frame0);
+  shim.enqueue_can_frame(frame1);
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  auto r = shim.flush_pending_can_frames(/*sim_time_us=*/500'000);
+
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_FALSE(r.error().transport_error.has_value());
+  ASSERT_EQ(shim.pending_can_frames().size(), 2u);
+  EXPECT_EQ(shim.pending_can_frames()[0], frame0);
+  EXPECT_EQ(shim.pending_can_frames()[1], frame1);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C20-12. Positive periodMs enqueues one immediate frame in v0.
+TEST(HalCanSendMessage, PositivePeriodMsEnqueuesOneImmediateFrameInV0) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::array<std::uint8_t, 8> data{8, 7, 6, 5, 4, 3, 2, 1};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x321, data.data(), 8, 20, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(shim.pending_can_frames().size(), 1u);
+  can_frame expected{};
+  expected.message_id = 0x321;
+  expected.data = data;
+  expected.data_size = 8;
+  EXPECT_EQ(shim.pending_can_frames()[0], expected);
+}
+
+// C20-13. Stop-repeat is not an immediate data frame send.
+TEST(HalCanSendMessage, StopRepeatingPeriodDoesNotEnqueueADataFrame) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::array<std::uint8_t, 8> data{1, 1, 2, 3, 5, 8, 13, 21};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x321,
+                      data.data(),
+                      8,
+                      kHalCanSendPeriodStopRepeating,
+                      &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// C20-14. Other negative period values are invalid and do not enqueue.
+TEST(HalCanSendMessage, OtherNegativePeriodSetsInvalidBufferAndDoesNotEnqueue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const std::array<std::uint8_t, 8> data{1, 2, 3, 4, 5, 6, 7, 8};
+  std::int32_t status = 999;
+  HAL_CAN_SendMessage(0x321, data.data(), 8, -2, &status);
+
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+  EXPECT_EQ(shim.pending_can_frames().size(), 0u);
+}
+
+// ============================================================================
+// Cycle 21 — HAL_CAN_OpenStreamSession / HAL_CAN_ReadStreamSession /
+// HAL_CAN_CloseStreamSession.
+// ============================================================================
+
+namespace {
+
+std::uint32_t open_can_stream(std::uint32_t message_id,
+                              std::uint32_t message_id_mask,
+                              std::uint32_t max_messages,
+                              std::int32_t* status) {
+  std::uint32_t handle = 0xFFFF'FFFFu;
+  HAL_CAN_OpenStreamSession(&handle,
+                            message_id,
+                            message_id_mask,
+                            max_messages,
+                            status);
+  return handle;
+}
+
+void inject_can_batch(tier1_endpoint& core,
+                      shim_core& shim,
+                      const can_frame_batch& batch,
+                      std::uint64_t sim_time_us = 250'000) {
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::can_frame_batch,
+                        active_prefix_bytes(batch),
+                        sim_time_us));
+  ASSERT_TRUE(shim.poll().has_value());
+}
+
+void expect_stream_message_eq(const HAL_CANStreamMessage& actual,
+                              const can_frame& expected) {
+  EXPECT_EQ(actual.messageID, expected.message_id);
+  EXPECT_EQ(actual.timeStamp, expected.timestamp_us);
+  EXPECT_EQ(actual.dataSize, expected.data_size);
+  EXPECT_EQ(std::memcmp(actual.data,
+                        expected.data.data(),
+                        expected.data.size()),
+            0);
+}
+
+template <std::size_t N>
+void fill_stream_messages_with_sentinel(
+    std::array<HAL_CANStreamMessage, N>& messages,
+    std::uint8_t sentinel = 0xCC) {
+  std::memset(messages.data(), sentinel, sizeof(messages));
+}
+
+template <std::size_t N>
+void expect_stream_messages_unchanged(
+    const std::array<HAL_CANStreamMessage, N>& actual,
+    const std::array<HAL_CANStreamMessage, N>& before) {
+  EXPECT_EQ(std::memcmp(actual.data(), before.data(), sizeof(actual)), 0);
+}
+
+}  // namespace
+
+// C21-1. No installed shim makes open fail with handle error.
+TEST(HalCanOpenStreamSession, WithNoShimInstalledSetsHandleErrorAndInvalidHandle) {
+  shim_core::install_global(nullptr);
+
+  std::uint32_t handle = 0xABCD'1234u;
+  std::int32_t status = 999;
+  HAL_CAN_OpenStreamSession(&handle, 0x100, 0x7FF, 4, &status);
+
+  EXPECT_EQ(status, kHalHandleError);
+  EXPECT_EQ(handle, 0u);
+}
+
+// C21-2. Successful open returns a nonzero stream handle.
+TEST(HalCanOpenStreamSession, WithInstalledShimReturnsNonzeroHandle) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_NE(handle, 0u);
+}
+
+// C21-3. Zero maxMessages is rejected at the C seam.
+TEST(HalCanOpenStreamSession, WithZeroMaxMessagesSetsInvalidBufferAndNoHandle) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::uint32_t handle = 0xABCD'1234u;
+  std::int32_t status = 999;
+  HAL_CAN_OpenStreamSession(&handle, 0x120, 0x7FF, 0, &status);
+
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+  EXPECT_EQ(handle, 0u);
+}
+
+// C21-4. No installed shim makes read fail without touching output.
+TEST(HalCanReadStreamSession, WithNoShimInstalledSetsHandleErrorAndDoesNotTouchMessages) {
+  shim_core::install_global(nullptr);
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+
+  HAL_CAN_ReadStreamSession(1, messages.data(), 1, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalHandleError);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-5. Invalid handle reports NotAllowed and does not touch output.
+TEST(HalCanReadStreamSession, WithInvalidHandleSetsNotAllowedAndDoesNotTouchMessages) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+
+  HAL_CAN_ReadStreamSession(0, messages.data(), 1, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalCanNotAllowed);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-6. Valid empty stream returns NoToken and preserves output.
+TEST(HalCanReadStreamSession, ValidEmptyStreamReturnsNoTokenAndLeavesMessagesUntouched) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalCanNoToken);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-7. Stream reads matching frames in FIFO order and drains them.
+TEST(HalCanReadStreamSession, ReturnsMatchingFramesInFifoOrderAndDrainsThem) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x120, 1'000, 4, 0xA0);
+  const auto frame1 = valid_can_frame(0x121, 2'000, 8, 0xB0);
+  const auto frame2 = valid_can_frame(0x120, 3'000, 2, 0xC0);
+  const std::array<can_frame, 3> frames{frame0, frame1, frame2};
+  inject_can_batch(core, shim, valid_can_frame_batch(frames));
+
+  std::array<HAL_CANStreamMessage, 2> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 2, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 2u);
+  expect_stream_message_eq(messages[0], frame0);
+  expect_stream_message_eq(messages[1], frame2);
+
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 2, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalCanNoToken);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-8. Partial reads leave unread frames queued.
+TEST(HalCanReadStreamSession, PartialReadLeavesUnreadSuffixQueued) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x555, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x555, 1'000, 4, 0x10);
+  const auto frame1 = valid_can_frame(0x555, 2'000, 4, 0x20);
+  const auto frame2 = valid_can_frame(0x555, 3'000, 4, 0x30);
+  const std::array<can_frame, 3> frames{frame0, frame1, frame2};
+  inject_can_batch(core, shim, valid_can_frame_batch(frames));
+
+  std::array<HAL_CANStreamMessage, 2> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 1u);
+  expect_stream_message_eq(messages[0], frame0);
+
+  fill_stream_messages_with_sentinel(messages);
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 2u);
+  expect_stream_message_eq(messages[0], frame1);
+  expect_stream_message_eq(messages[1], frame2);
+}
+
+// C21-9. Stream queues accumulate across multiple inbound batches.
+TEST(HalCanReadStreamSession, AccumulatesFramesAcrossMultipleInboundBatches) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x444, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x444, 1'000, 3, 0xA0);
+  const auto frame1 = valid_can_frame(0x444, 2'000, 4, 0xB0);
+  const auto frame2 = valid_can_frame(0x444, 3'000, 5, 0xC0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 1>{frame0}));
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 2>{frame1, frame2}));
+
+  std::array<HAL_CANStreamMessage, 3> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 3, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 3u);
+  expect_stream_message_eq(messages[0], frame0);
+  expect_stream_message_eq(messages[1], frame1);
+  expect_stream_message_eq(messages[2], frame2);
+}
+
+// C21-10. Mask zero matches every frame and preserves message IDs.
+TEST(HalCanReadStreamSession, MaskZeroMatchesAllFramesWithoutRewritingIds) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0, 0, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x101, 1'000, 1, 0xA0);
+  const auto frame1 = valid_can_frame(kCanFlagFrameRemote | 0x202, 2'000, 2, 0xB0);
+  const auto frame2 = valid_can_frame(kCanFlagFrame11Bit | 0x303, 3'000, 3, 0xC0);
+  const std::array<can_frame, 3> frames{frame0, frame1, frame2};
+  inject_can_batch(core, shim, valid_can_frame_batch(frames));
+
+  std::array<HAL_CANStreamMessage, 3> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 3, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 3u);
+  expect_stream_message_eq(messages[0], frame0);
+  expect_stream_message_eq(messages[1], frame1);
+  expect_stream_message_eq(messages[2], frame2);
+}
+
+// C21-11. Opening a stream does not replay the latest CAN cache.
+TEST(HalCanReadStreamSession, DoesNotBackfillFramesReceivedBeforeOpen) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto frame = valid_can_frame(0x120, 1'000, 4, 0xA0);
+  const auto batch = valid_can_frame_batch(std::array<can_frame, 1>{frame});
+  inject_can_batch(core, shim, batch);
+  ASSERT_TRUE(shim.latest_can_frame_batch().has_value());
+  EXPECT_EQ(*shim.latest_can_frame_batch(), batch);
+
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalCanNoToken);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-12. Multiple streams receive independent copies.
+TEST(HalCanReadStreamSession, MultipleStreamsReceiveIndependentCopies) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle_a = open_can_stream(0x100, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+  const std::uint32_t handle_b = open_can_stream(0, 0, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x100, 1'000, 4, 0xA0);
+  const auto frame1 = valid_can_frame(0x200, 2'000, 4, 0xB0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 2>{frame0, frame1}));
+
+  std::array<HAL_CANStreamMessage, 2> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle_a, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 1u);
+  expect_stream_message_eq(messages[0], frame0);
+
+  fill_stream_messages_with_sentinel(messages);
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle_b, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 2u);
+  expect_stream_message_eq(messages[0], frame0);
+  expect_stream_message_eq(messages[1], frame1);
+}
+
+// C21-13. Overflow drops oldest, reports overrun once, and keeps newest.
+TEST(HalCanReadStreamSession, OverflowDropsOldestReportsSessionOverrunAndKeepsNewest) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x321, 0x7FF, 2, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame0 = valid_can_frame(0x321, 1'000, 1, 0xA0);
+  const auto frame1 = valid_can_frame(0x321, 2'000, 2, 0xB0);
+  const auto frame2 = valid_can_frame(0x321, 3'000, 3, 0xC0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 3>{frame0, frame1, frame2}));
+
+  std::array<HAL_CANStreamMessage, 2> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalCanSessionOverrun);
+  ASSERT_EQ(messages_read, 2u);
+  expect_stream_message_eq(messages[0], frame1);
+  expect_stream_message_eq(messages[1], frame2);
+
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalCanNoToken);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-14. Null output with nonzero read is invalid and does not drain.
+TEST(HalCanReadStreamSession, NullMessagesWithNonzeroReadSetsInvalidBufferAndDoesNotDrain) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame = valid_can_frame(0x120, 1'000, 4, 0xA0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 1>{frame}));
+
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, nullptr, 1, &messages_read, &status);
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+  EXPECT_EQ(messages_read, 0u);
+
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 1u);
+  expect_stream_message_eq(messages[0], frame);
+}
+
+// C21-15. Zero-count reads succeed for null or non-null messages.
+TEST(HalCanReadStreamSession, ZeroCountReadSucceedsForNullOrNonNullMessagesWithoutTouchingQueue) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x120, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  const auto frame = valid_can_frame(0x120, 1'000, 4, 0xA0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 1>{frame}));
+
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, nullptr, 0, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(messages_read, 0u);
+
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 0, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 1u);
+  expect_stream_message_eq(messages[0], frame);
+}
+
+// C21-16. Closed handles become unreadable.
+TEST(HalCanCloseStreamSession, ClosedHandleIsUnreadable) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle = open_can_stream(0x222, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  HAL_CAN_CloseStreamSession(handle);
+
+  std::array<HAL_CANStreamMessage, 1> messages{};
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle, messages.data(), 1, &messages_read, &status);
+
+  EXPECT_EQ(status, kHalCanNotAllowed);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// C21-17. Closing one stream does not affect other streams.
+TEST(HalCanCloseStreamSession, ClosingOneStreamDoesNotAffectOtherStreams) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t open_status = 999;
+  const std::uint32_t handle_a = open_can_stream(0x100, 0x7FF, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+  const std::uint32_t handle_b = open_can_stream(0, 0, 4, &open_status);
+  ASSERT_EQ(open_status, kHalSuccess);
+
+  HAL_CAN_CloseStreamSession(handle_a);
+
+  const auto frame0 = valid_can_frame(0x100, 1'000, 4, 0xA0);
+  const auto frame1 = valid_can_frame(0x200, 2'000, 4, 0xB0);
+  inject_can_batch(core, shim, valid_can_frame_batch(std::array<can_frame, 2>{frame0, frame1}));
+
+  std::array<HAL_CANStreamMessage, 2> messages{};
+  std::uint32_t messages_read = 777;
+  std::int32_t status = 999;
+  HAL_CAN_ReadStreamSession(handle_b, messages.data(), 2, &messages_read, &status);
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(messages_read, 2u);
+  expect_stream_message_eq(messages[0], frame0);
+  expect_stream_message_eq(messages[1], frame1);
+
+  fill_stream_messages_with_sentinel(messages);
+  const auto before = messages;
+  messages_read = 777;
+  status = 999;
+  HAL_CAN_ReadStreamSession(handle_a, messages.data(), 1, &messages_read, &status);
+  EXPECT_EQ(status, kHalCanNotAllowed);
+  EXPECT_EQ(messages_read, 0u);
+  expect_stream_messages_unchanged(messages, before);
+}
+
+// ============================================================================
+// Cycle 22 — HAL_CAN_GetCANStatus.
+// ============================================================================
+
+namespace {
+
+struct can_status_outputs {
+  float percent_bus_utilization = -1.0f;
+  std::uint32_t bus_off_count = 0xAAAA'AAAAu;
+  std::uint32_t tx_full_count = 0xBBBB'BBBBu;
+  std::uint32_t receive_error_count = 0xCCCC'CCCCu;
+  std::uint32_t transmit_error_count = 0xDDDD'DDDDu;
+};
+
+void read_can_status_outputs(can_status_outputs& out, std::int32_t& status) {
+  HAL_CAN_GetCANStatus(&out.percent_bus_utilization,
+                       &out.bus_off_count,
+                       &out.tx_full_count,
+                       &out.receive_error_count,
+                       &out.transmit_error_count,
+                       &status);
+}
+
+void expect_can_status_outputs_eq(const can_status_outputs& out,
+                                  const can_status& expected) {
+  EXPECT_EQ(out.percent_bus_utilization, expected.percent_bus_utilization);
+  EXPECT_EQ(out.bus_off_count, expected.bus_off_count);
+  EXPECT_EQ(out.tx_full_count, expected.tx_full_count);
+  EXPECT_EQ(out.receive_error_count, expected.receive_error_count);
+  EXPECT_EQ(out.transmit_error_count, expected.transmit_error_count);
+}
+
+void expect_can_status_outputs_zero(const can_status_outputs& out) {
+  EXPECT_EQ(out.percent_bus_utilization, 0.0f);
+  EXPECT_EQ(out.bus_off_count, 0u);
+  EXPECT_EQ(out.tx_full_count, 0u);
+  EXPECT_EQ(out.receive_error_count, 0u);
+  EXPECT_EQ(out.transmit_error_count, 0u);
+}
+
+void inject_can_status(tier1_endpoint& core,
+                       shim_core& shim,
+                       const can_status& state,
+                       std::uint64_t sim_time_us = 50'000) {
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::can_status,
+                        bytes_of(state),
+                        sim_time_us));
+  ASSERT_TRUE(shim.poll().has_value());
+}
+
+}  // namespace
+
+// C22-1. No installed shim sets handle error and zeroes every output.
+TEST(HalCanGetCanStatus, WithNoShimInstalledSetsHandleErrorAndZerosOutputs) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  can_status_outputs out{};
+  std::int32_t status = 999;
+  read_can_status_outputs(out, status);
+
+  EXPECT_EQ(status, kHalHandleError);
+  expect_can_status_outputs_zero(out);
+}
+
+// C22-2. Empty cache succeeds, zeroes outputs, and does not populate cache.
+TEST(HalCanGetCanStatus, WithShimInstalledButCacheEmptySetsSuccessAndZerosOutputs) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_can_status().has_value());
+  shim_global_install_guard guard{shim};
+
+  can_status_outputs out{};
+  std::int32_t status = 999;
+  read_can_status_outputs(out, status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_can_status_outputs_zero(out);
+  EXPECT_FALSE(shim.latest_can_status().has_value());
+}
+
+// C22-3. Cached can_status copies every field in WPILib parameter order.
+TEST(HalCanGetCanStatus, WithCachedCanStatusCopiesEveryFieldInParameterOrder) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_can_status(0.625f, 11, 22, 33, 44);
+  inject_can_status(core, shim, state);
+  ASSERT_TRUE(shim.latest_can_status().has_value());
+
+  can_status_outputs out{};
+  std::int32_t status = 999;
+  read_can_status_outputs(out, status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_can_status_outputs_eq(out, state);
+}
+
+// C22-4. Latest-wins is observed across interleaved polls and reads.
+TEST(HalCanGetCanStatus, LatestWinsAcrossTwoUpdatesReturnsMostRecentStatus) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto first = valid_can_status(0.125f, 1, 2, 3, 4);
+  inject_can_status(core, shim, first, 50'000);
+
+  can_status_outputs out1{};
+  std::int32_t status1 = 999;
+  read_can_status_outputs(out1, status1);
+  EXPECT_EQ(status1, kHalSuccess);
+  expect_can_status_outputs_eq(out1, first);
+
+  const auto second = valid_can_status(0.875f, 9, 8, 7, 6);
+  inject_can_status(core, shim, second, 100'000);
+
+  can_status_outputs out2{};
+  std::int32_t status2 = 888;
+  read_can_status_outputs(out2, status2);
+  EXPECT_EQ(status2, kHalSuccess);
+  expect_can_status_outputs_eq(out2, second);
+}
+
+// ============================================================================
+// Cycle 23 — Driver Station scalar reads.
+// ============================================================================
+
+namespace {
+
+std::uint32_t control_word_bits(const HAL_ControlWord& word) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &word, sizeof(bits));
+  return bits;
+}
+
+HAL_ControlWord control_word_with_raw_bits(std::uint32_t bits) {
+  HAL_ControlWord word{};
+  std::memcpy(&word, &bits, sizeof(bits));
+  return word;
+}
+
+void expect_control_word_bits(const HAL_ControlWord& word,
+                              std::uint32_t expected_bits) {
+  EXPECT_EQ(control_word_bits(word), expected_bits);
+}
+
+void inject_ds_state(tier1_endpoint& core,
+                     shim_core& shim,
+                     const ds_state& state,
+                     std::uint64_t sim_time_us = 50'000) {
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::ds_state,
+                        bytes_of(state),
+                        sim_time_us));
+  ASSERT_TRUE(shim.poll().has_value());
+}
+
+}  // namespace
+
+// C23-1. No installed shim returns handle error and zeroes the full word.
+TEST(HalGetControlWord, WithNoShimInstalledReturnsHandleErrorAndZerosWord) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  HAL_ControlWord word = control_word_with_raw_bits(0xFFFF'FFFFu);
+  const std::int32_t status = HAL_GetControlWord(&word);
+
+  EXPECT_EQ(status, kHalHandleError);
+  expect_control_word_bits(word, 0u);
+}
+
+// C23-2. Empty ds_state cache succeeds, zeroes output, and stays empty.
+TEST(HalGetControlWord, WithShimInstalledButCacheEmptyReturnsSuccessAndZerosWord) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  HAL_ControlWord word = control_word_with_raw_bits(0xFFFF'FFFFu);
+  const std::int32_t status = HAL_GetControlWord(&word);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_control_word_bits(word, 0u);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C23-3. Each named control bit maps independently and clears reserved bits.
+TEST(HalGetControlWord, WithCachedDsStateCopiesEachNamedBitAndClearsReservedBits) {
+  struct case_ {
+    std::uint32_t control_bits;
+    std::uint32_t expected_word_bits;
+  };
+  constexpr std::array<case_, 6> cases{{
+      {kControlEnabled, kControlEnabled},
+      {kControlAutonomous, kControlAutonomous},
+      {kControlTest, kControlTest},
+      {kControlEStop, kControlEStop},
+      {kControlFmsAttached, kControlFmsAttached},
+      {kControlDsAttached, kControlDsAttached},
+  }};
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    const auto state = valid_ds_state(/*joystick0_axis_count=*/3,
+                                      /*joystick0_axis_0_value=*/0.5f,
+                                      /*control_bits=*/cases[i].control_bits);
+    inject_ds_state(core, shim, state, 50'000 + i);
+
+    HAL_ControlWord word = control_word_with_raw_bits(0xFFFF'FFFFu);
+    const std::int32_t status = HAL_GetControlWord(&word);
+
+    EXPECT_EQ(status, kHalSuccess);
+    expect_control_word_bits(word, cases[i].expected_word_bits);
+  }
+}
+
+// C23-4. No installed shim reports handle error and unknown alliance.
+TEST(HalGetAllianceStation, WithNoShimInstalledSetsHandleErrorAndReturnsUnknown) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  const HAL_AllianceStationID station = HAL_GetAllianceStation(&status);
+
+  EXPECT_EQ(status, kHalHandleError);
+  EXPECT_EQ(station, HAL_AllianceStationID_kUnknown);
+}
+
+// C23-5. Empty ds_state cache succeeds, returns unknown, and stays empty.
+TEST(HalGetAllianceStation, WithShimInstalledButCacheEmptySetsSuccessAndReturnsUnknown) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  const HAL_AllianceStationID station = HAL_GetAllianceStation(&status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(station, HAL_AllianceStationID_kUnknown);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C23-6. Cached ds_state station is returned through the HAL enum.
+TEST(HalGetAllianceStation, WithCachedDsStateReturnsCachedStation) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_ds_state(/*joystick0_axis_count=*/3,
+                                    /*joystick0_axis_0_value=*/0.5f,
+                                    /*control_bits=*/kControlEnabled,
+                                    /*station=*/alliance_station::blue_3);
+  inject_ds_state(core, shim, state);
+
+  std::int32_t status = 999;
+  const HAL_AllianceStationID station = HAL_GetAllianceStation(&status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(station, HAL_AllianceStationID_kBlue3);
+}
+
+// C23-7. No installed shim reports handle error and zero match time.
+TEST(HalGetMatchTime, WithNoShimInstalledSetsHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t status = 999;
+  const double match_time = HAL_GetMatchTime(&status);
+
+  EXPECT_EQ(status, kHalHandleError);
+  EXPECT_EQ(match_time, 0.0);
+}
+
+// C23-8. Empty ds_state cache succeeds, returns zero, and stays empty.
+TEST(HalGetMatchTime, WithShimInstalledButCacheEmptySetsSuccessAndReturnsZero) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  std::int32_t status = 999;
+  const double match_time = HAL_GetMatchTime(&status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(match_time, 0.0);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C23-9. Cached ds_state match time is returned without integer truncation.
+TEST(HalGetMatchTime, WithCachedDsStateReturnsCachedMatchTime) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto state = valid_ds_state(/*joystick0_axis_count=*/3,
+                                    /*joystick0_axis_0_value=*/0.5f,
+                                    /*control_bits=*/kControlEnabled,
+                                    /*station=*/alliance_station::red_2,
+                                    /*type=*/match_type::qualification,
+                                    /*match_number=*/42,
+                                    /*match_time_seconds=*/135.25);
+  inject_ds_state(core, shim, state);
+
+  std::int32_t status = 999;
+  const double match_time = HAL_GetMatchTime(&status);
+
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_EQ(match_time, 135.25);
+}
+
+// C23-10. Latest-wins is observed across all three DS scalar readers.
+TEST(HalDriverStationScalarReads, LatestWinsAcrossTwoDsUpdates) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const auto first = valid_ds_state(/*joystick0_axis_count=*/3,
+                                    /*joystick0_axis_0_value=*/0.5f,
+                                    /*control_bits=*/kControlEnabled,
+                                    /*station=*/alliance_station::red_1,
+                                    /*type=*/match_type::qualification,
+                                    /*match_number=*/1,
+                                    /*match_time_seconds=*/15.0);
+  inject_ds_state(core, shim, first, 50'000);
+
+  HAL_ControlWord first_word = control_word_with_raw_bits(0xFFFF'FFFFu);
+  EXPECT_EQ(HAL_GetControlWord(&first_word), kHalSuccess);
+  expect_control_word_bits(first_word, kControlEnabled);
+  std::int32_t first_station_status = 999;
+  EXPECT_EQ(HAL_GetAllianceStation(&first_station_status), HAL_AllianceStationID_kRed1);
+  EXPECT_EQ(first_station_status, kHalSuccess);
+  std::int32_t first_match_time_status = 888;
+  EXPECT_EQ(HAL_GetMatchTime(&first_match_time_status), 15.0);
+  EXPECT_EQ(first_match_time_status, kHalSuccess);
+
+  const auto second = valid_ds_state(/*joystick0_axis_count=*/4,
+                                     /*joystick0_axis_0_value=*/0.25f,
+                                     /*control_bits=*/kControlAutonomous |
+                                                       kControlTest |
+                                                       kControlDsAttached,
+                                     /*station=*/alliance_station::blue_2,
+                                     /*type=*/match_type::elimination,
+                                     /*match_number=*/2,
+                                     /*match_time_seconds=*/42.75);
+  inject_ds_state(core, shim, second, 100'000);
+
+  HAL_ControlWord second_word = control_word_with_raw_bits(0xFFFF'FFFFu);
+  EXPECT_EQ(HAL_GetControlWord(&second_word), kHalSuccess);
+  expect_control_word_bits(second_word,
+                           kControlAutonomous | kControlTest | kControlDsAttached);
+  std::int32_t second_station_status = 777;
+  EXPECT_EQ(HAL_GetAllianceStation(&second_station_status), HAL_AllianceStationID_kBlue2);
+  EXPECT_EQ(second_station_status, kHalSuccess);
+  std::int32_t second_match_time_status = 666;
+  EXPECT_EQ(HAL_GetMatchTime(&second_match_time_status), 42.75);
+  EXPECT_EQ(second_match_time_status, kHalSuccess);
+}
+
+// ============================================================================
+// Cycle 24 — Driver Station joystick reads.
+// ============================================================================
+
+namespace {
+
+template <typename T>
+void fill_with_sentinel(T& value) {
+  std::memset(&value, 0xA5, sizeof(value));
+}
+
+template <typename T>
+void expect_zero_bytes(const T& value) {
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    EXPECT_EQ(bytes[i], 0u) << "byte offset " << i;
+  }
+}
+
+template <typename HalT, typename BackendT>
+void expect_hal_bytes_eq_backend(const HalT& actual, const BackendT& expected) {
+  static_assert(sizeof(HalT) == sizeof(BackendT));
+  EXPECT_EQ(std::memcmp(&actual, &expected, sizeof(HalT)), 0);
+}
+
+joystick_axes make_axes(std::int16_t count, float base, std::uint8_t raw_base) {
+  joystick_axes axes{};
+  axes.count = count;
+  for (std::size_t i = 0; i < axes.axes.size(); ++i) {
+    axes.axes[i] = base + static_cast<float>(i) * 0.25f;
+    axes.raw[i] = static_cast<std::uint8_t>(raw_base + i);
+  }
+  return axes;
+}
+
+joystick_povs make_povs(std::int16_t count, std::int16_t base) {
+  joystick_povs povs{};
+  povs.count = count;
+  for (std::size_t i = 0; i < povs.povs.size(); ++i) {
+    povs.povs[i] = static_cast<std::int16_t>(base + static_cast<std::int16_t>(i) * 45);
+  }
+  return povs;
+}
+
+joystick_buttons make_buttons(std::uint32_t buttons, std::uint8_t count) {
+  joystick_buttons value{};
+  value.buttons = buttons;
+  value.count = count;
+  return value;
+}
+
+}  // namespace
+
+// C24-0. Exported C joystick structs match the backend WPILib ABI mirrors.
+TEST(HalJoystickStructLayout, MatchesBackendJoystickAbiMirrors) {
+  EXPECT_EQ(sizeof(HAL_JoystickAxes), sizeof(joystick_axes));
+  EXPECT_EQ(alignof(HAL_JoystickAxes), alignof(joystick_axes));
+  EXPECT_EQ(offsetof(HAL_JoystickAxes, count), offsetof(joystick_axes, count));
+  EXPECT_EQ(offsetof(HAL_JoystickAxes, axes), offsetof(joystick_axes, axes));
+  EXPECT_EQ(offsetof(HAL_JoystickAxes, raw), offsetof(joystick_axes, raw));
+
+  EXPECT_EQ(sizeof(HAL_JoystickPOVs), sizeof(joystick_povs));
+  EXPECT_EQ(alignof(HAL_JoystickPOVs), alignof(joystick_povs));
+  EXPECT_EQ(offsetof(HAL_JoystickPOVs, count), offsetof(joystick_povs, count));
+  EXPECT_EQ(offsetof(HAL_JoystickPOVs, povs), offsetof(joystick_povs, povs));
+
+  EXPECT_EQ(sizeof(HAL_JoystickButtons), sizeof(joystick_buttons));
+  EXPECT_EQ(alignof(HAL_JoystickButtons), alignof(joystick_buttons));
+  EXPECT_EQ(offsetof(HAL_JoystickButtons, buttons), offsetof(joystick_buttons, buttons));
+  EXPECT_EQ(offsetof(HAL_JoystickButtons, count), offsetof(joystick_buttons, count));
+}
+
+// C24-1. No installed shim returns handle error and zeroes axes output bytes.
+TEST(HalGetJoystickAxes, WithNoShimInstalledReturnsHandleErrorAndZerosOutput) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  HAL_JoystickAxes axes{};
+  fill_with_sentinel(axes);
+  const std::int32_t status = HAL_GetJoystickAxes(0, &axes);
+
+  EXPECT_EQ(status, kHalHandleError);
+  expect_zero_bytes(axes);
+}
+
+// C24-2. Empty ds_state cache succeeds, zeroes axes output, and stays empty.
+TEST(HalGetJoystickAxes, WithShimInstalledButCacheEmptyReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  HAL_JoystickAxes axes{};
+  fill_with_sentinel(axes);
+  const std::int32_t status = HAL_GetJoystickAxes(0, &axes);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_zero_bytes(axes);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C24-3. Populated axes reads copy valid boundary slots byte-for-byte.
+TEST(HalGetJoystickAxes, WithCachedDsStateCopiesBoundaryAxisSlotsByteForByte) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_axes_[0] = make_axes(3, -0.5f, 10);
+  state.joystick_axes_[5] = make_axes(6, 0.25f, 90);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickAxes axes0{};
+  fill_with_sentinel(axes0);
+  EXPECT_EQ(HAL_GetJoystickAxes(0, &axes0), kHalSuccess);
+  expect_hal_bytes_eq_backend(axes0, state.joystick_axes_[0]);
+
+  HAL_JoystickAxes axes5{};
+  fill_with_sentinel(axes5);
+  EXPECT_EQ(HAL_GetJoystickAxes(5, &axes5), kHalSuccess);
+  expect_hal_bytes_eq_backend(axes5, state.joystick_axes_[5]);
+}
+
+// C24-4. Invalid axes indices succeed with zero/default output.
+TEST(HalGetJoystickAxes, WithInvalidIndicesReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_axes_[0] = make_axes(4, 0.75f, 40);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickAxes negative{};
+  fill_with_sentinel(negative);
+  EXPECT_EQ(HAL_GetJoystickAxes(-1, &negative), kHalSuccess);
+  expect_zero_bytes(negative);
+
+  HAL_JoystickAxes too_high{};
+  fill_with_sentinel(too_high);
+  EXPECT_EQ(HAL_GetJoystickAxes(6, &too_high), kHalSuccess);
+  expect_zero_bytes(too_high);
+}
+
+// C24-5. No installed shim returns handle error and zeroes POV output bytes.
+TEST(HalGetJoystickPOVs, WithNoShimInstalledReturnsHandleErrorAndZerosOutput) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  HAL_JoystickPOVs povs{};
+  fill_with_sentinel(povs);
+  const std::int32_t status = HAL_GetJoystickPOVs(0, &povs);
+
+  EXPECT_EQ(status, kHalHandleError);
+  expect_zero_bytes(povs);
+}
+
+// C24-6. Empty ds_state cache succeeds, zeroes POV output, and stays empty.
+TEST(HalGetJoystickPOVs, WithShimInstalledButCacheEmptyReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  HAL_JoystickPOVs povs{};
+  fill_with_sentinel(povs);
+  const std::int32_t status = HAL_GetJoystickPOVs(0, &povs);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_zero_bytes(povs);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C24-7. Populated POV reads copy valid boundary slots byte-for-byte.
+TEST(HalGetJoystickPOVs, WithCachedDsStateCopiesBoundaryPovSlotsByteForByte) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_povs_[0] = make_povs(2, 0);
+  state.joystick_povs_[5] = make_povs(4, 90);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickPOVs povs0{};
+  fill_with_sentinel(povs0);
+  EXPECT_EQ(HAL_GetJoystickPOVs(0, &povs0), kHalSuccess);
+  expect_hal_bytes_eq_backend(povs0, state.joystick_povs_[0]);
+
+  HAL_JoystickPOVs povs5{};
+  fill_with_sentinel(povs5);
+  EXPECT_EQ(HAL_GetJoystickPOVs(5, &povs5), kHalSuccess);
+  expect_hal_bytes_eq_backend(povs5, state.joystick_povs_[5]);
+}
+
+// C24-8. Invalid POV indices succeed with zero/default output.
+TEST(HalGetJoystickPOVs, WithInvalidIndicesReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_povs_[0] = make_povs(3, 180);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickPOVs negative{};
+  fill_with_sentinel(negative);
+  EXPECT_EQ(HAL_GetJoystickPOVs(-1, &negative), kHalSuccess);
+  expect_zero_bytes(negative);
+
+  HAL_JoystickPOVs too_high{};
+  fill_with_sentinel(too_high);
+  EXPECT_EQ(HAL_GetJoystickPOVs(6, &too_high), kHalSuccess);
+  expect_zero_bytes(too_high);
+}
+
+// C24-9. No installed shim returns handle error and zeroes buttons output bytes.
+TEST(HalGetJoystickButtons, WithNoShimInstalledReturnsHandleErrorAndZerosOutput) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  HAL_JoystickButtons buttons{};
+  fill_with_sentinel(buttons);
+  const std::int32_t status = HAL_GetJoystickButtons(0, &buttons);
+
+  EXPECT_EQ(status, kHalHandleError);
+  expect_zero_bytes(buttons);
+}
+
+// C24-10. Empty ds_state cache succeeds, zeroes buttons output, and stays empty.
+TEST(HalGetJoystickButtons, WithShimInstalledButCacheEmptyReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  shim_global_install_guard guard{shim};
+
+  HAL_JoystickButtons buttons{};
+  fill_with_sentinel(buttons);
+  const std::int32_t status = HAL_GetJoystickButtons(0, &buttons);
+
+  EXPECT_EQ(status, kHalSuccess);
+  expect_zero_bytes(buttons);
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C24-11. Populated buttons read copies the requested max slot byte-for-byte.
+TEST(HalGetJoystickButtons, WithCachedDsStateCopiesRequestedButtonsSlotByteForByte) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_buttons_[0] = make_buttons(0x0000'0003u, 2);
+  state.joystick_buttons_[5] = make_buttons(0x8000'0005u, 16);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickButtons buttons{};
+  fill_with_sentinel(buttons);
+  EXPECT_EQ(HAL_GetJoystickButtons(5, &buttons), kHalSuccess);
+  expect_hal_bytes_eq_backend(buttons, state.joystick_buttons_[5]);
+}
+
+// C24-12. Invalid button indices succeed with zero/default output.
+TEST(HalGetJoystickButtons, WithInvalidIndicesReturnsSuccessAndZerosOutput) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto state = valid_ds_state();
+  state.joystick_buttons_[0] = make_buttons(0x0000'00FFu, 8);
+  inject_ds_state(core, shim, state);
+
+  HAL_JoystickButtons negative{};
+  fill_with_sentinel(negative);
+  EXPECT_EQ(HAL_GetJoystickButtons(-1, &negative), kHalSuccess);
+  expect_zero_bytes(negative);
+
+  HAL_JoystickButtons too_high{};
+  fill_with_sentinel(too_high);
+  EXPECT_EQ(HAL_GetJoystickButtons(6, &too_high), kHalSuccess);
+  expect_zero_bytes(too_high);
+}
+
+// C24-13. Latest-wins is observed across all three joystick readers.
+TEST(HalJoystickReads, LatestWinsAcrossTwoDsUpdates) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  auto first = valid_ds_state();
+  first.joystick_axes_[0] = make_axes(2, -1.0f, 1);
+  first.joystick_povs_[1] = make_povs(1, 45);
+  first.joystick_buttons_[2] = make_buttons(0x0000'0007u, 3);
+  inject_ds_state(core, shim, first, 50'000);
+
+  HAL_JoystickAxes first_axes{};
+  fill_with_sentinel(first_axes);
+  EXPECT_EQ(HAL_GetJoystickAxes(0, &first_axes), kHalSuccess);
+  expect_hal_bytes_eq_backend(first_axes, first.joystick_axes_[0]);
+  HAL_JoystickPOVs first_povs{};
+  fill_with_sentinel(first_povs);
+  EXPECT_EQ(HAL_GetJoystickPOVs(1, &first_povs), kHalSuccess);
+  expect_hal_bytes_eq_backend(first_povs, first.joystick_povs_[1]);
+  HAL_JoystickButtons first_buttons{};
+  fill_with_sentinel(first_buttons);
+  EXPECT_EQ(HAL_GetJoystickButtons(2, &first_buttons), kHalSuccess);
+  expect_hal_bytes_eq_backend(first_buttons, first.joystick_buttons_[2]);
+
+  auto second = valid_ds_state();
+  second.joystick_axes_[0] = make_axes(5, 0.5f, 51);
+  second.joystick_povs_[1] = make_povs(3, 135);
+  second.joystick_buttons_[2] = make_buttons(0x0000'0015u, 5);
+  inject_ds_state(core, shim, second, 100'000);
+
+  HAL_JoystickAxes second_axes{};
+  fill_with_sentinel(second_axes);
+  EXPECT_EQ(HAL_GetJoystickAxes(0, &second_axes), kHalSuccess);
+  expect_hal_bytes_eq_backend(second_axes, second.joystick_axes_[0]);
+  HAL_JoystickPOVs second_povs{};
+  fill_with_sentinel(second_povs);
+  EXPECT_EQ(HAL_GetJoystickPOVs(1, &second_povs), kHalSuccess);
+  expect_hal_bytes_eq_backend(second_povs, second.joystick_povs_[1]);
+  HAL_JoystickButtons second_buttons{};
+  fill_with_sentinel(second_buttons);
+  EXPECT_EQ(HAL_GetJoystickButtons(2, &second_buttons), kHalSuccess);
+  expect_hal_bytes_eq_backend(second_buttons, second.joystick_buttons_[2]);
 }
 
 }  // namespace robosim::backend::shim

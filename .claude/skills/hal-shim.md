@@ -1,6 +1,6 @@
 ---
 name: hal-shim
-description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 11: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` / `notifier_state` / `notifier_alarm_batch` / `error_message_batch` cache slots (the four variable-size — `can_frame_batch`, `notifier_state`, `notifier_alarm_batch`, `error_message_batch` — use active-prefix memcpy with zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path, **plus the outbound `send_can_frame_batch` (cycle 9), `send_notifier_state` (cycle 10), and `send_error_message_batch` (cycle 11) surfaces — all three outbound-meaningful schemas wired — publishing as `tick_boundary` envelopes into `backend_to_core` via the production `active_prefix_bytes` overloads in the schema headers (extracted at cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX), with the same shutdown-terminal short-circuit as `poll()` per typed method**. All 8 per-tick payload schemas are wired inbound; **all three outbound-meaningful schemas wired** (`can_frame_batch`, `notifier_state`, `error_message_batch` — the v0 outbound surface is closed). Does not yet cover the C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`, `HAL_Notifier*`, `HAL_SendError`, etc.), on-demand request/reply, shim-initiated shutdown, CAN RX queueing semantics (deferred to whichever cycle wires the C HAL CAN consumer), threading, or reset/reconnect.
+description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 24: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` / `notifier_state` / `notifier_alarm_batch` / `error_message_batch` cache slots (the four variable-size schemas use active-prefix memcpy with zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path, outbound `send_can_frame_batch`, `send_notifier_state`, and `send_error_message_batch` tick-boundary publishers, plus C HAL ABI surfaces `HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetVinCurrent`, `HAL_GetBrownedOut`, `HAL_GetBrownoutVoltage`, `HAL_GetSystemActive`, `HAL_GetSystemTimeValid`, `HAL_GetFPGAButton`, `HAL_GetRSLState`, `HAL_GetCommsDisableCount`, `HAL_SendError`, `HAL_CAN_SendMessage`, `HAL_CAN_OpenStreamSession`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_CloseStreamSession`, `HAL_CAN_GetCANStatus`, `HAL_GetControlWord`, `HAL_GetAllianceStation`, `HAL_GetMatchTime`, `HAL_GetJoystickAxes`, `HAL_GetJoystickPOVs`, and `HAL_GetJoystickButtons`. Cycle 19 added per-shim pending `error_message` buffering and explicit `flush_pending_errors`; cycle 20 added per-shim pending `can_frame` TX buffering and explicit `flush_pending_can_frames`; cycle 21 added per-shim CAN RX stream sessions fed by inbound `can_frame_batch` during `poll()`; cycle 22 added the CAN status out-parameter reader from `latest_can_status_`; cycle 23 added the first Driver Station scalar readers from `latest_ds_state_`; cycle 24 added joystick struct readers from `latest_ds_state_`. CAN streams use nonzero handles, masked-ID filtering, per-session FIFO queues, no pre-open backfill, independent multi-stream copies, newest-kept overflow with one-shot `HAL_ERR_CANSessionMux_SessionOverrun`, `HAL_WARN_CANSessionMux_NoToken` for valid empty reads, and `HAL_ERR_CANSessionMux_NotAllowed` for invalid/closed handles. `HAL_CAN_GetCANStatus` zeroes all five data outputs on no-shim/empty-cache paths and copies `percentBusUtilization`, `busOffCount`, `txFullCount`, `receiveErrorCount`, and `transmitErrorCount` in WPILib header order when cached. `HAL_GetControlWord` zeroes the full 32-bit word on no-shim/empty-cache paths, masks reserved bits on cached reads, and maps the six WPILib named bits from `ds_state::control.bits`; `HAL_GetAllianceStation` defaults to unknown and `HAL_GetMatchTime` defaults to 0.0. `HAL_GetJoystickAxes`, `HAL_GetJoystickPOVs`, and `HAL_GetJoystickButtons` zero full output structs on no-shim/empty-cache/invalid-index paths, copy valid slots byte-for-byte, and treat valid indices as exactly 0..5. The three power_state float readers widen float→double via `static_cast`; the five clock_state HAL_Bool readers share `clock_state_hal_bool_read`; `hal_c.h` exports `typedef int32_t HAL_Bool;`. With cycle 16, the power_state read surface is closed; with cycle 18, the clock_state read surface is fully closed. Does not yet cover the rest of the C HAL ABI (`HAL_Initialize`, `HAL_Notifier*`, match-info/descriptor DS reads, etc.), on-demand request/reply, shim-initiated shutdown, threading, or reset/reconnect.
 ---
 
 # HAL shim core
@@ -82,13 +82,28 @@ convention applied unchanged. With cycle 11, the v0 outbound
 surface is **closed** for the three semantically-meaningful
 schemas; the five sim-authoritative schemas remain
 intentionally absent from the outbound API per D-C9-TYPED-
-OUTBOUND.** Future cycles cover on-demand request/reply, shim-
-initiated `shutdown`, the C HAL ABI, threading, and reset/
+OUTBOUND.** Cycle 12 added the **first C HAL ABI surface**:
+`extern "C" HAL_GetFPGATime(int32_t* status)` reading from
+`latest_clock_state_->sim_time_us`, plus the process-global
+`shim_core::install_global` / `shim_core::current` accessor
+(declarations on `shim_core` in `shim_core.h`, definitions and
+the TU-static `shim_core* g_installed_shim_` storage in the new
+`hal_c.cpp` per D-C12-STORAGE-IN-HAL-C-CPP). Status semantics:
+no-shim → `kHalHandleError`; shim+empty cache → `kHalSuccess`,
+return 0 (D-C12-NO-CLOCK-STATE-IS-SUCCESS-ZERO matches WPILib's
+"always succeeds" contract and the sim's "sim_time starts at 0"
+model); shim+populated cache → `kHalSuccess`, return cached
+sim_time_us. Status is written unconditionally (D-C12-STATUS-
+WRITE-UNCONDITIONAL); NULL `status` is UB matching WPILib.
+Future cycles cover on-demand request/reply, shim-initiated
+`shutdown`, the rest of the C HAL ABI (HAL_Initialize,
+HAL_Notifier*, joystick reads, etc.),
+threading, and reset/
 reconnect.
 
 ## Scope
 
-**In (cycles 1–11):**
+**In (cycles 1–23):**
 - `shim_core::make(endpoint, desc, sim_time_us)` — moves the caller-
   owned `tier1_endpoint` into the shim and immediately publishes one
   `boot` envelope carrying `desc` via `endpoint.send`.
@@ -121,6 +136,37 @@ reconnect.
   shutdown short-circuit and `wrap_send_error` semantics. Calls the
   production `backend::active_prefix_bytes(batch)` helper in
   `error_message.h`.
+- `shim_core::enqueue_error(msg)` / `pending_error_messages()` /
+  `flush_pending_errors(sim_time_us)` (cycle 19) — per-shim pending
+  buffer for synchronous `HAL_SendError` calls. The buffer is
+  `std::array<error_message, kMaxErrorsPerBatch>` plus an active count;
+  enqueue appends until capacity and then drops new messages silently.
+  Empty flush succeeds without touching the lane. Successful flush builds
+  a zero-initialized `error_message_batch`, copies the active prefix, sends
+  via `send_error_message_batch`, and clears the count. Transport failure
+  propagates and retains the buffer for retry. Post-shutdown flush returns
+  `shutdown_already_observed` before send, retaining the buffer and lane.
+- `shim_core::enqueue_can_frame(frame)` / `pending_can_frames()` /
+  `flush_pending_can_frames(sim_time_us)` (cycle 20) — per-shim pending
+  buffer for synchronous `HAL_CAN_SendMessage` calls. The buffer is
+  `std::array<can_frame, kMaxCanFramesPerBatch>` plus an active count;
+  enqueue appends until capacity and then drops new frames silently.
+  Empty flush succeeds without touching the lane. Successful flush builds
+  a zero-initialized `can_frame_batch`, copies the active prefix, stamps
+  active frames with `static_cast<std::uint32_t>(sim_time_us)`, sends via
+  `send_can_frame_batch`, and clears the count. Transport failure
+  propagates and retains the buffer for retry. Post-shutdown flush returns
+  `shutdown_already_observed` before send, retaining the buffer and lane.
+- `shim_core::open_can_stream_session(message_id, message_id_mask,
+  max_messages)` / `read_can_stream_session(handle, messages,
+  messages_read)` / `close_can_stream_session(handle)` (cycle 21) —
+  per-shim CAN RX stream sessions for the 2026 `HAL_CAN_*StreamSession`
+  C ABI. Inbound `can_frame_batch` polling still updates
+  `latest_can_frame_batch_`, and additionally queues matching frames into
+  every open stream. Matching uses masked equality
+  `(frame.message_id & mask) == (message_id & mask)`. Reads drain FIFO
+  into caller-provided `can_frame` storage; close invalidates one handle
+  without affecting other streams.
 - `backend::active_prefix_bytes(const can_frame_batch&)`,
   `backend::active_prefix_bytes(const notifier_state&)`, and
   `backend::active_prefix_bytes(const error_message_batch&)` —
@@ -224,13 +270,11 @@ reconnect.
   forward-compat guard; if a post-v0 schema is added to
   `protocol_version.h` and the validator's allowed set but not
   yet wired in dispatch, the loud reject path still fires.
-- **CAN RX queueing semantics.** `latest_can_frame_batch_` uses
-  latest-wins (D-C4-LATEST-WINS) — a deferred decision pinned by
-  the cycle-4 tests. Cycle-1 D #7 anticipated that CAN RX may
-  eventually need queueing, but no live consumer drives that
-  requirement yet. The cycle that wires `HAL_CAN_ReadStreamSession`
-  brings the queue contract with it; until then, latest-wins is
-  the explicit and tested behavior.
+- **Raw CAN RX outside stream sessions.** `latest_can_frame_batch_`
+  remains latest-wins for the cache observer (D-C4-LATEST-WINS), while
+  cycle 21 adds per-stream FIFO queues for `HAL_CAN_ReadStreamSession`.
+  Future one-shot `HAL_CAN_ReceiveMessage` / CANAPI read surfaces own
+  their own latest/new/timeout semantics.
 - The five inbound-only schemas (`clock_state`, `power_state`,
   `ds_state`, `can_status`, `notifier_alarm_batch`) are sim-
   authoritative and have no outbound API by design
@@ -243,25 +287,22 @@ reconnect.
   direction). Future cycle drives the `protocol_session`'s
   single-flight pairing surface.
 - Shim-initiated `shutdown` envelope. Future cycle.
-- The exported C HAL ABI (`HAL_GetFPGATime`, `HAL_Initialize`,
-  `HAL_GetAlliance`, `HAL_CAN_SendMessage`, `HAL_SendError`,
-  `HAL_Notifier*`, etc.). Future cycle adds these as separate
-  surface-files that read from the shim's cache and write into
-  the shim's outbound API. The C HAL CAN TX cycle that wires
-  `HAL_CAN_SendMessage` will own the per-frame-batching and
-  per-tick-flush discipline that drives `send_can_frame_batch`;
-  cycle 9 stops at the C++ shim API.
-- Outbound oversize-count validation for both `send_can_frame_batch`
-  (`count > kMaxCanFramesPerBatch == 64`) and `send_notifier_state`
-  (`count > kMaxNotifiers == 32`). Both methods trust the caller to
-  pass a well-constructed batch; the production
+- Remaining exported C HAL ABI (`HAL_Initialize`, joystick reads,
+  `HAL_CAN_ReceiveMessage`, `HAL_Notifier*`, etc.). Future cycles add
+  these as separate surface-files that read from the shim's cache or
+  write into the shim's outbound API.
+- Outbound oversize-count validation for typed `send_*` methods
+  (`count > kMaxCanFramesPerBatch == 64` for `send_can_frame_batch`,
+  `count > kMaxNotifiers == 32` for `send_notifier_state`, and
+  `count > kMaxErrorsPerBatch == 8` for `send_error_message_batch`).
+  These methods trust the caller to pass a well-constructed batch; the production
   `active_prefix_bytes` overloads read `count` directly. Upstream,
   `protocol_session::build_envelope` and the validator catch
-  oversize batches with `payload_size_mismatch`, but the shim's
-  read past `frames[63]` / `slots[31]` is UB that the validator
-  surfaces only after the read has already happened. The C HAL ABI
-  cycles (`HAL_CAN_SendMessage`, `HAL_Notifier*`) own the count-
-  clamping discipline at the untrusted-caller seam.
+  oversize batches with `payload_size_mismatch`, but the shim's read
+  past the last valid element is UB that the validator surfaces only
+  after the read has already happened. C HAL ABI seams own their own
+  untrusted-caller clamps; `HAL_SendError` and `HAL_CAN_SendMessage`
+  now do this through their fixed pending buffers.
 - Threading. The shim is single-threaded; the caller drives both
   `poll()` and `send_can_frame_batch`. The C HAL ABI cycle that
   introduces multi-thread call sites also introduces the
@@ -658,6 +699,258 @@ Structural feature; no physical source data applies.
   cross-cycle structural parity with C9-7 / C10-7). Cycle 11
   introduces no new design decisions; every contract inherits
   from cycles 9 and 10.
+- Cycle-18 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE18.md`). Round-1 verdict
+  `not-ready` with one required change: C18-3 conflated field-read
+  correctness and cast-wraparound into one test. Round-2 split
+  into a 5-test suite (in-range read at C18-3, wraparound at
+  C18-4, latest-wins renumbered to C18-5). Round-2 verdict
+  `ready-to-implement` with one tiny doc fix (a stale C18-3 →
+  C18-4 reference in C18-5's setup, addressed). **One new design
+  decision:** D-C18-UINT32-TO-INT32-CAST — WPILib's
+  HAL_GetCommsDisableCount returns `int32_t`; the schema's
+  `clock_state::comms_disable_count` is `uint32_t` (the
+  UINT32_MAX boundary test in protocol_test.cpp is load-bearing
+  for the wire-format contract, so changing the schema was
+  rejected); the shim casts at the C ABI seam. For values
+  ≤ INT32_MAX the cast is identity; for values in
+  (INT32_MAX, UINT32_MAX] the cast wraps to negative per C++20.
+  D-C18-UINT32-TO-INT32-CAST is endorsed as the standing decision
+  for future `int32_t`-returning readers on `uint32_t` schema
+  fields. With cycle 18, the **clock_state read surface is fully
+  closed** (7 of 7 fields wired across cycles 12, 15, 17, 18).
+  Reviewer rulings: OQ-C18-WRAPAROUND-VALUE-CHOICE (split
+  required); OQ-C18-CHANGE-SCHEMA-INSTEAD (NO).
+- Cycle-19 plan approved by the `test-reviewer` agent on
+  2026-04-30 after three review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE19.md`). Round-1 verdict
+  `not-ready` required a boot-envelope non-clobber assertion on
+  failed flush and clearer C19-8 deserialization; it also endorsed
+  the fixed-array buffer over `std::vector`, explicit flush,
+  post-shutdown enqueue allowed, overflow-drop, and no-shim
+  `kHalHandleError`. Round-2 verdict `not-ready` required
+  `error_message_batch::reserved_pad[4]` coverage in C19-8/C19-8b
+  and cleanup of stale prose. Round-3 final narrow verdict `ready`.
+  **New design decisions:** D-C19-BUFFER-IN-SHIM-CORE,
+  D-C19-OVERFLOW-DROP, D-C19-EXPLICIT-FLUSH,
+  D-C19-EMPTY-FLUSH-NO-OP, D-C19-FLUSH-CLEARS-ON-SUCCESS,
+  D-C19-FLUSH-RETAINS-ON-FAILURE, D-C19-FLUSH-SHUTDOWN-TERMINAL,
+  D-C19-SEAM-CONSTRUCTS-ERROR-MESSAGE, and
+  D-C19-NULL-STRING-AS-EMPTY. +11 tests across `HalSendError`,
+  `ShimCoreEnqueueError`, and `ShimCoreFlushPendingErrors`;
+  focused shim suite is 157/157 green.
+- Cycle-20 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE20.md`). Round-1 verdict
+  `not-ready` rejected permissive handling for invalid CAN inputs and
+  required `dataSize > 8`, `data == nullptr && dataSize > 0`, and
+  unsupported negative `periodMs` values to return invalid-buffer
+  status without enqueueing. Round-2 verdict `ready-to-implement`.
+  **New design decisions:** D-C20-BUFFER-IN-SHIM-CORE,
+  D-C20-OVERFLOW-DROP-INHERITS-C19,
+  D-C20-EXPLICIT-FLUSH-INHERITS-C19,
+  D-C20-SEAM-CONSTRUCTS-CAN-FRAME,
+  D-C20-MESSAGE-ID-PRESERVED, D-C20-DATA-SIZE-RANGE,
+  D-C20-NULL-DATA-AS-ZERO, D-C20-TIMESTAMP-AT-FLUSH, and
+  D-C20-PERIODMS-DEFER-REPEAT-SCHEDULING. +15 tests across
+  `HalCanSendMessage`, `ShimCoreEnqueueCanFrame`, and
+  `ShimCoreFlushPendingCanFrames`; focused shim suite is 172/172 green
+  and full `ctest --test-dir build` is 487/487 green.
+- Cycle-21 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE21.md`). Round-1 verdict
+  `not-ready` required resolving CAN stream status choices, adding
+  no-shim read coverage, adding accumulation across multiple inbound
+  batches, making read success statuses/counts explicit, and replacing
+  an unobservable close assertion with closed-handle plus close-isolation
+  coverage. Round-2 verdict `ready-to-implement`. **New design
+  decisions:** D-C21-STREAM-HANDLES-IN-SHIM-CORE,
+  D-C21-HANDLE-ZERO-INVALID, D-C21-FILTER-MASK-SEMANTICS,
+  D-C21-QUEUE-ONLY-AFTER-OPEN, D-C21-FIFO-DRAIN,
+  D-C21-ZERO-MAX-MESSAGES-INVALID, D-C21-EMPTY-READ-NO-TOKEN,
+  D-C21-OVERFLOW-KEEPS-NEWEST, D-C21-INVALID-HANDLE-NOT-ALLOWED, and
+  D-C21-NULL-OUTPUT-BUFFER. +17 tests across
+  `HalCanOpenStreamSession`, `HalCanReadStreamSession`, and
+  `HalCanCloseStreamSession`; focused shim suite is 189/189 green and
+  full `ctest --test-dir build` is 504/504 green. Reviewer caveat:
+  empty-read and overflow statuses are explicit v0 shim decisions
+  pending future RIO parity fixture validation.
+- Cycle-22 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE22.md`). Round-1 verdict
+  `not-ready` required empty-cache purity coverage and interleaved
+  poll/read/poll/read latest-wins coverage. Round-2 verdict
+  `ready-to-implement`. **New design decisions:**
+  D-C22-STRUCT-OUT-PARAM-ZERO-DEFAULT and
+  D-C22-CAN-STATUS-FIELD-ORDER. +4 tests in `HalCanGetCanStatus`;
+  focused shim suite is 193/193 green and full
+  `ctest --test-dir build` is 508/508 green.
+- Cycle-23 plan approved by the `test-reviewer` agent on
+  2026-04-30 after three review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE23.md`). Round-1 verdict
+  `not-ready` rejected an all-six-bits-true `HAL_GetControlWord`
+  cached test because it could not detect named-bit transpositions.
+  Round-2 verdict `not-ready` rejected a single non-symmetric bit
+  pattern because some fields remained indistinguishable and `eStop`
+  was never true. Round-3 verdict `ready-to-implement` after C23-3
+  moved to one-hot coverage for all six named control bits. **New
+  design decisions:** D-C23-DS-SCALAR-ZERO-DEFAULT,
+  D-C23-CONTROL-WORD-BITFIELD-ORDER, and
+  D-C23-DS-READERS-SHARE-DS-CACHE. +10 tests across
+  `HalGetControlWord`, `HalGetAllianceStation`, `HalGetMatchTime`,
+  and `HalDriverStationScalarReads`; focused shim suite is 203/203
+  green and full `ctest --test-dir build` is 518/518 green.
+- Cycle-24 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE24.md`). Round-1 verdict
+  `not-ready` required explicit exported `HAL_Joystick*` layout
+  assertions against the backend structs, populated valid-boundary
+  coverage for joystick indices 0 and 5, and byte-equality expectations
+  in the latest-wins test. Round-2 verdict `ready-to-implement`.
+  **New design decisions:** D-C24-JOYSTICK-STRUCT-ZERO-DEFAULT,
+  D-C24-JOYSTICK-INDEX-RANGE, and D-C24-JOYSTICK-STRUCT-BYTE-COPY.
+  Invalid indices (`joystickNum < 0` or `joystickNum >= 6`) return
+  success with zero/default output in v0. +14 tests across
+  `HalJoystickStructLayout`, `HalGetJoystickAxes`, `HalGetJoystickPOVs`,
+  `HalGetJoystickButtons`, and `HalJoystickReads`; focused shim suite
+  is 217/217 green and full `ctest --test-dir build` is 532/532 green.
+- Cycle-17 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE17.md`). Round-1 verdict
+  `not-ready` with one required change: helper placement vs.
+  `extern "C"` boundary in `hal_c.cpp` was unspecified. Round-2
+  picked Option B (helper inside `robosim::backend::shim::{anonymous}`
+  parallel to the cycle-12 `g_installed_shim_` storage) plus
+  two file-scope `using` declarations (`using
+  robosim::backend::clock_state;` and `using
+  robosim::backend::shim::clock_state_hal_bool_read;`) bridging
+  the helper into `extern "C"`'s name lookup. **First explicitly
+  bundled cycle in the C HAL ABI series** — bundles four new
+  HAL_Bool readers (HAL_GetSystemActive, HAL_GetSystemTimeValid,
+  HAL_GetFPGAButton, HAL_GetRSLState) plus a refactor of
+  HAL_GetBrownedOut to the new shared helper. **Three new
+  design decisions:** D-C17-CLOCK-STATE-HAL-BOOL-HELPER (the
+  pointer-to-member helper itself); D-C17-PER-WRAPPER-WRONG-FIELD-
+  COVERAGE (each new wrapper gets one positive test that pins the
+  correct member-pointer is passed; null-shim / empty-cache /
+  latest-wins are session-level via the helper and inherited from
+  cycle 15's HAL_GetBrownedOut tests); D-C17-BUNDLED-SCOPE (the
+  4-criteria rubric for when bundling is justified — zero new
+  design decisions per surface, helper-lift trigger met,
+  per-wrapper coverage preserved, natural scope granularity;
+  explicitly NOT a precedent for outbound-buffering or
+  struct-out-param "new mechanic" cycles). With cycle 17, the
+  **clock_state HAL_Bool reader subset is closed** (5 of 5
+  fields). +4 tests in four new GoogleTest suites; cycle-15
+  HalGetBrownedOut tests verify the refactor preserves behavior.
+- Cycle-16 plan approved by the `test-reviewer` agent on
+  2026-04-30 after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE16.md`). Round-1 verdict
+  `ready-to-implement` with one required change (C16-3 must spell
+  out the explicit `valid_power_state(14.5f, 2.5f, 6.875f)` call
+  to prevent reliance on helper defaults — addressed in revision
+  2). **No new design decisions** — pure mirror of cycles 13/14
+  applied to the third (and final) `power_state` float field.
+  With cycle 16 the power_state read surface is **closed** (all
+  three float fields wired). Reviewer ruled OQ-C16-LIFTING-A-
+  HELPER (still don't lift; defensible but reviewer noted that a
+  scoped pointer-to-member helper for the three power_state float
+  readers would be ONE parameter, not four — captured as a
+  non-blocking note for future cycles when a 6th or 7th similar
+  function lands) and OQ-C16-CLOSE-POWER-STATE-MILESTONE (factual
+  opening-paragraph mention is the right level of ceremony).
+- Cycle-15 plan approved by the `test-reviewer` agent on
+  2026-04-30 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE15.md`). Round-1 verdict
+  `not-ready` with one required change (C15-3's "distinguishing-
+  field hygiene" block was misleading — it named only
+  `fpga_button_latched=0` as a wrong-field mitigation but left
+  the other three sibling `hal_bool` fields at the helper's
+  default `1`) plus a documentation-clarity note about
+  `typedef HAL_Bool` placement in `hal_c.h`. Round-2 picked
+  reviewer's option (b) to neutralize all four sibling
+  `hal_bool` fields to 0 in C15-3, making it self-sufficient
+  for wrong-field isolation, and added the `extern "C"`
+  placement note. Round-2 verdict `ready-to-implement`. **Two
+  new design decisions:** D-C15-HAL-BOOL-SIGNED-PARITY (changes
+  `hal_bool` from `uint32_t` to `int32_t` to match WPILib's
+  `HAL_Bool` byte-for-byte AND signedness-for-signedness; wire
+  format unchanged for valid 0/1 values) and
+  D-C15-HAL-BOOL-TYPEDEF-IN-HAL-C-H (exports `typedef int32_t
+  HAL_Bool;` inside the `extern "C"` block in `hal_c.h` so
+  robot C TUs see the same type name as WPILib). Reviewer
+  resolved all three open questions: OQ-C15-PARITY-FIX-FRAMING
+  (bundle the parity fix with HAL_GetBrownedOut — the surface
+  motivates the fix); OQ-C15-WRONG-FIELD-COVERAGE-IN-C15-3-OR-
+  C15-4 (C15-3 self-sufficient + C15-4 covers the latest-wins-
+  plus-isolation joint contract); OQ-C15-FIELD-PARAM-ON-VALID-
+  CLOCK-STATE (explicit post-helper field assignment over a
+  helper-param expansion). Production-side changes: one line
+  in `types.h` plus updated `static_assert`; comment updates
+  in `notifier_state.h`; `Types.HalBoolIsUint32` →
+  `Types.HalBoolIsInt32` rename in `protocol_test.cpp`; doc
+  references in `tests/backend/common/TEST_PLAN.md` and
+  `.claude/skills/protocol-schema.md`. New TU surface in
+  `hal_c.{h,cpp}`. **+4 tests** in the new `HalGetBrownedOut`
+  suite plus 1 renamed-and-inverted existing protocol test.
+- Cycle-14 plan approved by the `test-reviewer` agent on
+  2026-04-30 after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE14.md`). Round-1 verdict
+  `ready-to-implement` with no blockers and one required plan-text
+  correction (a muddled parenthetical in C14-3's bug-class
+  narrative about wrong-field copy-paste — addressed in revision
+  2 of the plan). **Cycle 14 introduces no new design decisions**
+  — it is a pure mirror of cycle 13 applied to the sibling
+  `power_state::vin_a` field. Reviewer ruled both open questions:
+  OQ-C14-VALUE-CHOICE (keep the deliberately-different-from-C13
+  fixture; catches the "copy-pasted whole function body including
+  field name" bug); OQ-C14-LIFTING-A-HELPER (do NOT lift a shared
+  helper at three functions — the three current readers differ in
+  return type, cache slot, AND field, so a shared helper would
+  need three template parameters and obscure the one line that
+  varies; defer until 4th/5th lands and the pattern is stable).
+- Cycle-13 plan approved by the `test-reviewer` agent on
+  2026-04-30 after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE13.md`). Round-1 verdict
+  `ready-to-implement` with no blockers and no required changes.
+  Reviewer explicitly resolved all three open questions:
+  OQ-C13-IDEMPOTENCY-TEST (trim is defensible — no new bug class
+  beyond what C13-3/C13-4 catch; the cycle-10 trim convention
+  applies); OQ-C13-PEER-BUNDLING (do not bundle HAL_GetVinCurrent
+  with cycle 13 — one HAL_* per cycle, mirroring the cycle-9/10/11
+  precedent and keeping each cycle's claimed scope honest);
+  OQ-C13-FIXTURE-VIN-CHOICE (12.5/99.25/6.75 exact-equality
+  assertion is correct because float→double widening is
+  mathematically lossless for finite values, so a tolerance would
+  be wrong). Cycle 13 is the second C HAL ABI surface and adds
+  one new design decision (D-C13-FLOAT-TO-DOUBLE-CAST). Test
+  count trimmed from cycle 12's 8 to 4 because the install/clear
+  surface and idempotency contracts are already pinned by cycle
+  12 and don't need re-verification per HAL_* function.
+- Cycle-12 plan approved by the `test-reviewer` agent on
+  2026-04-30 after three review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE12.md`). Round-1 verdict
+  `not-ready` with three blockers (storage-location ambiguity
+  between `shim_core.cpp` and `hal_c.cpp`; C12-2 internal
+  contradiction on whether `make_connected_shim` is called;
+  `shim_global_install_guard` double-qualified
+  `shim_core::shim_core::install_global`) plus five non-blocking
+  items (C12-1 / C12-4 explicit precondition wording; C12-7
+  restructured to actually catch "caches-on-first-call" via
+  interleaved poll/read; D-C12-NO-CLOCK-STATE-IS-SUCCESS-ZERO
+  indistinguishability note; OQ-C12-STORAGE-LOCATION resolution).
+  Round-2 closed all three blockers and four of the five
+  non-blocking items but left a single residual: a stale
+  "storage in shim_core.cpp" sentence in the D-C12-GLOBAL-
+  ACCESSOR block that contradicted the resolved OQ. Round-3
+  closed that and the two label artifacts. Reviewer explicitly
+  resolved all five open questions: OQ-C12-INSTALL-AS-METHOD-VS-
+  FREE-FN (static methods on `shim_core`); OQ-C12-NO-CLOCK-
+  STATE-DECISION (success-zero, with indistinguishability note);
+  OQ-C12-NULL-STATUS-GUARD (UB matching WPILib); OQ-C12-RAII-
+  GUARD-LOCATION (test-helpers); OQ-C12-STORAGE-LOCATION
+  (`hal_c.cpp` TU-static, with declarations in `shim_core.h`).
 - `tests/backend/shim/shim_core_test.cpp` covers, across cycles
   1–11, **113 tests**: boot publish layout, make-failure-atomicity
   (lane busy), wrong-direction endpoint surfacing
@@ -749,23 +1042,33 @@ Structural feature; no physical source data applies.
   `error_message_batch`); the per-tick set is closed on the
   inbound side. On-demand replies (via `on_demand_reply`)
   follow as their own TDD cycle.
-- CAN RX queueing is **not implemented**; `latest_can_frame_batch_`
-  is latest-wins. Per D-C4-LATEST-WINS this is deferred until the
-  cycle that wires `HAL_CAN_ReadStreamSession`.
+- CAN RX stream queueing is implemented for
+  `HAL_CAN_OpenStreamSession` / `HAL_CAN_ReadStreamSession` /
+  `HAL_CAN_CloseStreamSession`. `HAL_CAN_GetCANStatus` reads
+  `latest_can_status_`. `latest_can_frame_batch_` remains a latest-wins
+  cache for direct observation and for future one-shot CAN read surfaces.
+- Driver Station scalar reads are implemented for `HAL_GetControlWord`,
+  `HAL_GetAllianceStation`, and `HAL_GetMatchTime` against
+  `latest_ds_state_`. Empty-cache reads succeed with zero/default
+  values and do not materialize a cache value. Joystick reads are
+  implemented for `HAL_GetJoystickAxes`, `HAL_GetJoystickPOVs`, and
+  `HAL_GetJoystickButtons`; they copy valid slots byte-for-byte and
+  return success with zero/default output for invalid indices. Match-info,
+  descriptor, and all-joystick aggregate reads remain future DS surfaces.
 - All three outbound-meaningful schemas wired
   (`send_can_frame_batch` at cycle 9 + `send_notifier_state` at
   cycle 10 + `send_error_message_batch` at cycle 11); the v0
   outbound surface is closed for tick_boundary publishing. The
   five inbound-only schemas are intentionally absent from the
   outbound API (D-C9-TYPED-OUTBOUND).
-- No outbound oversize-count clamp on any send method
+- No outbound oversize-count clamp on any typed `send_*` method
   (`count > kMaxCanFramesPerBatch == 64` for `send_can_frame_batch`,
   `count > kMaxNotifiers == 32` for `send_notifier_state`,
   `count > kMaxErrorsPerBatch == 8` for `send_error_message_batch`).
   Reading past the last valid element is UB that the upstream
-  validator surfaces only after the read. The C HAL ABI cycles
-  that wire `HAL_CAN_SendMessage`, `HAL_Notifier*`, and
-  `HAL_SendError` own the seam-level count clamp.
+  validator surfaces only after the read. C HAL ABI seams own their own
+  untrusted-caller clamps; `HAL_SendError` and `HAL_CAN_SendMessage`
+  now do this through their fixed pending buffers.
 - No `on_demand_request` / `on_demand_reply` traffic in either
   direction. Single-flight pairing in `protocol_session` exists
   but is not yet driven by the shim.
@@ -778,9 +1081,20 @@ Structural feature; no physical source data applies.
   waits.
 - No reset / reconnect. After `is_shutting_down()` becomes true,
   the shim object is unusable on both inbound and outbound paths.
-- No C HAL surface (`HAL_*` symbols). Future cycles add per-surface
-  exports that read from the cache and write into the outbound
-  send API.
+- C HAL surface (`HAL_*` symbols) is **partially wired**: cycles
+  12–18 ship the clock/power read surfaces, cycle 19 ships
+  `HAL_SendError` plus the pending-error flush buffer, and cycle 20
+  ships `HAL_CAN_SendMessage` plus the pending-CAN-frame flush buffer;
+  cycle 21 ships the CAN stream open/read/close surface and per-stream
+  RX queues; cycle 22 ships `HAL_CAN_GetCANStatus`; cycle 23 ships
+  `HAL_GetControlWord`, `HAL_GetAllianceStation`, and
+  `HAL_GetMatchTime`; cycle 24 ships `HAL_GetJoystickAxes`,
+  `HAL_GetJoystickPOVs`, and `HAL_GetJoystickButtons`.
+  Future cycles add HAL_Initialize, HAL_Notifier*, match-info reads,
+  etc. — each its own cycle. The accessor's storage (a non-atomic TU-static in
+  `hal_c.cpp`) is single-threaded; the threading cycle promotes
+  to `std::atomic<shim_core*>`. NULL `status` to any HAL_* is UB,
+  matching WPILib's contract.
 - Bound to `tier1::tier1_endpoint` directly. Generalization to a
   tier-agnostic transport seam waits until tier 2 lands.
 
@@ -879,6 +1193,112 @@ Structural feature; no physical source data applies.
   and OQ-C11-MEMCMP-IN-DETERMINISM resolved as "keep for
   parity"; this cycle closes the v0 outbound surface for the
   three semantically-meaningful outbound schemas).
+- `tests/backend/shim/TEST_PLAN_CYCLE12.md` — approved cycle-12
+  addendum (first C HAL ABI surface; new TU
+  `src/backend/shim/hal_c.{h,cpp}`; `extern "C" HAL_GetFPGATime`
+  reading from `latest_clock_state_->sim_time_us`; new process-
+  global accessor `shim_core::install_global` /
+  `shim_core::current` declared in `shim_core.h` but defined in
+  `hal_c.cpp` next to its TU-static `g_installed_shim_` storage
+  per D-C12-STORAGE-IN-HAL-C-CPP; status code constants
+  `kHalSuccess` / `kHalHandleError` mirror WPILib HAL/Errors.h;
+  D-C12-NULL-SHIM-IS-HANDLE-ERROR for the no-shim error path;
+  D-C12-NO-CLOCK-STATE-IS-SUCCESS-ZERO matches the WPILib
+  contract that HAL_GetFPGATime always succeeds and the sim-
+  authoritative "sim_time starts at 0" model — the empty-cache
+  return value is intentionally indistinguishable from a
+  populated-cache `sim_time_us == 0`; D-C12-STATUS-WRITE-
+  UNCONDITIONAL pins that `*status` is overwritten on every
+  call regardless of prior value; D-C12-LATEST-WINS-READ pins
+  that the function reads the cache observer at call time, not
+  at install time, with the C12-7 interleaved-poll/read
+  structure catching "caches-on-first-call" bugs; new
+  `shim_global_install_guard` RAII helper in `shim_core_test.cpp`'s
+  anonymous namespace; C12-1/C12-2/C12-3 use explicit
+  `install_global(nullptr)` pre-clear/post-clear rather than the
+  guard since they are testing the install/clear surface itself;
+  eight tests across two new suites `ShimCoreCurrent` and
+  `HalGetFPGATime`).
+- `tests/backend/shim/TEST_PLAN_CYCLE13.md` — approved cycle-13
+  addendum (second C HAL ABI surface; `extern "C" double
+  HAL_GetVinVoltage(int32_t* status)` reading from
+  `latest_power_state_->vin_v`; D-C13-FLOAT-TO-DOUBLE-CAST is
+  the only new design decision (loss-free `static_cast<double>`
+  at the C ABI seam); all other contracts inherit unchanged from
+  cycle 12 (D-C12-NULL-SHIM-IS-HANDLE-ERROR, D-C12-NO-CLOCK-
+  STATE-IS-SUCCESS-ZERO per-function variant for `power_state`,
+  D-C12-STATUS-WRITE-UNCONDITIONAL, D-C12-LATEST-WINS-READ); 4
+  tests in the new `HalGetVinVoltage` suite; fixture values
+  12.5 / 99.25 / 6.75 exactly representable in IEEE-754 single
+  AND double precision so exact equality is asserted rather than
+  tolerance; OQ-C13-IDEMPOTENCY-TEST resolved as "do not add"
+  via cycle-10 trim convention; OQ-C13-PEER-BUNDLING resolved as
+  "one HAL_* per cycle"; OQ-C13-FIXTURE-VIN-CHOICE resolved as
+  "exact-equality is correct because IEEE-754 widening is
+  lossless").
+- `tests/backend/shim/TEST_PLAN_CYCLE14.md` — approved cycle-14
+  addendum (third C HAL ABI surface; `extern "C" double
+  HAL_GetVinCurrent(int32_t* status)` reading from
+  `latest_power_state_->vin_a`; **no new design decisions** —
+  pure mirror of cycle 13 applied to the sibling `vin_a` field;
+  4 tests in the new `HalGetVinCurrent` suite; C14-3 fixture
+  values 7.5/42.25/6.5 deliberately different from C13-3's
+  12.5/99.25/6.75 to catch "copy-pasted HAL_GetVinVoltage's body
+  including the field name" bug; OQ-C14-VALUE-CHOICE resolved
+  as "keep the different fixture"; OQ-C14-LIFTING-A-HELPER
+  resolved as "do not lift at three functions — wait for fourth
+  or fifth").
+- `tests/backend/shim/TEST_PLAN_CYCLE18.md` — approved cycle-18
+  addendum (`HAL_GetCommsDisableCount`; final clock_state reader;
+  D-C18-UINT32-TO-INT32-CAST pinning the cast at the C ABI seam
+  for the schema's `uint32_t` field meeting WPILib's `int32_t`
+  return; 5 tests including a dedicated wraparound test at
+  `0xCAFEBABE > INT32_MAX`; closes the clock_state read surface
+  entirely).
+- `tests/backend/shim/TEST_PLAN_CYCLE17.md` — approved cycle-17
+  addendum (first bundled cycle; lifts shared
+  `clock_state_hal_bool_read` helper; refactors `HAL_GetBrownedOut`
+  to call it; adds four new HAL_Bool readers
+  `HAL_GetSystemActive` / `HAL_GetSystemTimeValid` /
+  `HAL_GetFPGAButton` / `HAL_GetRSLState` as 1-line wrappers; closes
+  the clock_state HAL_Bool reader subset; D-C17-CLOCK-STATE-HAL-
+  BOOL-HELPER, D-C17-PER-WRAPPER-WRONG-FIELD-COVERAGE, D-C17-
+  BUNDLED-SCOPE; 4 new tests, one per new wrapper, each isolating
+  the wrong-field bug class via single-distinguished-field
+  fixtures; cycle-15's existing HalGetBrownedOut tests verify the
+  helper-based refactor of HAL_GetBrownedOut preserves behavior).
+- `tests/backend/shim/TEST_PLAN_CYCLE16.md` — approved cycle-16
+  addendum (fifth C HAL ABI surface; `extern "C" double
+  HAL_GetBrownoutVoltage(int32_t* status)` reading from
+  `latest_power_state_->brownout_voltage_v` widened float→double
+  per D-C13-FLOAT-TO-DOUBLE-CAST inherited; **no new design
+  decisions**; pure mirror of cycles 13/14 against the third
+  power_state float field; **closes the power_state read
+  surface** — all three float fields wired; 4 tests in the new
+  `HalGetBrownoutVoltage` suite; C16-3 fixture values
+  14.5/2.5/6.875 deliberately distinct from cycles 13's
+  12.5/99.25/6.75 and 14's 7.5/42.25/6.5 to catch copy-paste
+  bugs across the three float-reader cycles; reviewer's
+  pointer-to-member helper observation captured for the future
+  helper-lift trigger).
+- `tests/backend/shim/TEST_PLAN_CYCLE15.md` — approved cycle-15
+  addendum (fourth C HAL ABI surface, first HAL_Bool-returning;
+  `extern "C" HAL_Bool HAL_GetBrownedOut(int32_t* status)`
+  reading from `latest_clock_state_->browned_out`; **two new
+  design decisions** — D-C15-HAL-BOOL-SIGNED-PARITY changes
+  `hal_bool` from `uint32_t` to `int32_t` to match WPILib's
+  `HAL_Bool` byte-for-byte AND signedness-for-signedness, with
+  wire format unchanged for valid 0/1 values; D-C15-HAL-BOOL-
+  TYPEDEF-IN-HAL-C-H exports `typedef int32_t HAL_Bool;`
+  inside `hal_c.h`'s `extern "C"` block; bundles the parity fix
+  with the new HAL surface because the surface is what motivates
+  the fix; 4 tests in the new `HalGetBrownedOut` suite plus 1
+  renamed-and-inverted existing protocol test
+  `Types.HalBoolIsInt32`; C15-3 fixture explicitly zeroes all
+  four sibling `hal_bool` fields to make wrong-field isolation
+  self-sufficient; C15-4 uses inversely-correlated sibling
+  fields across two updates to catch latest-wins + wrong-field
+  bugs jointly).
 - `tests/backend/shim/shim_core_test.cpp` — implementation of the
   approved cycle-1 through cycle-11 tests.
 - `tests/backend/tier1/test_helpers.h` — shared test helpers

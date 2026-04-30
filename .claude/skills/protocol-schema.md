@@ -71,7 +71,7 @@ have their own future TDD cycle.
 | Header                    | Purpose                                                                              |
 |---------------------------|--------------------------------------------------------------------------------------|
 | `protocol_version.h`      | `kProtocolVersion`, `kProtocolMagic`, `schema_id`, `envelope_kind`, `direction`, `runtime_type` enums; little-endian `static_assert`. |
-| `types.h`                 | `hal_bool` = `uint32_t`, `hal_handle` = `int32_t` (mirror WPILib `HAL_Bool`/`HAL_Handle`). |
+| `types.h`                 | `hal_bool` = `int32_t`, `hal_handle` = `int32_t` (mirror WPILib `HAL_Bool`/`HAL_Handle` byte-for-byte AND signedness-for-signedness; cycle 15 D-C15-HAL-BOOL-SIGNED-PARITY fix from a previously-shipped `uint32_t` typedef). |
 | `truncate.h`/`.cpp`       | `copy_truncated`, `copy_bytes_truncated`. Pure, no I/O, no allocation, overlap = UB.  |
 | `sync_envelope.h`         | 32-byte wire-contract envelope.                                                      |
 | `clock_state.h`           | Per-tick sim time + system flags. **No team_number** (fork F1 — moved to boot).       |

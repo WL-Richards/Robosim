@@ -94,7 +94,7 @@ old SHA. Drift is a build break, never silent.
 | Header                  | Contains |
 |-------------------------|----------|
 | `protocol_version.h`    | `kProtocolVersion`, `kProtocolMagic`, `schema_id` enum, `envelope_kind` enum, `direction` enum, `runtime_type` enum. |
-| `types.h`               | `hal_bool` = `uint32_t` (mirrors WPILib `HAL_Bool`); `hal_handle` = `int32_t` (mirrors `HAL_Handle`). |
+| `types.h`               | `hal_bool` = `int32_t` (mirrors WPILib `HAL_Bool` byte-for-byte AND signedness-for-signedness; cycle 15 D-C15-HAL-BOOL-SIGNED-PARITY fix from a previously-shipped `uint32_t`); `hal_handle` = `int32_t` (mirrors `HAL_Handle`). |
 | `truncate.h`/`.cpp`     | `copy_truncated(std::span<char>, std::string_view) -> bool`; `copy_bytes_truncated(std::span<uint8_t>, std::span<const uint8_t>) -> std::size_t`. Pure helpers; no I/O. |
 | `sync_envelope.h`       | `sync_envelope` POD header that prefixes every exchange. |
 | `clock_state.h`         | `clock_state` — sim time, system_active, browned_out, system_time_valid, FPGA button, RSL, comms-disable count. **Per-tick fields only**; session-invariants live in `boot_descriptor` (fork F1). |
@@ -394,7 +394,7 @@ Pinned explicitly in the test (mirror struct + `static_assert`)
 because C enum backing is implementation-defined. Verified against
 WPILib at `kWpilibParitySha`.
 
-### 22. `error_message::severity` is `hal_bool` (= `uint32_t`)
+### 22. `error_message::severity` is `hal_bool` (= `int32_t`)
 
 Mirrors `HAL_SendError`'s `HAL_Bool isError` parameter (1 = error,
 0 = warning/info). Single bool, not a multi-level enum, because
@@ -504,9 +504,11 @@ test name is the behavior. No fixtures bigger than necessary.
   the fact that it's there.
 
 - A5. `hal_bool` typedef pin: `static_assert(sizeof(hal_bool) == 4)`,
-  `static_assert(std::is_same_v<hal_bool, uint32_t>)`. Decision #10
-  shim-memcpy story breaks if `hal_bool` ever becomes a 1-byte
-  `bool`.
+  `static_assert(std::is_same_v<hal_bool, int32_t>)`. Cycle 15
+  D-C15-HAL-BOOL-SIGNED-PARITY fixed the typedef from `uint32_t` to
+  `int32_t` to match WPILib `HAL_Bool` byte-for-byte AND signedness-
+  for-signedness. Decision #10 shim-memcpy story breaks if `hal_bool`
+  ever becomes a 1-byte `bool`.
 
 - A6. `hal_handle` typedef pin: `static_assert(std::is_same_v<
   hal_handle, int32_t>)`. Mirrors `HAL_Handle`.
