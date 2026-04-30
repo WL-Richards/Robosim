@@ -7,12 +7,13 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
 
 ## Headline
 
-- Full project baseline through cycle 24: **ctest 532/532 green** under
-  `build`. Cycle 24 focused shim suite: **217/217 green**.
-- HAL shim through **cycle 24** (power_state read surface closed +
+- Full project baseline through cycle 35: **ctest 634/634 green** under
+  `build`. Cycle 35 focused shim suite: **319/319 green**.
+- HAL shim through **cycle 35** (power_state read surface closed +
   clock_state read surface fully closed — all 7 fields wired; first
   two C HAL write surfaces landed; CAN stream RX and CAN status read
-  landed; Driver Station scalar and joystick reads landed): v0 outbound surface closed for the
+  landed; Driver Station scalar and joystick reads landed; Notifier
+  control-plane C HAL surface started): v0 outbound surface closed for the
   three semantically-meaningful outbound schemas; the eight inbound
   per-tick payload schemas are all wired with latest-wins replacement;
   C HAL ABI surfaces wired so far: **`HAL_GetFPGATime`** (cycle 12),
@@ -30,7 +31,27 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
   **`HAL_GetControlWord`** / **`HAL_GetAllianceStation`** /
   **`HAL_GetMatchTime`** (cycle 23), plus
   **`HAL_GetJoystickAxes`** / **`HAL_GetJoystickPOVs`** /
-  **`HAL_GetJoystickButtons`** (cycle 24). The three
+  **`HAL_GetJoystickButtons`** (cycle 24), plus
+  **`HAL_InitializeNotifier`** / **`HAL_SetNotifierName`** /
+  **`HAL_UpdateNotifierAlarm`** / **`HAL_CancelNotifierAlarm`** /
+  **`HAL_StopNotifier`** / **`HAL_CleanNotifier`** (cycle 25), plus
+  **`HAL_SetNotifierThreadPriority`** (cycle 26), plus
+  **`HAL_WaitForNotifierAlarm`** (cycle 27), plus
+  **`HAL_Initialize`** / **`HAL_Shutdown`** (cycle 28), plus
+  **`HAL_GetMatchInfo`** / **`HAL_GetJoystickDescriptor`** /
+  **`HAL_GetJoystickIsXbox`** / **`HAL_GetJoystickType`** /
+  **`HAL_GetJoystickName`** / **`HAL_GetJoystickAxisType`** (cycle
+  29), plus **`HAL_GetAllJoystickData`** (cycle 30), plus
+  **`HAL_CAN_ReceiveMessage`** (cycle 31), plus
+  **`HAL_RefreshDSData`** (cycle 32), plus
+  **`HAL_ProvideNewDataEventHandle`** /
+  **`HAL_RemoveNewDataEventHandle`** (cycle 33), plus
+  **`HAL_GetOutputsEnabled`** (cycle 34), plus
+  **`HAL_ObserveUserProgramStarting`** /
+  **`HAL_ObserveUserProgramDisabled`** /
+  **`HAL_ObserveUserProgramAutonomous`** /
+  **`HAL_ObserveUserProgramTeleop`** /
+  **`HAL_ObserveUserProgramTest`** (cycle 35). The three
   power_state float readers widen float→double via
   D-C13-FLOAT-TO-DOUBLE-CAST. With cycle 16 the **power_state read
   surface is closed** — all three float fields wired.
@@ -554,22 +575,256 @@ full byte equality.
 `HalGetJoystickPOVs`, `HalGetJoystickButtons`, and `HalJoystickReads`.
 The plan reached `ready-to-implement` after two `test-reviewer` rounds.
 
+### Cycle 25 — Notifier control plane
+
+The first Notifier C HAL slice. `HAL_InitializeNotifier`,
+`HAL_SetNotifierName`, `HAL_UpdateNotifierAlarm`,
+`HAL_CancelNotifierAlarm`, `HAL_StopNotifier`, and
+`HAL_CleanNotifier` now own per-shim notifier handles and publish
+compact `notifier_state` snapshots through explicit
+`flush_notifier_state(sim_time_us)`.
+
+Handles are nonzero, monotonic, and not reused in v0; handle `0`,
+unknown handles, and cleaned handles report `kHalHandleError` from
+status-writing functions. The 32-slot table boundary is explicit: the
+33rd active allocation returns handle `0` with `kHalHandleError`. Names
+are zero-filled, null names become empty, and overlong names copy at
+most 63 bytes to preserve a trailing NUL. Update activates an alarm;
+cancel and stop clear `trigger_time_us`, set `alarm_active = 0`, and
+mark `canceled = 1`. `HAL_CleanNotifier` is a no-op when no shim is
+installed and removes live slots otherwise. Empty notifier-table flushes
+publish a header-only snapshot rather than no-oping, so Sim Core can
+observe that all notifiers were removed. `HAL_WaitForNotifierAlarm`
+remained deferred to cycle 27.
+
+**+18 tests** across `HalInitializeNotifier`, `HalSetNotifierName`,
+`HalUpdateNotifierAlarm`, `HalCancelNotifierAlarm`, `HalStopNotifier`,
+`HalCleanNotifier`, `ShimCoreFlushNotifierState`, and
+`ShimCoreDeterminism`. The plan reached `ready-to-implement` after two
+`test-reviewer` rounds.
+
+### Cycle 26 — Notifier thread priority
+
+`HAL_SetNotifierThreadPriority` is now present as a v0 deterministic
+no-op. With no shim installed it returns false and writes
+`kHalHandleError`; with a shim installed it accepts all `realTime` and
+`priority` inputs, returns true, and writes `kHalSuccess`. The call does
+not allocate notifiers, mutate `notifier_state`, or publish outbound
+traffic. Real scheduler policy, priority validation, and threading
+effects remain deferred to the future threading model.
+
+**+5 tests** in `HalSetNotifierThreadPriority`. The plan reached
+`ready-to-implement` in one `test-reviewer` round.
+
+### Cycle 27 — Notifier wait
+
+`HAL_WaitForNotifierAlarm` now has real v0 wake semantics instead of an
+empty nonblocking placeholder. With no shim or an invalid/cleaned handle
+it returns `0` and writes `kHalHandleError`. For a valid active handle
+it waits until a matching inbound `notifier_alarm_batch` event is
+available, `HAL_StopNotifier` wakes the handle, or `HAL_CleanNotifier`
+invalidates it. Alarm events are appended during `shim_core::poll()` to
+a per-shim FIFO wait queue, drained by matching handle without mutating
+the existing latest-wins `latest_notifier_alarm_batch()` observer cache.
+`HAL_StopNotifier` wakes pending waits with `0/kHalSuccess`;
+`HAL_CleanNotifier` wakes them with `0/kHalHandleError`;
+`HAL_CancelNotifierAlarm` updates control-plane state but does not wake
+waits. Queue capacity/overflow and multi-waiter behavior remain
+explicitly deferred.
+
+Cycle 27 is the first shim cycle to add synchronized state around a HAL
+wait path: notifier records and pending wait events are protected by the
+per-shim notifier wait mutex/condition variable so concurrent
+`poll()`/wait/stop/clean/cancel paths are data-race-free for this
+surface.
+
+**+10 tests** in `HalWaitForNotifierAlarm`. The plan reached
+`ready-to-implement` after three `test-reviewer` rounds.
+
+### Cycle 28 — HAL lifecycle
+
+`HAL_Initialize(timeout, mode)` and `HAL_Shutdown()` are now wired as
+the first process lifecycle C HAL surface. v0 keeps shim ownership with
+the host harness: `HAL_Initialize` does not create transport or boot a
+new `shim_core`; it returns false when no shim is installed and true
+when `shim_core::install_global(&shim)` already points at a live shim.
+`timeout` and `mode` are accepted but ignored in v0, including
+`INT32_MIN` / `INT32_MAX`. Repeated and concurrent initialize calls are
+idempotent read-only operations against an already installed shim.
+
+`HAL_Shutdown` is a no-op without an installed shim. With an installed
+shim it wakes pending HAL waits, then clears the process-global current
+shim pointer without destroying or clearing the caller-owned shim
+object. Pending `HAL_WaitForNotifierAlarm` calls wake with
+`0/kHalHandleError` on shutdown. The host may reinstall the same shim
+after shutdown and call `HAL_Initialize` again; cycle 28 intentionally
+does not add persistent process poison state. A small diagnostic
+`pending_notifier_wait_count` observer was added to make wait
+registration deterministic in tests without sleeps.
+
+**+9 tests** across `HalInitialize` and `HalShutdown`. The plan reached
+`ready-to-implement` after two `test-reviewer` rounds.
+
+### Cycle 29 — DS match info and joystick descriptors
+
+The remaining per-slot Driver Station metadata reads now come from
+`latest_ds_state_`. `HAL_GetMatchInfo` copies `ds_state::match`
+byte-for-byte into `HAL_MatchInfo`; no installed shim returns
+`kHalHandleError` and zeroes the output, while an installed shim with an
+empty DS cache returns `kHalSuccess` and zeroes the output.
+
+`HAL_GetJoystickDescriptor` copies valid joystick descriptor slots
+byte-for-byte. Invalid joystick indices return `kHalSuccess` with a
+zero/default descriptor, matching the cycle-24 invalid-index convention
+and WPILib's documented descriptor default-fill behavior. The scalar
+descriptor helpers `HAL_GetJoystickIsXbox`, `HAL_GetJoystickType`, and
+`HAL_GetJoystickAxisType` have no status channel, so no-shim,
+empty-cache, invalid joystick, and invalid axis paths return zero.
+`HAL_GetJoystickName` fills `WPI_String { const char* str, size_t len }`
+with heap-owned bytes copied from the fixed descriptor name field up to
+the first NUL, or all 256 bytes if no NUL is present; unavailable or
+empty names return `{nullptr, 0}`.
+
+**+15 tests** across `HalGetMatchInfo`, `HalGetJoystickDescriptor`,
+`HalJoystickDescriptorScalars`, `HalGetJoystickName`, and
+`HalDriverStationMetadataReads`. The first test-reviewer pass was
+`not-ready` for missing scalar-helper no-shim/empty/latest coverage; the
+revised plan reached `ready-to-implement`.
+
+### Cycle 30 — all joystick aggregate read
+
+`HAL_GetAllJoystickData` now copies all six axes, POV, and button slots
+from `latest_ds_state_` in one void C HAL call. No installed shim or an
+installed shim with an empty DS cache zeroes all three output arrays.
+Populated-cache reads copy every fixed ABI struct byte-for-byte and
+match the per-slot Cycle 24 readers for the same cache.
+
+**+5 tests** in `HalGetAllJoystickData`. The plan reached
+`ready-to-implement` in the Cycle 29/30 reviewer follow-up.
+
+### Cycle 31 — HAL_CAN_ReceiveMessage
+
+`HAL_CAN_ReceiveMessage` is now wired against the older WPILib
+`hal/CAN.h` signature already used by this repo's stream-session ABI:
+`uint32_t* messageID`, `uint32_t messageIDMask`, `uint8_t* data`,
+`uint8_t* dataSize`, `uint32_t* timeStamp`, `int32_t* status`. The
+signature was re-confirmed against WPILib primary source before the
+cycle because generated newer docs show a bus-ID based API.
+
+v0 treats `messageID` as in/out: callers provide the requested ID in
+`*messageID`, and successful reads overwrite it with the actual matched
+frame ID. Matching uses the cycle-21 stream rule
+`(frame.message_id & mask) == (requested_id & mask)`, including
+mask-zero matching every active frame. The source is only the current
+`latest_can_frame_batch_` active prefix: the call does not open, drain,
+or backfill stream sessions, and it does not search stale older batches.
+If multiple active frames match, it returns the first matching frame in
+wire order.
+
+No installed shim writes `kHalHandleError` and zeroes outputs. An
+installed shim with null `data` writes `kHalCanInvalidBuffer`, zeroes
+scalar outputs, and leaves receive state available for a later valid
+read. Empty cache, empty latest batch, or no match writes
+`kHalCanMessageNotFound` and zeroes all outputs; this intentionally uses
+the receive-message error code rather than the stream-session
+`kHalCanNoToken` warning.
+
+**+11 tests** in `HalCanReceiveMessage`. The first test-reviewer pass
+was `not-ready` for stale fallback, inactive-prefix, and internal-state
+assertion gaps; the revised plan reached `ready-to-implement`.
+
+### Cycle 32 — HAL_RefreshDSData
+
+`HAL_RefreshDSData` is now wired as the first Driver Station runtime-loop
+surface. No installed shim returns false. An installed shim attempts one
+inbound receive/dispatch step through the same protocol path as `poll()`.
+It returns true only when that accepted message is a `ds_state` packet; valid
+non-DS messages still dispatch but return false. No-message, dispatch-error,
+and shutdown paths also return false because the C ABI has no status
+out-parameter.
+
+The refresh path updates the same `latest_ds_state_` cache observed by the
+existing DS getters. Tests pin that no-message and non-DS refresh calls
+preserve getter-visible DS values, repeated DS refreshes are latest-wins, and
+shutdown prevents later DS packets from surfacing through the public getters.
+
+**+6 tests** in `HalRefreshDSData`. The first test-reviewer pass was
+`not-ready` for internal-cache assertions, an infeasible multi-message queue
+test, and weak shutdown observation; the revised plan reached
+`ready-to-implement`.
+
+### Cycle 33 — DS new-data event handles
+
+`HAL_ProvideNewDataEventHandle` and `HAL_RemoveNewDataEventHandle` are
+now wired for Driver Station new-data signaling. `WPI_Handle` and
+`WPI_EventHandle` mirror WPILib as `unsigned int`, with `0` treated as
+the invalid handle. Registrations live on the installed `shim_core`
+object, are unique by handle, and are removed idempotently; no-shim,
+zero-handle, and unknown-remove paths are no-ops.
+
+Accepted `ds_state` packets wake registered handles through the WPI
+signal-object seam by calling weak `WPI_SetEvent(handle)`. The wake is in
+the shared inbound dispatch path, so both direct host-driven `poll()` and
+`HAL_RefreshDSData()` signal handles when they accept DS data. Valid
+non-DS packets, no-message refreshes, and post-shutdown paths do not
+signal. The weak symbol keeps the shim linkable in non-WPI unit-test
+hosts while still using the real WPI ABI symbol when present.
+
+**+10 tests** in `HalDsNewDataEvents`. The first test-reviewer pass was
+`not-ready` for ABI assertion gaps, mixed no-shim/invalid-handle
+coverage, order-sensitive signal expectations, missing per-shim coverage,
+and weak shutdown observation; the revised plan reached
+`ready-to-implement`.
+
+### Cycle 34 — HAL_GetOutputsEnabled
+
+`HAL_GetOutputsEnabled` now mirrors WPILib sim's pinned expression:
+the latest cached DS control word reports outputs enabled only when both
+`kControlEnabled` and `kControlDsAttached` are set. No installed shim and
+installed-shim empty DS cache both return false. E-stop does not add hidden
+gating in v0; this surface follows the WPILib boolean expression exactly.
+
+The result observes the same `latest_ds_state_` cache updated by direct
+`poll()` and by `HAL_RefreshDSData`, so repeated DS updates are latest-wins.
+
+**+5 tests** in `HalGetOutputsEnabled`.
+
+### Cycle 35 — user-program observer calls
+
+The five Driver Station user-program observer calls are now exported:
+`HAL_ObserveUserProgramStarting`, `HAL_ObserveUserProgramDisabled`,
+`HAL_ObserveUserProgramAutonomous`, `HAL_ObserveUserProgramTeleop`, and
+`HAL_ObserveUserProgramTest`.
+
+Because no protocol schema exists yet for publishing user-code observer
+state to Sim Core, v0 records the latest call as a documented host-facing
+`shim_core::user_program_observer_state()` value. The enum is per shim object
+with `none`, `starting`, `disabled`, `autonomous`, `teleop`, and `test`
+states. No-shim observer calls are no-ops, repeated calls are latest-wins,
+observer calls do not publish into existing outbound schemas, and calls after
+`HAL_Shutdown` are no-ops because shutdown detaches the process-global shim.
+
+**+8 tests** in `HalObserveUserProgram`. The first test-reviewer pass was
+`not-ready` for missing no-publish coverage, missing fresh-shim default-state
+coverage, and not naming the state accessor as host-facing v0 API; the
+revised plan reached `ready-to-implement`.
+
 ## What's next
 
 The C HAL ABI is the **largest remaining shim chunk** and is now in
-progress — cycles 12–24 wired the first read surfaces, the global shim
+progress — cycles 12–35 wired the first read surfaces, the global shim
 accessor, the first two write surfaces (`HAL_SendError` and
-`HAL_CAN_SendMessage`), CAN stream RX, CAN status reads, and DS scalar
-and joystick reads. Each
+`HAL_CAN_SendMessage`), CAN one-shot/stream RX, CAN status reads, and DS
+scalar and joystick/match/descriptor reads plus DS refresh/new-data
+events, outputs-enabled, user-program observers, plus the Notifier
+control-plane/wait and lifecycle slices. Each
 remaining surface is its own TDD cycle:
-- HAL_Initialize / HAL_Shutdown (initialize-once semantics).
-- HAL_GetMatchInfo / descriptor/all-joystick aggregate DS reads.
-- HAL_Notifier* (outbound buffer → `send_notifier_state`).
+- Remaining DS output surfaces (joystick outputs/rumble).
 
 Other shim concerns:
 - Shim-initiated `shutdown`.
 - On-demand request/reply.
-- Threading model.
+- Broader threading model beyond the synchronized Notifier wait path.
 
 Beyond the shim:
 - T1 wait/reset/named-discovery work.

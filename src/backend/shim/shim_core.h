@@ -14,10 +14,20 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
+
+extern "C" {
+/** Mirrors WPILib WPI_Handle from wpi/Synchronization.h. */
+typedef unsigned int WPI_Handle;
+
+/** Mirrors WPILib WPI_EventHandle from wpi/Synchronization.h. */
+typedef WPI_Handle WPI_EventHandle;
+}
 
 namespace robosim::backend::shim {
 
@@ -40,6 +50,16 @@ struct shim_error {
   bool operator==(const shim_error&) const = default;
 };
 
+/** Latest user-program observer state reported through the C HAL DS hooks. */
+enum class user_program_observer_state {
+  none,
+  starting,
+  disabled,
+  autonomous,
+  teleop,
+  test,
+};
+
 /**
  * In-process backend-side orchestrator for the HAL <-> Sim Core protocol.
  *
@@ -51,10 +71,9 @@ struct shim_error {
 class shim_core {
  public:
   /** Creates a shim and sends the initial boot descriptor envelope. */
-  [[nodiscard]] static std::expected<shim_core, shim_error> make(
-      tier1::tier1_endpoint endpoint,
-      const boot_descriptor& desc,
-      std::uint64_t sim_time_us);
+  [[nodiscard]] static std::expected<shim_core, shim_error> make(tier1::tier1_endpoint endpoint,
+                                                                 const boot_descriptor& desc,
+                                                                 std::uint64_t sim_time_us);
 
   /**
    * Installs the non-owning process-global shim pointer used by HAL_* exports.
@@ -71,17 +90,34 @@ class shim_core {
   [[nodiscard]] std::expected<void, shim_error> poll();
 
   /**
+   * Drains at most one inbound message for HAL_RefreshDSData.
+   *
+   * Returns true only when the accepted message was a Driver Station state
+   * packet. Other valid inbound messages are still dispatched but return false.
+   */
+  [[nodiscard]] bool refresh_ds_data();
+
+  /** Registers a WPI event handle for wakeup when DS data is accepted. */
+  void provide_new_data_event_handle(WPI_EventHandle handle);
+
+  /** Removes a previously registered WPI DS new-data event handle. */
+  void remove_new_data_event_handle(WPI_EventHandle handle);
+
+  /** Records the latest user-program observer state for host-side v0 use. */
+  void observe_user_program(user_program_observer_state state) noexcept;
+
+  /**
    * Publishes a CAN frame batch using active-prefix serialization.
    *
    * Fails with shutdown_already_observed after a shutdown envelope has arrived,
    * or send_failed when the Tier 1 outbound lane rejects the message.
    */
-  [[nodiscard]] std::expected<void, shim_error> send_can_frame_batch(
-      const can_frame_batch& batch, std::uint64_t sim_time_us);
+  [[nodiscard]] std::expected<void, shim_error> send_can_frame_batch(const can_frame_batch& batch,
+                                                                     std::uint64_t sim_time_us);
 
   /** Publishes notifier state using its active-prefix serialization. */
-  [[nodiscard]] std::expected<void, shim_error> send_notifier_state(
-      const notifier_state& state, std::uint64_t sim_time_us);
+  [[nodiscard]] std::expected<void, shim_error> send_notifier_state(const notifier_state& state,
+                                                                    std::uint64_t sim_time_us);
 
   /** Publishes a HAL_SendError batch using active-prefix serialization. */
   [[nodiscard]] std::expected<void, shim_error> send_error_message_batch(
@@ -94,27 +130,63 @@ class shim_core {
   void enqueue_can_frame(const can_frame& frame) noexcept;
 
   /** Publishes and clears pending HAL_SendError messages, if any. */
-  [[nodiscard]] std::expected<void, shim_error> flush_pending_errors(
-      std::uint64_t sim_time_us);
+  [[nodiscard]] std::expected<void, shim_error> flush_pending_errors(std::uint64_t sim_time_us);
 
   /** Publishes and clears pending CAN TX frames, if any. */
-  [[nodiscard]] std::expected<void, shim_error> flush_pending_can_frames(
-      std::uint64_t sim_time_us);
+  [[nodiscard]] std::expected<void, shim_error> flush_pending_can_frames(std::uint64_t sim_time_us);
 
   /** Opens a filtered CAN RX stream session. Returns 0 if no slot is available. */
-  [[nodiscard]] std::uint32_t open_can_stream_session(
-      std::uint32_t message_id,
-      std::uint32_t message_id_mask,
-      std::uint32_t max_messages);
+  [[nodiscard]] std::uint32_t open_can_stream_session(std::uint32_t message_id,
+                                                      std::uint32_t message_id_mask,
+                                                      std::uint32_t max_messages);
 
   /** Closes a CAN RX stream session handle if it is currently open. */
   void close_can_stream_session(std::uint32_t handle) noexcept;
 
   /** Reads and drains queued CAN RX stream frames into `messages`. */
-  [[nodiscard]] std::int32_t read_can_stream_session(
-      std::uint32_t handle,
-      std::span<can_frame> messages,
-      std::uint32_t& messages_read);
+  [[nodiscard]] std::int32_t read_can_stream_session(std::uint32_t handle,
+                                                     std::span<can_frame> messages,
+                                                     std::uint32_t& messages_read);
+
+  /** Allocates one HAL notifier handle, returning 0 when the table is full. */
+  [[nodiscard]] std::int32_t initialize_notifier() noexcept;
+
+  /** Updates the fixed-size name field for an active notifier handle. */
+  [[nodiscard]] std::int32_t set_notifier_name(std::int32_t handle, std::string_view name) noexcept;
+
+  /** Activates an alarm for an active notifier handle. */
+  [[nodiscard]] std::int32_t update_notifier_alarm(std::int32_t handle,
+                                                   std::uint64_t trigger_time_us) noexcept;
+
+  /** Cancels the alarm for an active notifier handle. */
+  [[nodiscard]] std::int32_t cancel_notifier_alarm(std::int32_t handle) noexcept;
+
+  /** Stops the notifier's alarm without freeing its handle. */
+  [[nodiscard]] std::int32_t stop_notifier(std::int32_t handle) noexcept;
+
+  /** Frees an active notifier handle; invalid handles are ignored. */
+  void clean_notifier(std::int32_t handle) noexcept;
+
+  /** Returns a compact active-prefix snapshot of the live notifier table. */
+  [[nodiscard]] notifier_state current_notifier_state() const noexcept;
+
+  /** Publishes the current notifier table snapshot, including empty tables. */
+  [[nodiscard]] std::expected<void, shim_error> flush_notifier_state(std::uint64_t sim_time_us);
+
+  /** Waits for a fired alarm, stop wake, or clean wake for an active notifier. */
+  [[nodiscard]] std::uint64_t wait_for_notifier_alarm(std::int32_t handle, std::int32_t& status);
+
+  /** Clears shutdown wake state when the host reinitializes this installed shim. */
+  void prepare_for_hal_initialize();
+
+  /** Wakes pending HAL waits during process HAL shutdown. */
+  void shutdown_hal_waits();
+
+  /** Returns the total number of registered pending notifier waits. */
+  [[nodiscard]] std::uint32_t pending_notifier_wait_count() const noexcept;
+
+  /** Returns the pending notifier wait count for one handle. */
+  [[nodiscard]] std::uint32_t pending_notifier_wait_count(std::int32_t handle) const noexcept;
 
   /** Returns the currently buffered HAL_SendError messages. */
   [[nodiscard]] std::span<const error_message> pending_error_messages() const noexcept;
@@ -142,6 +214,8 @@ class shim_core {
   [[nodiscard]] const std::optional<notifier_alarm_batch>& latest_notifier_alarm_batch() const;
   /** Latest cached error message batch, if one has been received. */
   [[nodiscard]] const std::optional<error_message_batch>& latest_error_message_batch() const;
+  /** Latest user-program observer state reported by robot code. */
+  [[nodiscard]] user_program_observer_state user_program_observer_state() const noexcept;
 
   shim_core(const shim_core&) = delete;
   shim_core& operator=(const shim_core&) = delete;
@@ -149,9 +223,26 @@ class shim_core {
   shim_core& operator=(shim_core&&) = default;
 
  private:
+  enum class inbound_dispatch_result {
+    no_message,
+    boot_ack,
+    clock_state,
+    power_state,
+    ds_state,
+    can_frame_batch,
+    can_status,
+    notifier_state,
+    notifier_alarm_batch,
+    error_message_batch,
+    shutdown,
+  };
+
   explicit shim_core(tier1::tier1_endpoint endpoint);
 
+  [[nodiscard]] std::expected<inbound_dispatch_result, shim_error> poll_one();
+  void wake_new_data_event_handles() const;
   void enqueue_can_rx_frame_for_streams(const can_frame& frame);
+  [[nodiscard]] std::int32_t find_notifier_slot(std::int32_t handle) const noexcept;
 
   tier1::tier1_endpoint endpoint_;
   bool connected_ = false;
@@ -168,6 +259,8 @@ class shim_core {
   std::uint32_t pending_error_count_ = 0;
   std::array<can_frame, kMaxCanFramesPerBatch> pending_can_frames_{};
   std::uint32_t pending_can_frame_count_ = 0;
+  enum user_program_observer_state user_program_observer_state_ =
+      static_cast<enum user_program_observer_state>(0);
 
   struct can_stream_session {
     bool active = false;
@@ -182,6 +275,22 @@ class shim_core {
   static constexpr std::uint32_t kMaxCanStreamSessions = 32;
   std::array<can_stream_session, kMaxCanStreamSessions> can_stream_sessions_{};
   std::uint32_t next_can_stream_handle_ = 1;
+  std::vector<WPI_EventHandle> new_data_event_handles_;
+
+  struct notifier_record {
+    bool active = false;
+    std::uint32_t allocation_order = 0;
+    bool stopped = false;
+    std::uint64_t stop_wake_count = 0;
+    notifier_slot slot{};
+  };
+
+  struct notifier_wait_state;
+
+  std::array<notifier_record, kMaxNotifiers> notifier_records_{};
+  std::int32_t next_notifier_handle_ = 1;
+  std::uint32_t next_notifier_allocation_order_ = 1;
+  std::shared_ptr<notifier_wait_state> notifier_wait_state_;
 };
 
 }  // namespace robosim::backend::shim

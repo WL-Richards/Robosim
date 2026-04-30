@@ -3,9 +3,15 @@
 #include "hal_c.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <span>
 #include <utility>
+
+extern "C" void WPI_SetEvent(WPI_EventHandle handle) __attribute__((weak));
 
 namespace robosim::backend::shim {
 namespace {
@@ -28,19 +34,26 @@ namespace {
 
 }  // namespace
 
-shim_core::shim_core(tier1::tier1_endpoint endpoint) : endpoint_(std::move(endpoint)) {}
+struct shim_core::notifier_wait_state {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<notifier_alarm_event> pending_alarm_events;
+  std::uint32_t total_waiters = 0;
+  std::map<std::int32_t, std::uint32_t> waiters_by_handle;
+  bool shutdown_wake = false;
+};
 
-std::expected<shim_core, shim_error> shim_core::make(
-    tier1::tier1_endpoint endpoint,
-    const boot_descriptor& desc,
-    std::uint64_t sim_time_us) {
+shim_core::shim_core(tier1::tier1_endpoint endpoint)
+    : endpoint_(std::move(endpoint)),
+      notifier_wait_state_(std::make_shared<notifier_wait_state>()) {}
+
+std::expected<shim_core, shim_error> shim_core::make(tier1::tier1_endpoint endpoint,
+                                                     const boot_descriptor& desc,
+                                                     std::uint64_t sim_time_us) {
   const auto* desc_bytes = reinterpret_cast<const std::uint8_t*>(&desc);
   std::span<const std::uint8_t> payload{desc_bytes, sizeof(boot_descriptor)};
 
-  auto sent = endpoint.send(envelope_kind::boot,
-                            schema_id::boot_descriptor,
-                            payload,
-                            sim_time_us);
+  auto sent = endpoint.send(envelope_kind::boot, schema_id::boot_descriptor, payload, sim_time_us);
   if (!sent.has_value()) {
     return std::unexpected(wrap_send_error(std::move(sent.error())));
   }
@@ -48,6 +61,19 @@ std::expected<shim_core, shim_error> shim_core::make(
 }
 
 std::expected<void, shim_error> shim_core::poll() {
+  auto result = poll_one();
+  if (!result.has_value()) {
+    return std::unexpected(std::move(result.error()));
+  }
+  return {};
+}
+
+bool shim_core::refresh_ds_data() {
+  auto result = poll_one();
+  return result.has_value() && *result == inbound_dispatch_result::ds_state;
+}
+
+std::expected<shim_core::inbound_dispatch_result, shim_error> shim_core::poll_one() {
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -58,7 +84,7 @@ std::expected<void, shim_error> shim_core::poll() {
   auto received = endpoint_.try_receive();
   if (!received.has_value()) {
     if (received.error().kind == tier1::tier1_transport_error_kind::no_message) {
-      return {};
+      return inbound_dispatch_result::no_message;
     }
     return std::unexpected(wrap_receive_error(std::move(received.error())));
   }
@@ -68,26 +94,27 @@ std::expected<void, shim_error> shim_core::poll() {
   switch (env.kind) {
     case envelope_kind::boot_ack:
       connected_ = true;
-      return {};
+      return inbound_dispatch_result::boot_ack;
 
     case envelope_kind::tick_boundary:
       if (env.payload_schema == schema_id::clock_state) {
         clock_state state{};
         std::memcpy(&state, received->payload.data(), sizeof(clock_state));
         latest_clock_state_ = state;
-        return {};
+        return inbound_dispatch_result::clock_state;
       }
       if (env.payload_schema == schema_id::power_state) {
         power_state state{};
         std::memcpy(&state, received->payload.data(), sizeof(power_state));
         latest_power_state_ = state;
-        return {};
+        return inbound_dispatch_result::power_state;
       }
       if (env.payload_schema == schema_id::ds_state) {
         ds_state state{};
         std::memcpy(&state, received->payload.data(), sizeof(ds_state));
         latest_ds_state_ = state;
-        return {};
+        wake_new_data_event_handles();
+        return inbound_dispatch_result::ds_state;
       }
       if (env.payload_schema == schema_id::can_frame_batch) {
         // Variable-size schema: copy received->payload.size() bytes (the
@@ -100,13 +127,13 @@ std::expected<void, shim_error> shim_core::poll() {
         for (std::uint32_t i = 0; i < state.count; ++i) {
           enqueue_can_rx_frame_for_streams(state.frames[i]);
         }
-        return {};
+        return inbound_dispatch_result::can_frame_batch;
       }
       if (env.payload_schema == schema_id::can_status) {
         can_status state{};
         std::memcpy(&state, received->payload.data(), sizeof(can_status));
         latest_can_status_ = state;
-        return {};
+        return inbound_dispatch_result::can_status;
       }
       if (env.payload_schema == schema_id::notifier_state) {
         // Variable-size: copy received->payload.size() bytes (active prefix),
@@ -116,7 +143,7 @@ std::expected<void, shim_error> shim_core::poll() {
         notifier_state state{};
         std::memcpy(&state, received->payload.data(), received->payload.size());
         latest_notifier_state_ = state;
-        return {};
+        return inbound_dispatch_result::notifier_state;
       }
       if (env.payload_schema == schema_id::notifier_alarm_batch) {
         // Variable-size: copy received->payload.size() bytes (active prefix),
@@ -127,7 +154,14 @@ std::expected<void, shim_error> shim_core::poll() {
         notifier_alarm_batch state{};
         std::memcpy(&state, received->payload.data(), received->payload.size());
         latest_notifier_alarm_batch_ = state;
-        return {};
+        {
+          std::lock_guard lock{notifier_wait_state_->mutex};
+          for (std::uint32_t i = 0; i < state.count; ++i) {
+            notifier_wait_state_->pending_alarm_events.push_back(state.events[i]);
+          }
+        }
+        notifier_wait_state_->cv.notify_all();
+        return inbound_dispatch_result::notifier_alarm_batch;
       }
       if (env.payload_schema == schema_id::error_message_batch) {
         // Variable-size: copy received->payload.size() bytes (active prefix).
@@ -140,21 +174,22 @@ std::expected<void, shim_error> shim_core::poll() {
         error_message_batch state{};
         std::memcpy(&state, received->payload.data(), received->payload.size());
         latest_error_message_batch_ = state;
-        return {};
+        return inbound_dispatch_result::error_message_batch;
       }
       // D-C8-DEAD-BRANCH: at cycle 8 every per-tick payload schema is wired,
       // so this fall-through is unreachable from valid traffic. Kept as a
       // defensive forward-compat structural guard — a future schema added
       // to protocol_version.h and the validator's allowed set but not yet
       // wired here will fail loudly rather than silently discarded.
-      return std::unexpected(shim_error{shim_error_kind::unsupported_payload_schema,
-                                        std::nullopt,
-                                        "payload_schema",
-                                        "shim does not yet handle this schema under tick_boundary"});
+      return std::unexpected(
+          shim_error{shim_error_kind::unsupported_payload_schema,
+                     std::nullopt,
+                     "payload_schema",
+                     "shim does not yet handle this schema under tick_boundary"});
 
     case envelope_kind::shutdown:
       shutdown_observed_ = true;
-      return {};
+      return inbound_dispatch_result::shutdown;
 
     default:
       return std::unexpected(shim_error{shim_error_kind::unsupported_envelope_kind,
@@ -164,8 +199,8 @@ std::expected<void, shim_error> shim_core::poll() {
   }
 }
 
-std::expected<void, shim_error> shim_core::send_can_frame_batch(
-    const can_frame_batch& batch, std::uint64_t sim_time_us) {
+std::expected<void, shim_error> shim_core::send_can_frame_batch(const can_frame_batch& batch,
+                                                                std::uint64_t sim_time_us) {
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -182,8 +217,38 @@ std::expected<void, shim_error> shim_core::send_can_frame_batch(
   return {};
 }
 
-std::expected<void, shim_error> shim_core::send_notifier_state(
-    const notifier_state& state, std::uint64_t sim_time_us) {
+void shim_core::provide_new_data_event_handle(WPI_EventHandle handle) {
+  if (handle == 0) {
+    return;
+  }
+  if (std::ranges::find(new_data_event_handles_, handle) != new_data_event_handles_.end()) {
+    return;
+  }
+  new_data_event_handles_.push_back(handle);
+}
+
+void shim_core::remove_new_data_event_handle(WPI_EventHandle handle) {
+  if (handle == 0) {
+    return;
+  }
+  std::erase(new_data_event_handles_, handle);
+}
+
+void shim_core::observe_user_program(enum user_program_observer_state state) noexcept {
+  user_program_observer_state_ = state;
+}
+
+void shim_core::wake_new_data_event_handles() const {
+  if (WPI_SetEvent == nullptr) {
+    return;
+  }
+  for (const WPI_EventHandle handle : new_data_event_handles_) {
+    WPI_SetEvent(handle);
+  }
+}
+
+std::expected<void, shim_error> shim_core::send_notifier_state(const notifier_state& state,
+                                                               std::uint64_t sim_time_us) {
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -234,8 +299,7 @@ void shim_core::enqueue_can_frame(const can_frame& frame) noexcept {
   ++pending_can_frame_count_;
 }
 
-std::expected<void, shim_error> shim_core::flush_pending_errors(
-    std::uint64_t sim_time_us) {
+std::expected<void, shim_error> shim_core::flush_pending_errors(std::uint64_t sim_time_us) {
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -248,9 +312,7 @@ std::expected<void, shim_error> shim_core::flush_pending_errors(
 
   error_message_batch batch{};
   batch.count = pending_error_count_;
-  std::copy_n(pending_error_messages_.begin(),
-              pending_error_count_,
-              batch.messages.begin());
+  std::copy_n(pending_error_messages_.begin(), pending_error_count_, batch.messages.begin());
 
   auto sent = send_error_message_batch(batch, sim_time_us);
   if (!sent.has_value()) {
@@ -264,8 +326,7 @@ std::span<const error_message> shim_core::pending_error_messages() const noexcep
   return {pending_error_messages_.data(), pending_error_count_};
 }
 
-std::expected<void, shim_error> shim_core::flush_pending_can_frames(
-    std::uint64_t sim_time_us) {
+std::expected<void, shim_error> shim_core::flush_pending_can_frames(std::uint64_t sim_time_us) {
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -278,9 +339,7 @@ std::expected<void, shim_error> shim_core::flush_pending_can_frames(
 
   can_frame_batch batch{};
   batch.count = pending_can_frame_count_;
-  std::copy_n(pending_can_frames_.begin(),
-              pending_can_frame_count_,
-              batch.frames.begin());
+  std::copy_n(pending_can_frames_.begin(), pending_can_frame_count_, batch.frames.begin());
   const auto timestamp_us = static_cast<std::uint32_t>(sim_time_us);
   for (std::uint32_t i = 0; i < pending_can_frame_count_; ++i) {
     batch.frames[i].timestamp_us = timestamp_us;
@@ -298,13 +357,11 @@ std::span<const can_frame> shim_core::pending_can_frames() const noexcept {
   return {pending_can_frames_.data(), pending_can_frame_count_};
 }
 
-std::uint32_t shim_core::open_can_stream_session(
-    std::uint32_t message_id,
-    std::uint32_t message_id_mask,
-    std::uint32_t max_messages) {
-  auto slot = std::ranges::find_if(can_stream_sessions_, [](const auto& session) {
-    return !session.active;
-  });
+std::uint32_t shim_core::open_can_stream_session(std::uint32_t message_id,
+                                                 std::uint32_t message_id_mask,
+                                                 std::uint32_t max_messages) {
+  auto slot = std::ranges::find_if(can_stream_sessions_,
+                                   [](const auto& session) { return !session.active; });
   if (slot == can_stream_sessions_.end()) {
     return 0;
   }
@@ -339,10 +396,9 @@ void shim_core::close_can_stream_session(std::uint32_t handle) noexcept {
   slot->queued_frames.clear();
 }
 
-std::int32_t shim_core::read_can_stream_session(
-    std::uint32_t handle,
-    std::span<can_frame> messages,
-    std::uint32_t& messages_read) {
+std::int32_t shim_core::read_can_stream_session(std::uint32_t handle,
+                                                std::span<can_frame> messages,
+                                                std::uint32_t& messages_read) {
   messages_read = 0;
   auto slot = std::ranges::find_if(can_stream_sessions_, [handle](const auto& session) {
     return session.active && session.handle == handle;
@@ -361,8 +417,7 @@ std::int32_t shim_core::read_can_stream_session(
   const auto count = std::min<std::size_t>(messages.size(), slot->queued_frames.size());
   std::copy_n(slot->queued_frames.begin(), count, messages.begin());
   slot->queued_frames.erase(slot->queued_frames.begin(),
-                            slot->queued_frames.begin() +
-                                static_cast<std::ptrdiff_t>(count));
+                            slot->queued_frames.begin() + static_cast<std::ptrdiff_t>(count));
   messages_read = static_cast<std::uint32_t>(count);
 
   if (slot->overrun) {
@@ -387,6 +442,239 @@ void shim_core::enqueue_can_rx_frame_for_streams(const can_frame& frame) {
     }
     session.queued_frames.push_back(frame);
   }
+}
+
+std::int32_t shim_core::find_notifier_slot(std::int32_t handle) const noexcept {
+  if (handle == 0) {
+    return -1;
+  }
+  for (std::size_t i = 0; i < notifier_records_.size(); ++i) {
+    if (notifier_records_[i].active && notifier_records_[i].slot.handle == handle) {
+      return static_cast<std::int32_t>(i);
+    }
+  }
+  return -1;
+}
+
+std::int32_t shim_core::initialize_notifier() noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  auto slot =
+      std::ranges::find_if(notifier_records_, [](const auto& record) { return !record.active; });
+  if (slot == notifier_records_.end()) {
+    return 0;
+  }
+
+  std::int32_t handle = next_notifier_handle_++;
+  if (handle == 0) {
+    handle = next_notifier_handle_++;
+  }
+
+  slot->active = true;
+  slot->allocation_order = next_notifier_allocation_order_++;
+  slot->stopped = false;
+  slot->stop_wake_count = 0;
+  slot->slot = notifier_slot{};
+  slot->slot.handle = handle;
+  return handle;
+}
+
+std::int32_t shim_core::set_notifier_name(std::int32_t handle, std::string_view name) noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  const std::int32_t index = find_notifier_slot(handle);
+  if (index < 0) {
+    return kHalHandleError;
+  }
+
+  auto& out = notifier_records_[static_cast<std::size_t>(index)].slot.name;
+  out.fill('\0');
+  const std::size_t bytes_to_copy = std::min(name.size(), out.size() - std::size_t{1});
+  if (bytes_to_copy > 0) {
+    std::memcpy(out.data(), name.data(), bytes_to_copy);
+  }
+  return kHalSuccess;
+}
+
+std::int32_t shim_core::update_notifier_alarm(std::int32_t handle,
+                                              std::uint64_t trigger_time_us) noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  const std::int32_t index = find_notifier_slot(handle);
+  if (index < 0) {
+    return kHalHandleError;
+  }
+
+  auto& slot = notifier_records_[static_cast<std::size_t>(index)].slot;
+  slot.trigger_time_us = trigger_time_us;
+  slot.alarm_active = 1;
+  slot.canceled = 0;
+  notifier_records_[static_cast<std::size_t>(index)].stopped = false;
+  return kHalSuccess;
+}
+
+std::int32_t shim_core::cancel_notifier_alarm(std::int32_t handle) noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  const std::int32_t index = find_notifier_slot(handle);
+  if (index < 0) {
+    return kHalHandleError;
+  }
+
+  auto& slot = notifier_records_[static_cast<std::size_t>(index)].slot;
+  slot.trigger_time_us = 0;
+  slot.alarm_active = 0;
+  slot.canceled = 1;
+  notifier_records_[static_cast<std::size_t>(index)].stopped = false;
+  return kHalSuccess;
+}
+
+std::int32_t shim_core::stop_notifier(std::int32_t handle) noexcept {
+  {
+    std::lock_guard lock{notifier_wait_state_->mutex};
+    const std::int32_t index = find_notifier_slot(handle);
+    if (index < 0) {
+      return kHalHandleError;
+    }
+
+    auto& record = notifier_records_[static_cast<std::size_t>(index)];
+    record.slot.trigger_time_us = 0;
+    record.slot.alarm_active = 0;
+    record.slot.canceled = 1;
+    record.stopped = true;
+    ++record.stop_wake_count;
+    std::erase_if(notifier_wait_state_->pending_alarm_events,
+                  [handle](const notifier_alarm_event& event) { return event.handle == handle; });
+  }
+  notifier_wait_state_->cv.notify_all();
+  return kHalSuccess;
+}
+
+void shim_core::clean_notifier(std::int32_t handle) noexcept {
+  {
+    std::lock_guard lock{notifier_wait_state_->mutex};
+    const std::int32_t index = find_notifier_slot(handle);
+    if (index < 0) {
+      return;
+    }
+    std::erase_if(notifier_wait_state_->pending_alarm_events,
+                  [handle](const notifier_alarm_event& event) { return event.handle == handle; });
+    notifier_records_[static_cast<std::size_t>(index)] = notifier_record{};
+  }
+  notifier_wait_state_->cv.notify_all();
+}
+
+notifier_state shim_core::current_notifier_state() const noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  notifier_state state{};
+  std::array<const notifier_record*, kMaxNotifiers> active{};
+  std::size_t active_count = 0;
+  for (const auto& record : notifier_records_) {
+    if (record.active) {
+      active[active_count] = &record;
+      ++active_count;
+    }
+  }
+  std::sort(active.begin(),
+            active.begin() + static_cast<std::ptrdiff_t>(active_count),
+            [](const notifier_record* lhs, const notifier_record* rhs) {
+              return lhs->allocation_order < rhs->allocation_order;
+            });
+
+  state.count = static_cast<std::uint32_t>(active_count);
+  for (std::size_t i = 0; i < active_count; ++i) {
+    state.slots[i] = active[i]->slot;
+  }
+  return state;
+}
+
+std::expected<void, shim_error> shim_core::flush_notifier_state(std::uint64_t sim_time_us) {
+  return send_notifier_state(current_notifier_state(), sim_time_us);
+}
+
+std::uint64_t shim_core::wait_for_notifier_alarm(std::int32_t handle, std::int32_t& status) {
+  std::unique_lock lock{notifier_wait_state_->mutex};
+
+  const auto remove_first_matching_event = [this, handle]() -> std::optional<std::uint64_t> {
+    auto found = std::ranges::find_if(
+        notifier_wait_state_->pending_alarm_events,
+        [handle](const notifier_alarm_event& event) { return event.handle == handle; });
+    if (found == notifier_wait_state_->pending_alarm_events.end()) {
+      return std::nullopt;
+    }
+    const std::uint64_t fired_at_us = found->fired_at_us;
+    notifier_wait_state_->pending_alarm_events.erase(found);
+    return fired_at_us;
+  };
+
+  const std::int32_t initial_index = find_notifier_slot(handle);
+  if (initial_index < 0 || notifier_wait_state_->shutdown_wake) {
+    status = kHalHandleError;
+    return 0;
+  }
+
+  ++notifier_wait_state_->total_waiters;
+  ++notifier_wait_state_->waiters_by_handle[handle];
+  const auto unregister_waiter = [this, handle]() {
+    --notifier_wait_state_->total_waiters;
+    auto waiter_count = notifier_wait_state_->waiters_by_handle.find(handle);
+    if (waiter_count != notifier_wait_state_->waiters_by_handle.end()) {
+      --waiter_count->second;
+      if (waiter_count->second == 0) {
+        notifier_wait_state_->waiters_by_handle.erase(waiter_count);
+      }
+    }
+  };
+
+  while (true) {
+    const std::int32_t index = find_notifier_slot(handle);
+    if (index < 0) {
+      unregister_waiter();
+      status = kHalHandleError;
+      return 0;
+    }
+
+    if (notifier_wait_state_->shutdown_wake) {
+      unregister_waiter();
+      status = kHalHandleError;
+      return 0;
+    }
+
+    const auto& record = notifier_records_[static_cast<std::size_t>(index)];
+    if (record.stopped) {
+      unregister_waiter();
+      status = kHalSuccess;
+      return 0;
+    }
+
+    if (auto fired_at_us = remove_first_matching_event(); fired_at_us.has_value()) {
+      unregister_waiter();
+      status = kHalSuccess;
+      return *fired_at_us;
+    }
+
+    notifier_wait_state_->cv.wait(lock);
+  }
+}
+
+void shim_core::prepare_for_hal_initialize() {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  notifier_wait_state_->shutdown_wake = false;
+}
+
+void shim_core::shutdown_hal_waits() {
+  {
+    std::lock_guard lock{notifier_wait_state_->mutex};
+    notifier_wait_state_->shutdown_wake = true;
+  }
+  notifier_wait_state_->cv.notify_all();
+}
+
+std::uint32_t shim_core::pending_notifier_wait_count() const noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  return notifier_wait_state_->total_waiters;
+}
+
+std::uint32_t shim_core::pending_notifier_wait_count(std::int32_t handle) const noexcept {
+  std::lock_guard lock{notifier_wait_state_->mutex};
+  const auto found = notifier_wait_state_->waiters_by_handle.find(handle);
+  return found == notifier_wait_state_->waiters_by_handle.end() ? 0u : found->second;
 }
 
 bool shim_core::is_connected() const {
@@ -427,6 +715,10 @@ const std::optional<notifier_alarm_batch>& shim_core::latest_notifier_alarm_batc
 
 const std::optional<error_message_batch>& shim_core::latest_error_message_batch() const {
   return latest_error_message_batch_;
+}
+
+user_program_observer_state shim_core::user_program_observer_state() const noexcept {
+  return user_program_observer_state_;
 }
 
 }  // namespace robosim::backend::shim

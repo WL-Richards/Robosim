@@ -6,8 +6,9 @@
 #include "shim_core.h"
 #include "truncate.h"
 
-#include <cstring>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -18,34 +19,63 @@ static_assert(offsetof(HAL_CANStreamMessage, messageID) ==
               offsetof(robosim::backend::can_frame, message_id));
 static_assert(offsetof(HAL_CANStreamMessage, timeStamp) ==
               offsetof(robosim::backend::can_frame, timestamp_us));
-static_assert(offsetof(HAL_CANStreamMessage, data) ==
-              offsetof(robosim::backend::can_frame, data));
+static_assert(offsetof(HAL_CANStreamMessage, data) == offsetof(robosim::backend::can_frame, data));
 static_assert(offsetof(HAL_CANStreamMessage, dataSize) ==
               offsetof(robosim::backend::can_frame, data_size));
 static_assert(sizeof(HAL_ControlWord) == sizeof(robosim::backend::control_word));
 static_assert(alignof(HAL_ControlWord) == alignof(robosim::backend::control_word));
 static_assert(sizeof(HAL_AllianceStationID) == sizeof(robosim::backend::alliance_station));
 static_assert(alignof(HAL_AllianceStationID) == alignof(robosim::backend::alliance_station));
+static_assert(sizeof(HAL_MatchType) == sizeof(robosim::backend::match_type));
+static_assert(alignof(HAL_MatchType) == alignof(robosim::backend::match_type));
 static_assert(sizeof(HAL_JoystickAxes) == sizeof(robosim::backend::joystick_axes));
 static_assert(alignof(HAL_JoystickAxes) == alignof(robosim::backend::joystick_axes));
 static_assert(offsetof(HAL_JoystickAxes, count) ==
               offsetof(robosim::backend::joystick_axes, count));
-static_assert(offsetof(HAL_JoystickAxes, axes) ==
-              offsetof(robosim::backend::joystick_axes, axes));
-static_assert(offsetof(HAL_JoystickAxes, raw) ==
-              offsetof(robosim::backend::joystick_axes, raw));
+static_assert(offsetof(HAL_JoystickAxes, axes) == offsetof(robosim::backend::joystick_axes, axes));
+static_assert(offsetof(HAL_JoystickAxes, raw) == offsetof(robosim::backend::joystick_axes, raw));
 static_assert(sizeof(HAL_JoystickPOVs) == sizeof(robosim::backend::joystick_povs));
 static_assert(alignof(HAL_JoystickPOVs) == alignof(robosim::backend::joystick_povs));
 static_assert(offsetof(HAL_JoystickPOVs, count) ==
               offsetof(robosim::backend::joystick_povs, count));
-static_assert(offsetof(HAL_JoystickPOVs, povs) ==
-              offsetof(robosim::backend::joystick_povs, povs));
+static_assert(offsetof(HAL_JoystickPOVs, povs) == offsetof(robosim::backend::joystick_povs, povs));
 static_assert(sizeof(HAL_JoystickButtons) == sizeof(robosim::backend::joystick_buttons));
 static_assert(alignof(HAL_JoystickButtons) == alignof(robosim::backend::joystick_buttons));
 static_assert(offsetof(HAL_JoystickButtons, buttons) ==
               offsetof(robosim::backend::joystick_buttons, buttons));
 static_assert(offsetof(HAL_JoystickButtons, count) ==
               offsetof(robosim::backend::joystick_buttons, count));
+static_assert(sizeof(HAL_JoystickDescriptor) == sizeof(robosim::backend::joystick_descriptor));
+static_assert(alignof(HAL_JoystickDescriptor) == alignof(robosim::backend::joystick_descriptor));
+static_assert(offsetof(HAL_JoystickDescriptor, isXbox) ==
+              offsetof(robosim::backend::joystick_descriptor, is_xbox));
+static_assert(offsetof(HAL_JoystickDescriptor, type) ==
+              offsetof(robosim::backend::joystick_descriptor, type));
+static_assert(offsetof(HAL_JoystickDescriptor, name) ==
+              offsetof(robosim::backend::joystick_descriptor, name));
+static_assert(offsetof(HAL_JoystickDescriptor, axisCount) ==
+              offsetof(robosim::backend::joystick_descriptor, axis_count));
+static_assert(offsetof(HAL_JoystickDescriptor, axisTypes) ==
+              offsetof(robosim::backend::joystick_descriptor, axis_types));
+static_assert(offsetof(HAL_JoystickDescriptor, buttonCount) ==
+              offsetof(robosim::backend::joystick_descriptor, button_count));
+static_assert(offsetof(HAL_JoystickDescriptor, povCount) ==
+              offsetof(robosim::backend::joystick_descriptor, pov_count));
+static_assert(sizeof(HAL_MatchInfo) == sizeof(robosim::backend::match_info));
+static_assert(alignof(HAL_MatchInfo) == alignof(robosim::backend::match_info));
+static_assert(offsetof(HAL_MatchInfo, eventName) ==
+              offsetof(robosim::backend::match_info, event_name));
+static_assert(offsetof(HAL_MatchInfo, matchType) == offsetof(robosim::backend::match_info, type));
+static_assert(offsetof(HAL_MatchInfo, matchNumber) ==
+              offsetof(robosim::backend::match_info, match_number));
+static_assert(offsetof(HAL_MatchInfo, replayNumber) ==
+              offsetof(robosim::backend::match_info, replay_number));
+static_assert(offsetof(HAL_MatchInfo, gameSpecificMessage) ==
+              offsetof(robosim::backend::match_info, game_specific_message));
+static_assert(offsetof(HAL_MatchInfo, gameSpecificMessageSize) ==
+              offsetof(robosim::backend::match_info, game_specific_message_size));
+static_assert(offsetof(WPI_String, str) == 0);
+static_assert(offsetof(WPI_String, len) == sizeof(const char*));
 
 namespace robosim::backend::shim {
 namespace {
@@ -65,8 +95,7 @@ shim_core* g_installed_shim_ = nullptr;
 // reader wrappers (HAL_GetBrownedOut + HAL_GetSystemActive +
 // HAL_GetSystemTimeValid + HAL_GetFPGAButton + HAL_GetRSLState)
 // inherit them for free without per-function code repetition.
-HAL_Bool clock_state_hal_bool_read(std::int32_t* status,
-                                   hal_bool clock_state::* field) {
+HAL_Bool clock_state_hal_bool_read(std::int32_t* status, hal_bool clock_state::*field) {
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
     *status = kHalHandleError;
@@ -88,15 +117,69 @@ bool valid_joystick_index(std::int32_t joystick_num) noexcept {
   return joystick_num >= 0 && joystick_num < static_cast<std::int32_t>(kMaxJoysticks);
 }
 
+bool valid_joystick_axis_index(std::int32_t axis) noexcept {
+  return axis >= 0 && axis < static_cast<std::int32_t>(kJoystickAxisTypesLen);
+}
+
 template <typename HalT>
 void zero_hal_struct(HalT* out) {
   std::memset(out, 0, sizeof(HalT));
+}
+
+template <typename HalT>
+void zero_hal_array(HalT* out, std::size_t count) {
+  std::memset(out, 0, sizeof(HalT) * count);
 }
 
 template <typename HalT, typename BackendT>
 void copy_hal_struct(HalT* out, const BackendT& in) {
   static_assert(sizeof(HalT) == sizeof(BackendT));
   std::memcpy(out, &in, sizeof(HalT));
+}
+
+const ds_state* latest_ds_state_or_null() {
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return nullptr;
+  }
+  const auto& cached = shim->latest_ds_state();
+  if (!cached.has_value()) {
+    return nullptr;
+  }
+  return &*cached;
+}
+
+const joystick_descriptor* descriptor_or_null(std::int32_t joystick_num) {
+  const ds_state* state = latest_ds_state_or_null();
+  if (state == nullptr || !valid_joystick_index(joystick_num)) {
+    return nullptr;
+  }
+  return &state->joystick_descriptors[static_cast<std::size_t>(joystick_num)];
+}
+
+std::size_t fixed_name_length(const std::array<char, kJoystickNameLen>& name) noexcept {
+  for (std::size_t i = 0; i < name.size(); ++i) {
+    if (name[i] == '\0') {
+      return i;
+    }
+  }
+  return name.size();
+}
+
+void assign_wpi_string(WPI_String* out, std::span<const char> bytes) {
+  out->str = nullptr;
+  out->len = 0;
+  if (bytes.empty()) {
+    return;
+  }
+
+  void* allocation = std::malloc(bytes.size());
+  if (allocation == nullptr) {
+    return;
+  }
+  std::memcpy(allocation, bytes.data(), bytes.size());
+  out->str = static_cast<const char*>(allocation);
+  out->len = bytes.size();
 }
 
 }  // namespace
@@ -124,10 +207,35 @@ using robosim::backend::shim::clock_state_hal_bool_read;
 
 extern "C" {
 
-std::uint64_t HAL_GetFPGATime(std::int32_t* status) {
+HAL_Bool HAL_Initialize(std::int32_t timeout, std::int32_t mode) {
   using robosim::backend::shim::shim_core;
+
+  (void)timeout;
+  (void)mode;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return 0;
+  }
+  shim->prepare_for_hal_initialize();
+  return 1;
+}
+
+void HAL_Shutdown(void) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->shutdown_hal_waits();
+  shim_core::install_global(nullptr);
+}
+
+std::uint64_t HAL_GetFPGATime(std::int32_t* status) {
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -143,9 +251,9 @@ std::uint64_t HAL_GetFPGATime(std::int32_t* status) {
 }
 
 double HAL_GetVinVoltage(std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -162,9 +270,9 @@ double HAL_GetVinVoltage(std::int32_t* status) {
 }
 
 double HAL_GetVinCurrent(std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -181,9 +289,9 @@ double HAL_GetVinCurrent(std::int32_t* status) {
 }
 
 double HAL_GetBrownoutVoltage(std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -220,9 +328,9 @@ HAL_Bool HAL_GetRSLState(std::int32_t* status) {
 }
 
 std::int32_t HAL_GetCommsDisableCount(std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -243,17 +351,17 @@ std::int32_t HAL_GetCommsDisableCount(std::int32_t* status) {
 std::int32_t HAL_GetControlWord(HAL_ControlWord* controlWord) {
   using robosim::backend::kControlAutonomous;
   using robosim::backend::kControlDsAttached;
-  using robosim::backend::kControlEStop;
   using robosim::backend::kControlEnabled;
+  using robosim::backend::kControlEStop;
   using robosim::backend::kControlFmsAttached;
   using robosim::backend::kControlTest;
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
-  constexpr std::uint32_t kNamedControlBits =
-      kControlEnabled | kControlAutonomous | kControlTest | kControlEStop |
-      kControlFmsAttached | kControlDsAttached;
+  constexpr std::uint32_t kNamedControlBits = kControlEnabled | kControlAutonomous | kControlTest |
+                                              kControlEStop | kControlFmsAttached |
+                                              kControlDsAttached;
   std::uint32_t out_bits = 0;
 
   shim_core* shim = shim_core::current();
@@ -272,9 +380,9 @@ std::int32_t HAL_GetControlWord(HAL_ControlWord* controlWord) {
 
 HAL_AllianceStationID HAL_GetAllianceStation(std::int32_t* status) {
   using robosim::backend::alliance_station;
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -287,14 +395,13 @@ HAL_AllianceStationID HAL_GetAllianceStation(std::int32_t* status) {
   if (!cached.has_value()) {
     return HAL_AllianceStationID_kUnknown;
   }
-  return static_cast<HAL_AllianceStationID>(
-      static_cast<std::int32_t>(cached->station));
+  return static_cast<HAL_AllianceStationID>(static_cast<std::int32_t>(cached->station));
 }
 
 double HAL_GetMatchTime(std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -310,14 +417,13 @@ double HAL_GetMatchTime(std::int32_t* status) {
   return cached->match_time_seconds;
 }
 
-std::int32_t HAL_GetJoystickAxes(std::int32_t joystickNum,
-                                 HAL_JoystickAxes* axes) {
+std::int32_t HAL_GetJoystickAxes(std::int32_t joystickNum, HAL_JoystickAxes* axes) {
   using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
   using robosim::backend::shim::shim_core;
   using robosim::backend::shim::valid_joystick_index;
   using robosim::backend::shim::zero_hal_struct;
-  using robosim::backend::shim::kHalHandleError;
-  using robosim::backend::shim::kHalSuccess;
 
   zero_hal_struct(axes);
   shim_core* shim = shim_core::current();
@@ -334,14 +440,13 @@ std::int32_t HAL_GetJoystickAxes(std::int32_t joystickNum,
   return kHalSuccess;
 }
 
-std::int32_t HAL_GetJoystickPOVs(std::int32_t joystickNum,
-                                 HAL_JoystickPOVs* povs) {
+std::int32_t HAL_GetJoystickPOVs(std::int32_t joystickNum, HAL_JoystickPOVs* povs) {
   using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
   using robosim::backend::shim::shim_core;
   using robosim::backend::shim::valid_joystick_index;
   using robosim::backend::shim::zero_hal_struct;
-  using robosim::backend::shim::kHalHandleError;
-  using robosim::backend::shim::kHalSuccess;
 
   zero_hal_struct(povs);
   shim_core* shim = shim_core::current();
@@ -358,14 +463,13 @@ std::int32_t HAL_GetJoystickPOVs(std::int32_t joystickNum,
   return kHalSuccess;
 }
 
-std::int32_t HAL_GetJoystickButtons(std::int32_t joystickNum,
-                                    HAL_JoystickButtons* buttons) {
+std::int32_t HAL_GetJoystickButtons(std::int32_t joystickNum, HAL_JoystickButtons* buttons) {
   using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
   using robosim::backend::shim::shim_core;
   using robosim::backend::shim::valid_joystick_index;
   using robosim::backend::shim::zero_hal_struct;
-  using robosim::backend::shim::kHalHandleError;
-  using robosim::backend::shim::kHalSuccess;
 
   zero_hal_struct(buttons);
   shim_core* shim = shim_core::current();
@@ -382,6 +486,224 @@ std::int32_t HAL_GetJoystickButtons(std::int32_t joystickNum,
   return kHalSuccess;
 }
 
+void HAL_GetAllJoystickData(HAL_JoystickAxes* axes,
+                            HAL_JoystickPOVs* povs,
+                            HAL_JoystickButtons* buttons) {
+  using robosim::backend::kMaxJoysticks;
+  using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::zero_hal_array;
+
+  zero_hal_array(axes, kMaxJoysticks);
+  zero_hal_array(povs, kMaxJoysticks);
+  zero_hal_array(buttons, kMaxJoysticks);
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+
+  const auto& cached = shim->latest_ds_state();
+  if (!cached.has_value()) {
+    return;
+  }
+
+  for (std::size_t i = 0; i < kMaxJoysticks; ++i) {
+    copy_hal_struct(&axes[i], cached->joystick_axes_[i]);
+    copy_hal_struct(&povs[i], cached->joystick_povs_[i]);
+    copy_hal_struct(&buttons[i], cached->joystick_buttons_[i]);
+  }
+}
+
+std::int32_t HAL_GetJoystickDescriptor(std::int32_t joystickNum, HAL_JoystickDescriptor* desc) {
+  using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::valid_joystick_index;
+  using robosim::backend::shim::zero_hal_struct;
+
+  zero_hal_struct(desc);
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return kHalHandleError;
+  }
+
+  const auto& cached = shim->latest_ds_state();
+  if (!cached.has_value() || !valid_joystick_index(joystickNum)) {
+    return kHalSuccess;
+  }
+
+  copy_hal_struct(desc, cached->joystick_descriptors[static_cast<std::size_t>(joystickNum)]);
+  return kHalSuccess;
+}
+
+HAL_Bool HAL_GetJoystickIsXbox(std::int32_t joystickNum) {
+  using robosim::backend::shim::descriptor_or_null;
+
+  const auto* descriptor = descriptor_or_null(joystickNum);
+  return descriptor == nullptr ? 0 : static_cast<HAL_Bool>(descriptor->is_xbox);
+}
+
+std::int32_t HAL_GetJoystickType(std::int32_t joystickNum) {
+  using robosim::backend::shim::descriptor_or_null;
+
+  const auto* descriptor = descriptor_or_null(joystickNum);
+  return descriptor == nullptr ? 0 : static_cast<std::int32_t>(descriptor->type);
+}
+
+void HAL_GetJoystickName(WPI_String* name, std::int32_t joystickNum) {
+  using robosim::backend::shim::assign_wpi_string;
+  using robosim::backend::shim::descriptor_or_null;
+  using robosim::backend::shim::fixed_name_length;
+
+  const auto* descriptor = descriptor_or_null(joystickNum);
+  if (descriptor == nullptr) {
+    assign_wpi_string(name, {});
+    return;
+  }
+
+  const std::size_t length = fixed_name_length(descriptor->name);
+  assign_wpi_string(name, std::span<const char>{descriptor->name.data(), length});
+}
+
+std::int32_t HAL_GetJoystickAxisType(std::int32_t joystickNum, std::int32_t axis) {
+  using robosim::backend::shim::descriptor_or_null;
+  using robosim::backend::shim::valid_joystick_axis_index;
+
+  const auto* descriptor = descriptor_or_null(joystickNum);
+  if (descriptor == nullptr || !valid_joystick_axis_index(axis)) {
+    return 0;
+  }
+  return static_cast<std::int32_t>(descriptor->axis_types[static_cast<std::size_t>(axis)]);
+}
+
+std::int32_t HAL_GetMatchInfo(HAL_MatchInfo* info) {
+  using robosim::backend::shim::copy_hal_struct;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::zero_hal_struct;
+
+  zero_hal_struct(info);
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return kHalHandleError;
+  }
+
+  const auto& cached = shim->latest_ds_state();
+  if (!cached.has_value()) {
+    return kHalSuccess;
+  }
+
+  copy_hal_struct(info, cached->match);
+  return kHalSuccess;
+}
+
+HAL_Bool HAL_RefreshDSData(void) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return 0;
+  }
+  return shim->refresh_ds_data() ? 1 : 0;
+}
+
+void HAL_ProvideNewDataEventHandle(WPI_EventHandle handle) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->provide_new_data_event_handle(handle);
+}
+
+void HAL_RemoveNewDataEventHandle(WPI_EventHandle handle) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->remove_new_data_event_handle(handle);
+}
+
+HAL_Bool HAL_GetOutputsEnabled(void) {
+  using robosim::backend::kControlDsAttached;
+  using robosim::backend::kControlEnabled;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return 0;
+  }
+
+  const auto& cached = shim->latest_ds_state();
+  if (!cached.has_value()) {
+    return 0;
+  }
+
+  const std::uint32_t bits = cached->control.bits;
+  return ((bits & kControlEnabled) != 0 && (bits & kControlDsAttached) != 0) ? 1 : 0;
+}
+
+void HAL_ObserveUserProgramStarting(void) {
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::user_program_observer_state;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->observe_user_program(user_program_observer_state::starting);
+}
+
+void HAL_ObserveUserProgramDisabled(void) {
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::user_program_observer_state;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->observe_user_program(user_program_observer_state::disabled);
+}
+
+void HAL_ObserveUserProgramAutonomous(void) {
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::user_program_observer_state;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->observe_user_program(user_program_observer_state::autonomous);
+}
+
+void HAL_ObserveUserProgramTeleop(void) {
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::user_program_observer_state;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->observe_user_program(user_program_observer_state::teleop);
+}
+
+void HAL_ObserveUserProgramTest(void) {
+  using robosim::backend::shim::shim_core;
+  using robosim::backend::shim::user_program_observer_state;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->observe_user_program(user_program_observer_state::test);
+}
+
 std::int32_t HAL_SendError(HAL_Bool isError,
                            std::int32_t errorCode,
                            HAL_Bool isLVCode,
@@ -389,14 +711,14 @@ std::int32_t HAL_SendError(HAL_Bool isError,
                            const char* location,
                            const char* callStack,
                            HAL_Bool printMsg) {
+  using robosim::backend::copy_truncated;
   using robosim::backend::error_message;
   using robosim::backend::kErrorTruncCallStack;
   using robosim::backend::kErrorTruncDetails;
   using robosim::backend::kErrorTruncLocation;
-  using robosim::backend::copy_truncated;
+  using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::safe_view;
   using robosim::backend::shim::shim_core;
-  using robosim::backend::shim::kHalHandleError;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -429,11 +751,11 @@ void HAL_CAN_SendMessage(std::uint32_t messageID,
                          std::int32_t periodMs,
                          std::int32_t* status) {
   using robosim::backend::can_frame;
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalCanInvalidBuffer;
   using robosim::backend::shim::kHalCanSendPeriodStopRepeating;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -459,16 +781,77 @@ void HAL_CAN_SendMessage(std::uint32_t messageID,
   shim->enqueue_can_frame(frame);
 }
 
+void HAL_CAN_ReceiveMessage(std::uint32_t* messageID,
+                            std::uint32_t messageIDMask,
+                            std::uint8_t* data,
+                            std::uint8_t* dataSize,
+                            std::uint32_t* timeStamp,
+                            std::int32_t* status) {
+  using robosim::backend::shim::kHalCanInvalidBuffer;
+  using robosim::backend::shim::kHalCanMessageNotFound;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+
+  const auto zero_scalars = [&] {
+    *messageID = 0;
+    *dataSize = 0;
+    *timeStamp = 0;
+  };
+  const auto zero_outputs = [&] {
+    zero_scalars();
+    if (data != nullptr) {
+      std::memset(data, 0, 8);
+    }
+  };
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    zero_outputs();
+    *status = kHalHandleError;
+    return;
+  }
+  if (data == nullptr) {
+    zero_scalars();
+    *status = kHalCanInvalidBuffer;
+    return;
+  }
+
+  const std::uint32_t requested_id = *messageID;
+  const auto& cached = shim->latest_can_frame_batch();
+  if (!cached.has_value()) {
+    zero_outputs();
+    *status = kHalCanMessageNotFound;
+    return;
+  }
+
+  for (std::uint32_t i = 0; i < cached->count; ++i) {
+    const auto& frame = cached->frames[i];
+    if ((frame.message_id & messageIDMask) != (requested_id & messageIDMask)) {
+      continue;
+    }
+    *messageID = frame.message_id;
+    std::memcpy(data, frame.data.data(), frame.data.size());
+    *dataSize = frame.data_size;
+    *timeStamp = frame.timestamp_us;
+    *status = kHalSuccess;
+    return;
+  }
+
+  zero_outputs();
+  *status = kHalCanMessageNotFound;
+}
+
 void HAL_CAN_OpenStreamSession(std::uint32_t* sessionHandle,
                                std::uint32_t messageID,
                                std::uint32_t messageIDMask,
                                std::uint32_t maxMessages,
                                std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalCanInvalidBuffer;
   using robosim::backend::shim::kHalCanNotAllowed;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -482,8 +865,7 @@ void HAL_CAN_OpenStreamSession(std::uint32_t* sessionHandle,
     return;
   }
 
-  const std::uint32_t handle =
-      shim->open_can_stream_session(messageID, messageIDMask, maxMessages);
+  const std::uint32_t handle = shim->open_can_stream_session(messageID, messageIDMask, maxMessages);
   *sessionHandle = handle;
   *status = handle == 0 ? kHalCanNotAllowed : kHalSuccess;
 }
@@ -504,9 +886,9 @@ void HAL_CAN_ReadStreamSession(std::uint32_t sessionHandle,
                                std::uint32_t* messagesRead,
                                std::int32_t* status) {
   using robosim::backend::can_frame;
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalCanInvalidBuffer;
   using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
@@ -541,9 +923,9 @@ void HAL_CAN_GetCANStatus(float* percentBusUtilization,
                           std::uint32_t* receiveErrorCount,
                           std::uint32_t* transmitErrorCount,
                           std::int32_t* status) {
-  using robosim::backend::shim::shim_core;
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
 
   *percentBusUtilization = 0.0f;
   *busOffCount = 0;
@@ -568,6 +950,120 @@ void HAL_CAN_GetCANStatus(float* percentBusUtilization,
   *txFullCount = cached->tx_full_count;
   *receiveErrorCount = cached->receive_error_count;
   *transmitErrorCount = cached->transmit_error_count;
+}
+
+HAL_NotifierHandle HAL_InitializeNotifier(std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return 0;
+  }
+
+  const std::int32_t handle = shim->initialize_notifier();
+  if (handle == 0) {
+    *status = kHalHandleError;
+    return 0;
+  }
+  *status = kHalSuccess;
+  return handle;
+}
+
+void HAL_SetNotifierName(HAL_NotifierHandle notifierHandle,
+                         const char* name,
+                         std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::safe_view;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return;
+  }
+  *status = shim->set_notifier_name(notifierHandle, safe_view(name));
+}
+
+HAL_Bool HAL_SetNotifierThreadPriority(HAL_Bool realTime,
+                                       std::int32_t priority,
+                                       std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+
+  (void)realTime;
+  (void)priority;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return 0;
+  }
+  *status = kHalSuccess;
+  return 1;
+}
+
+void HAL_StopNotifier(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return;
+  }
+  *status = shim->stop_notifier(notifierHandle);
+}
+
+void HAL_CleanNotifier(HAL_NotifierHandle notifierHandle) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return;
+  }
+  shim->clean_notifier(notifierHandle);
+}
+
+void HAL_UpdateNotifierAlarm(HAL_NotifierHandle notifierHandle,
+                             std::uint64_t triggerTime,
+                             std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return;
+  }
+  *status = shim->update_notifier_alarm(notifierHandle, triggerTime);
+}
+
+void HAL_CancelNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return;
+  }
+  *status = shim->cancel_notifier_alarm(notifierHandle);
+}
+
+std::uint64_t HAL_WaitForNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    *status = kHalHandleError;
+    return 0;
+  }
+  return shim->wait_for_notifier_alarm(notifierHandle, *status);
 }
 
 }  // extern "C"

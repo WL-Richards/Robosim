@@ -11,6 +11,7 @@
 // shim_core.cpp does NOT touch this storage. See
 // `.claude/skills/hal-shim.md` and tests/backend/shim/TEST_PLAN_CYCLE12.md.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace robosim::backend::shim {
@@ -21,7 +22,7 @@ namespace robosim::backend::shim {
  * The `kHal` prefix avoids macro-name collisions with the eventual WPILib
  * HAL_* macros.
  */
-inline constexpr std::int32_t kHalSuccess     =  0;
+inline constexpr std::int32_t kHalSuccess = 0;
 inline constexpr std::int32_t kHalHandleError = -1;
 inline constexpr std::int32_t kHalCanInvalidBuffer = -44086;
 inline constexpr std::int32_t kHalCanMessageNotFound = -44087;
@@ -43,6 +44,15 @@ extern "C" {
  */
 typedef std::int32_t HAL_Bool;
 
+/** Mirrors WPILib WPI_Handle from wpi/Synchronization.h. */
+typedef unsigned int WPI_Handle;
+
+/** Mirrors WPILib WPI_EventHandle from wpi/Synchronization.h. */
+typedef WPI_Handle WPI_EventHandle;
+
+/** Mirrors WPILib HAL_NotifierHandle from hal/include/hal/Types.h. */
+typedef std::int32_t HAL_NotifierHandle;
+
 /**
  * Mirrors WPILib HAL_ControlWord from hal/include/hal/DriverStationTypes.h.
  *
@@ -62,12 +72,20 @@ struct HAL_ControlWord {
 /** Mirrors WPILib HAL_AllianceStationID from DriverStationTypes.h. */
 enum HAL_AllianceStationID : std::int32_t {
   HAL_AllianceStationID_kUnknown = 0,
-  HAL_AllianceStationID_kRed1    = 1,
-  HAL_AllianceStationID_kRed2    = 2,
-  HAL_AllianceStationID_kRed3    = 3,
-  HAL_AllianceStationID_kBlue1   = 4,
-  HAL_AllianceStationID_kBlue2   = 5,
-  HAL_AllianceStationID_kBlue3   = 6,
+  HAL_AllianceStationID_kRed1 = 1,
+  HAL_AllianceStationID_kRed2 = 2,
+  HAL_AllianceStationID_kRed3 = 3,
+  HAL_AllianceStationID_kBlue1 = 4,
+  HAL_AllianceStationID_kBlue2 = 5,
+  HAL_AllianceStationID_kBlue3 = 6,
+};
+
+/** Mirrors WPILib HAL_MatchType from DriverStationTypes.h. */
+enum HAL_MatchType : std::int32_t {
+  HAL_kMatchType_none = 0,
+  HAL_kMatchType_practice = 1,
+  HAL_kMatchType_qualification = 2,
+  HAL_kMatchType_elimination = 3,
 };
 
 /** Driver Station joystick limits mirrored from WPILib. */
@@ -94,6 +112,33 @@ struct HAL_JoystickButtons {
   std::uint8_t count;
 };
 
+/** Mirrors WPILib HAL_JoystickDescriptor from DriverStationTypes.h. */
+struct HAL_JoystickDescriptor {
+  std::uint8_t isXbox;
+  std::uint8_t type;
+  char name[256];
+  std::uint8_t axisCount;
+  std::uint8_t axisTypes[12];
+  std::uint8_t buttonCount;
+  std::uint8_t povCount;
+};
+
+/** Mirrors WPILib HAL_MatchInfo from DriverStationTypes.h. */
+struct HAL_MatchInfo {
+  char eventName[64];
+  HAL_MatchType matchType;
+  std::uint16_t matchNumber;
+  std::uint8_t replayNumber;
+  std::uint8_t gameSpecificMessage[64];
+  std::uint16_t gameSpecificMessageSize;
+};
+
+/** Mirrors WPI_String from wpi/string.h. */
+struct WPI_String {
+  const char* str;
+  std::size_t len;
+};
+
 /**
  * Mirrors WPILib HAL_CANStreamMessage from hal/include/hal/CAN.h.
  *
@@ -106,6 +151,22 @@ struct HAL_CANStreamMessage {
   std::uint8_t data[8];
   std::uint8_t dataSize;
 };
+
+/**
+ * Mirrors WPILib HAL_Initialize from hal/include/hal/HALBase.h.
+ *
+ * v0 does not create or own the shim; the host must install one first via
+ * shim_core::install_global. timeout and mode are accepted but ignored.
+ */
+HAL_Bool HAL_Initialize(std::int32_t timeout, std::int32_t mode);
+
+/**
+ * Mirrors WPILib HAL_Shutdown from hal/include/hal/HALBase.h.
+ *
+ * Wakes pending HAL waits and detaches the process-global shim pointer. The
+ * caller-owned shim object is not destroyed.
+ */
+void HAL_Shutdown(void);
 
 /**
  * Mirrors WPILib HAL_GetFPGATime from hal/include/hal/HALBase.h.
@@ -190,16 +251,96 @@ double HAL_GetMatchTime(std::int32_t* status);
  * kHalHandleError and zeroes the output; empty cache or invalid joystick index
  * returns kHalSuccess with zero/default output. `axes` must not be null.
  */
-std::int32_t HAL_GetJoystickAxes(std::int32_t joystickNum,
-                                 HAL_JoystickAxes* axes);
+std::int32_t HAL_GetJoystickAxes(std::int32_t joystickNum, HAL_JoystickAxes* axes);
 
 /** Mirrors WPILib HAL_GetJoystickPOVs from DriverStation.h. */
-std::int32_t HAL_GetJoystickPOVs(std::int32_t joystickNum,
-                                 HAL_JoystickPOVs* povs);
+std::int32_t HAL_GetJoystickPOVs(std::int32_t joystickNum, HAL_JoystickPOVs* povs);
 
 /** Mirrors WPILib HAL_GetJoystickButtons from DriverStation.h. */
-std::int32_t HAL_GetJoystickButtons(std::int32_t joystickNum,
-                                    HAL_JoystickButtons* buttons);
+std::int32_t HAL_GetJoystickButtons(std::int32_t joystickNum, HAL_JoystickButtons* buttons);
+
+/**
+ * Mirrors WPILib HAL_GetAllJoystickData from DriverStation.h.
+ *
+ * Copies all six axes/POV/button slots from latest_ds_state_. No shim or empty
+ * cache zeroes all outputs. All output pointers must be non-null.
+ */
+void HAL_GetAllJoystickData(HAL_JoystickAxes* axes,
+                            HAL_JoystickPOVs* povs,
+                            HAL_JoystickButtons* buttons);
+
+/**
+ * Mirrors WPILib HAL_GetJoystickDescriptor from DriverStation.h.
+ *
+ * Copies one joystick descriptor from latest_ds_state_. No shim returns
+ * kHalHandleError and zeroes the descriptor; empty cache or invalid joystick
+ * index returns kHalSuccess with zero/default output.
+ */
+std::int32_t HAL_GetJoystickDescriptor(std::int32_t joystickNum, HAL_JoystickDescriptor* desc);
+
+/** Mirrors WPILib HAL_GetJoystickIsXbox from DriverStation.h. */
+HAL_Bool HAL_GetJoystickIsXbox(std::int32_t joystickNum);
+
+/** Mirrors WPILib HAL_GetJoystickType from DriverStation.h. */
+std::int32_t HAL_GetJoystickType(std::int32_t joystickNum);
+
+/**
+ * Mirrors WPILib HAL_GetJoystickName from DriverStation.h.
+ *
+ * Fills a WPI_String with heap-owned bytes copied from the descriptor name.
+ * Empty/default names return {nullptr, 0}. Nonempty strings must be freed by
+ * the caller with the same allocator family as WPI_FreeString/std::free.
+ */
+void HAL_GetJoystickName(WPI_String* name, std::int32_t joystickNum);
+
+/** Mirrors WPILib HAL_GetJoystickAxisType from DriverStation.h. */
+std::int32_t HAL_GetJoystickAxisType(std::int32_t joystickNum, std::int32_t axis);
+
+/**
+ * Mirrors WPILib HAL_GetMatchInfo from DriverStation.h.
+ *
+ * Copies latest_ds_state_::match. No shim returns kHalHandleError and zeroes
+ * the output; empty cache returns kHalSuccess with zero/default output.
+ */
+std::int32_t HAL_GetMatchInfo(HAL_MatchInfo* info);
+
+/**
+ * Mirrors WPILib HAL_RefreshDSData from DriverStation.h.
+ *
+ * Drains one inbound protocol message and returns true only when that message
+ * was a Driver Station state update. Other valid messages still dispatch but
+ * return false.
+ */
+HAL_Bool HAL_RefreshDSData(void);
+
+/** Mirrors WPILib HAL_ProvideNewDataEventHandle from DriverStation.h. */
+void HAL_ProvideNewDataEventHandle(WPI_EventHandle handle);
+
+/** Mirrors WPILib HAL_RemoveNewDataEventHandle from DriverStation.h. */
+void HAL_RemoveNewDataEventHandle(WPI_EventHandle handle);
+
+/**
+ * Mirrors WPILib HAL_GetOutputsEnabled from DriverStation.h.
+ *
+ * Returns true only when the latest cached Driver Station control word has
+ * both enabled and DS-attached bits set. No shim or empty cache returns false.
+ */
+HAL_Bool HAL_GetOutputsEnabled(void);
+
+/** Mirrors WPILib HAL_ObserveUserProgramStarting from DriverStation.h. */
+void HAL_ObserveUserProgramStarting(void);
+
+/** Mirrors WPILib HAL_ObserveUserProgramDisabled from DriverStation.h. */
+void HAL_ObserveUserProgramDisabled(void);
+
+/** Mirrors WPILib HAL_ObserveUserProgramAutonomous from DriverStation.h. */
+void HAL_ObserveUserProgramAutonomous(void);
+
+/** Mirrors WPILib HAL_ObserveUserProgramTeleop from DriverStation.h. */
+void HAL_ObserveUserProgramTeleop(void);
+
+/** Mirrors WPILib HAL_ObserveUserProgramTest from DriverStation.h. */
+void HAL_ObserveUserProgramTest(void);
 
 /**
  * Mirrors WPILib HAL_SendError from hal/include/hal/DriverStation.h.
@@ -231,6 +372,22 @@ void HAL_CAN_SendMessage(std::uint32_t messageID,
                          std::int32_t periodMs,
                          std::int32_t* status);
 
+/**
+ * Mirrors WPILib HAL_CAN_ReceiveMessage from hal/include/hal/CAN.h.
+ *
+ * Reads the first matching active frame from latest_can_frame_batch_. The
+ * messageID pointer is in/out: callers provide the requested ID and receive
+ * the actual matched frame ID on success. No shim reports kHalHandleError;
+ * empty/no-match reports kHalCanMessageNotFound; null data reports
+ * kHalCanInvalidBuffer when a shim is installed.
+ */
+void HAL_CAN_ReceiveMessage(std::uint32_t* messageID,
+                            std::uint32_t messageIDMask,
+                            std::uint8_t* data,
+                            std::uint8_t* dataSize,
+                            std::uint32_t* timeStamp,
+                            std::int32_t* status);
+
 /** Mirrors WPILib HAL_CAN_OpenStreamSession from hal/include/hal/CAN.h. */
 void HAL_CAN_OpenStreamSession(std::uint32_t* sessionHandle,
                                std::uint32_t messageID,
@@ -255,5 +412,50 @@ void HAL_CAN_GetCANStatus(float* percentBusUtilization,
                           std::uint32_t* receiveErrorCount,
                           std::uint32_t* transmitErrorCount,
                           std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_InitializeNotifier from hal/include/hal/Notifier.h.
+ *
+ * Returns a nonzero handle on success. No installed shim or a full notifier
+ * table writes kHalHandleError and returns 0.
+ */
+HAL_NotifierHandle HAL_InitializeNotifier(std::int32_t* status);
+
+/** Mirrors WPILib HAL_SetNotifierName; null names are treated as empty. */
+void HAL_SetNotifierName(HAL_NotifierHandle notifierHandle, const char* name, std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_SetNotifierThreadPriority.
+ *
+ * v0 has no scheduler model, so an installed shim accepts all inputs as a
+ * deterministic no-op success. No installed shim writes kHalHandleError and
+ * returns false.
+ */
+HAL_Bool HAL_SetNotifierThreadPriority(HAL_Bool realTime,
+                                       std::int32_t priority,
+                                       std::int32_t* status);
+
+/** Mirrors WPILib HAL_StopNotifier for the cycle-25 control-plane state. */
+void HAL_StopNotifier(HAL_NotifierHandle notifierHandle, std::int32_t* status);
+
+/** Mirrors WPILib HAL_CleanNotifier; invalid/no-shim handles are no-ops. */
+void HAL_CleanNotifier(HAL_NotifierHandle notifierHandle);
+
+/** Mirrors WPILib HAL_UpdateNotifierAlarm. */
+void HAL_UpdateNotifierAlarm(HAL_NotifierHandle notifierHandle,
+                             std::uint64_t triggerTime,
+                             std::int32_t* status);
+
+/** Mirrors WPILib HAL_CancelNotifierAlarm. */
+void HAL_CancelNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_WaitForNotifierAlarm.
+ *
+ * Waits until a matching inbound notifier_alarm event is available, the
+ * notifier is stopped, or the handle is cleaned. Stop wakes return 0 with
+ * success; invalid/cleaned handles return 0 with kHalHandleError.
+ */
+std::uint64_t HAL_WaitForNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status);
 
 }  // extern "C"
