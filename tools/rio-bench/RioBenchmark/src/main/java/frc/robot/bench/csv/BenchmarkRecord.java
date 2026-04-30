@@ -16,8 +16,9 @@ import java.util.Locale;
  * @param sampleCount the number of timing blocks that contributed to
  *     {@code stats}; typically equal to {@code samples_per_block} from the
  *     metadata, unless the sweep was truncated
- * @param stats per-call mean / stddev / p99 in microseconds plus the
- *     outlier rate
+ * @param stats per-call mean / stddev / p50 / p99 / p999 in microseconds
+ *     plus the outlier rate (cycle B widened the percentile coverage from
+ *     just p99 to all three)
  */
 public record BenchmarkRecord(
     CallClass callClass,
@@ -49,13 +50,15 @@ public record BenchmarkRecord(
   public String toCsvRow() {
     return String.format(
         Locale.ROOT,
-        "%s,%s,%d,%.3f,%.3f,%.3f,%.6f\n",
+        "%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f\n",
         callClass.csvLabel(),
         operatingPoint.csvLabel(),
         sampleCount,
         stats.meanUs(),
         stats.stddevUs(),
+        stats.p50Us(),
         stats.p99Us(),
+        stats.p999Us(),
         stats.outlierRate());
   }
 }

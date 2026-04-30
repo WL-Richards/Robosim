@@ -28,11 +28,24 @@ class BenchmarkPipelineTest {
     for (int round = 0; round < WARMUP_COUNT; round++) {
       for (CallClass c : ALL_CLASSES) s.submitSample(c, 1L);
     }
+    // Cycle B P1'': v = ((6*p.ordinal() + c.ordinal()) + 1) * 1000.
+    // The +1 offset keeps the lowest cell's `v - 1` sample non-negative
+    // (samples are timing-style ns values, so negative is semantically
+    // wrong even though Statistics.compute does not reject it).
+    // For each cell, submit the four-sample spread [v-1, v, v, v+1] so
+    // that p50, p99, p999 differ at nanosecond precision (per cycle-B
+    // bug-class P1''-1: distinguishes p50 from p99 in the byte-equal
+    // fixture for blockSize=1 cells).
     for (OperatingPoint p : OperatingPoint.values()) {
-      long valueNs = (long) (6 * p.ordinal()) * 1000L;
       for (int round = 0; round < PER_POINT_COUNT; round++) {
         for (CallClass c : ALL_CLASSES) {
-          long sampleNs = valueNs + (long) c.ordinal() * 1000L;
+          long valueNs = (long) ((6 * p.ordinal() + c.ordinal()) + 1) * 1000L;
+          long sampleNs;
+          switch (round) {
+            case 0 -> sampleNs = valueNs - 1L;
+            case 3 -> sampleNs = valueNs + 1L;
+            default -> sampleNs = valueNs;
+          }
           s.submitSample(c, sampleNs);
         }
       }

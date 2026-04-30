@@ -13,6 +13,9 @@ import org.junit.jupiter.api.Test;
 
 class CsvWriterTest {
 
+  private static final String HEADER_LINE =
+      "call_class,operating_point,sample_count,mean_us,stddev_us,p50_us,p99_us,p999_us,outlier_rate";
+
   private static RunMetadata defaultMetadata() {
     return new RunMetadata(
         "2026.2.1",
@@ -42,7 +45,7 @@ class CsvWriterTest {
         # samples_per_block=10000
         # block_size=100
         # validated=false
-        call_class,operating_point,sample_count,mean_us,stddev_us,p99_us,outlier_rate
+        call_class,operating_point,sample_count,mean_us,stddev_us,p50_us,p99_us,p999_us,outlier_rate
         """;
     assertEquals(expected, out);
   }
@@ -51,22 +54,29 @@ class CsvWriterTest {
   void writes_header_row_after_preamble() {
     String out = CsvWriter.write(defaultMetadata(), List.of());
     String[] lines = out.split("\n");
-    assertEquals(
-        "call_class,operating_point,sample_count,mean_us,stddev_us,p99_us,outlier_rate",
-        lines[10]);
+    assertEquals(HEADER_LINE, lines[10]);
   }
 
   @Test
   void sorts_records_by_call_class_then_operating_point() {
-    Stats s = new Stats(0.0, 0.0, 0.0, 0.0);
+    // Distinct stats per record so a row-swap is byte-visible. The sort
+    // key is (call_class.csvLabel, operating_point.csvLabel) — the values
+    // here intentionally vary by the integer cell index so any swap
+    // produces a different rendered string.
+    Stats sa = new Stats(1.000, 0.0, 0.0, 0.0, 0.0, 0.0);
+    Stats sb = new Stats(2.000, 0.0, 0.0, 0.0, 0.0, 0.0);
+    Stats sc = new Stats(3.000, 0.0, 0.0, 0.0, 0.0, 0.0);
+    Stats sd = new Stats(4.000, 0.0, 0.0, 0.0, 0.0, 0.0);
+    Stats se = new Stats(5.000, 0.0, 0.0, 0.0, 0.0, 0.0);
+    Stats sf = new Stats(6.000, 0.0, 0.0, 0.0, 0.0, 0.0);
     List<BenchmarkRecord> records =
         List.of(
-            new BenchmarkRecord(CallClass.CAN_FRAME_WRITE, OperatingPoint.SATURATED_BUS, 1, s),
-            new BenchmarkRecord(CallClass.CAN_FRAME_WRITE, OperatingPoint.IDLE_BUS, 1, s),
-            new BenchmarkRecord(CallClass.CAN_FRAME_READ, OperatingPoint.SATURATED_BUS, 1, s),
-            new BenchmarkRecord(CallClass.CAN_FRAME_READ, OperatingPoint.IDLE_BUS, 1, s),
-            new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.SATURATED_BUS, 1, s),
-            new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, s));
+            new BenchmarkRecord(CallClass.CAN_FRAME_WRITE, OperatingPoint.SATURATED_BUS, 1, sa),
+            new BenchmarkRecord(CallClass.CAN_FRAME_WRITE, OperatingPoint.IDLE_BUS, 1, sb),
+            new BenchmarkRecord(CallClass.CAN_FRAME_READ, OperatingPoint.SATURATED_BUS, 1, sc),
+            new BenchmarkRecord(CallClass.CAN_FRAME_READ, OperatingPoint.IDLE_BUS, 1, sd),
+            new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.SATURATED_BUS, 1, se),
+            new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, sf));
     String out = CsvWriter.write(defaultMetadata(), records);
     String[] lines = out.split("\n");
     int header = 10;
@@ -80,29 +90,40 @@ class CsvWriterTest {
 
   @Test
   void formats_microsecond_columns_with_locale_root_half_up() {
-    Stats s1 = new Stats(1.2345678, 0.0, 0.0, 0.0);
+    // C4': all five µs columns must use HALF_UP. Set every µs field to
+    // the witness 1.0625; HALF_UP → 1.063, HALF_EVEN → 1.062. Five
+    // occurrences of `1.063` in the row prove all five columns route
+    // through the same formatter.
+    Stats s1 = new Stats(1.2345678, 0.0, 0.0, 0.0, 0.0, 0.0);
     BenchmarkRecord r1 =
         new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, s1);
     String out1 = CsvWriter.write(defaultMetadata(), List.of(r1));
     assertTrue(out1.contains(",1.235,"), "expected '1.235' in output, got:\n" + out1);
 
-    Stats s2 = new Stats(1.0625, 0.0, 0.0, 0.0);
+    Stats s2 = new Stats(1.0625, 1.0625, 1.0625, 1.0625, 1.0625, 0.0);
     BenchmarkRecord r2 =
         new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, s2);
     String out2 = CsvWriter.write(defaultMetadata(), List.of(r2));
-    assertTrue(out2.contains(",1.063,"), "expected '1.063' (HALF_UP), got:\n" + out2);
     assertFalse(out2.contains(",1.062,"), "must not produce '1.062' (HALF_EVEN)");
+    int occurrences = countOccurrences(out2, "1.063");
+    assertEquals(
+        5,
+        occurrences,
+        "expected exactly five HALF_UP occurrences (one per µs column), got "
+            + occurrences
+            + " in:\n"
+            + out2);
   }
 
   @Test
   void formats_outlier_rate_with_six_decimal_places() {
-    Stats s1 = new Stats(0.0, 0.0, 0.0, 1e-6);
+    Stats s1 = new Stats(0.0, 0.0, 0.0, 0.0, 0.0, 1e-6);
     BenchmarkRecord r1 =
         new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, s1);
     String out1 = CsvWriter.write(defaultMetadata(), List.of(r1));
     assertTrue(out1.contains(",0.000001\n"), "expected '0.000001' tail, got:\n" + out1);
 
-    Stats s2 = new Stats(0.0, 0.0, 0.0, 0.0);
+    Stats s2 = new Stats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     BenchmarkRecord r2 =
         new BenchmarkRecord(CallClass.HAL_GET_FPGA_TIME, OperatingPoint.IDLE_BUS, 1, s2);
     String out2 = CsvWriter.write(defaultMetadata(), List.of(r2));
@@ -165,5 +186,16 @@ class CsvWriterTest {
     String out = CsvWriter.write(defaultMetadata(), List.of());
     long lineCount = out.chars().filter(c -> c == '\n').count();
     assertEquals(11L, lineCount);
+  }
+
+  private static int countOccurrences(String haystack, String needle) {
+    int count = 0;
+    int from = 0;
+    while (true) {
+      int idx = haystack.indexOf(needle, from);
+      if (idx < 0) return count;
+      count++;
+      from = idx + needle.length();
+    }
   }
 }

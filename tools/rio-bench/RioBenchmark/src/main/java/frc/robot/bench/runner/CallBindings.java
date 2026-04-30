@@ -32,11 +32,21 @@ public final class CallBindings {
    */
   private static final int CAN_BENCH_MESSAGE_ID = 0x1FFFFFFE;
 
+  /**
+   * CAN message ID used by {@link #spamCanFrame()} to software-saturate
+   * the bus during {@code SATURATED_BUS} / {@code SATURATED_MULTI_THREAD}
+   * phases. Distinct from {@link #CAN_BENCH_MESSAGE_ID} so spam traffic
+   * cannot contaminate the timed receive/send measurements (which are
+   * pinned to {@code CAN_BENCH_MESSAGE_ID}).
+   */
+  private static final int CAN_SPAM_MESSAGE_ID = 0x1FFFFFFD;
+
   private final IntBuffer canRxId =
       ByteBuffer.allocateDirect(4).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
   private final ByteBuffer canRxTimestamp =
       ByteBuffer.allocateDirect(4).order(ByteOrder.LITTLE_ENDIAN);
   private final byte[] canTxPayload = new byte[8];
+  private final byte[] canSpamPayload = new byte[8];
 
   private long sink;
 
@@ -136,6 +146,27 @@ public final class CallBindings {
       // Send may report bus error if no devices ack; HAL call cost is measured.
     }
     return System.nanoTime() - start;
+  }
+
+  /**
+   * Drives one CAN-frame transmission for software-driven bus saturation.
+   * Called in a tight loop by the CAN-spam worker that {@code WorkerSpec}
+   * spawns for {@code SATURATED_BUS} and {@code SATURATED_MULTI_THREAD}
+   * phases. Uses a distinct message ID from {@link #timeCanFrameWrite()}
+   * and {@link #timeCanFrameRead()} so spam traffic cannot land in the
+   * receive queue used by the timed measurement.
+   *
+   * <p>Not timed; the runner does not feed this into the sequencer. The
+   * goal is HAL-call traffic on the bus, not the cost of the call.
+   */
+  public void spamCanFrame() {
+    try {
+      CANJNI.FRCNetCommCANSessionMuxSendMessage(
+          CAN_SPAM_MESSAGE_ID, canSpamPayload, CANJNI.CAN_SEND_PERIOD_NO_REPEAT);
+    } catch (RuntimeException ignored) {
+      // Bus-error / no-ack failures are expected during saturation. The
+      // intent is to keep the HAL session-mux busy, not to land frames.
+    }
   }
 
   /**

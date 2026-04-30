@@ -24,8 +24,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link #runOnce()} callers.
  */
 public final class BenchmarkRunner {
-  /** Iterations per call class before any samples are recorded; lets the JIT and CPU caches reach steady state. */
-  private static final int WARMUP_COUNT = 1000;
+  /**
+   * Iterations per call class before any samples are recorded; lets the JIT
+   * and CPU caches reach steady state. Bumped from 1000 → 10000 after the
+   * first hardware run showed `idle_bus` (the first measured phase) biased
+   * high for `block_size=1` call classes (CAN_FRAME_*, HAL_NOTIFIER_WAIT) —
+   * 1000 invocations is below C2 JIT's ~10k threshold, so those calls
+   * weren't fully warm by the time recording started. 10000 invocations
+   * past C2 + the notifier-wait warmup costs ~10s extra wall-time, which
+   * is dominated by the rest of the sweep.
+   */
+  private static final int WARMUP_COUNT = 10000;
 
   /** Iterations per call class per operating point. Echoed as {@code samples_per_block} in the CSV header. */
   private static final int PER_POINT_COUNT = 10000;
@@ -122,26 +131,49 @@ public final class BenchmarkRunner {
   }
 
   /**
-   * Spins up background load matching {@code phase}. Today only
-   * {@link OperatingPoint#MULTI_THREAD} requires workers — three threads
-   * hammer {@code HAL_GetFPGATime} to model the cross-thread HAL contention
-   * a typical robot project sees from logging threads and command dispatch.
+   * Spins up background load matching {@code phase} per the
+   * {@link WorkerSpec} table. The operating-point → load-profile mapping
+   * lives in exactly one place ({@code WorkerSpec.forPoint}) so that
+   * cycle-A's cross-product points stay consistent with cycle-B+ additions.
    *
-   * @return null when no workers are needed; the caller treats null as
-   *     "nothing to shut down" in the {@code finally} block
+   * <p>Worker threads:
+   * <ul>
+   *   <li>CPU-contention workers — each loops on a cheap HAL call, modeling
+   *       the cross-thread contention a typical robot project sees from
+   *       logging threads and command dispatch.</li>
+   *   <li>CAN-spam worker (when {@code spec.canSpam()}) — loops on
+   *       {@link CallBindings#spamCanFrame()} to software-saturate the
+   *       bus regardless of operator hardware. This is the {@code D-RB-8}
+   *       semantic shift: {@code SATURATED_BUS} is no longer
+   *       operator-hardware-driven.</li>
+   * </ul>
+   *
+   * @return null when {@code spec} requests no workers (e.g. {@code IDLE_BUS});
+   *     the caller treats null as "nothing to shut down" in the
+   *     {@code finally} block
    */
   private ExecutorService startWorkersFor(
       OperatingPoint phase, AtomicBoolean stop, CallBindings bindings) {
-    if (phase != OperatingPoint.MULTI_THREAD) {
+    WorkerSpec spec = WorkerSpec.forPoint(phase);
+    int totalWorkers = spec.cpuWorkers() + spec.canSpamWorkers();
+    if (totalWorkers == 0) {
       return null;
     }
 
-    ExecutorService pool = Executors.newFixedThreadPool(3);
-    for (int i = 0; i < 3; i++) {
+    ExecutorService pool = Executors.newFixedThreadPool(totalWorkers);
+    for (int i = 0; i < spec.cpuWorkers(); i++) {
       pool.submit(
           () -> {
             while (!stop.get()) {
               bindings.timeBlockNs(CallClass.HAL_GET_FPGA_TIME);
+            }
+          });
+    }
+    for (int i = 0; i < spec.canSpamWorkers(); i++) {
+      pool.submit(
+          () -> {
+            while (!stop.get()) {
+              bindings.spamCanFrame();
             }
           });
     }

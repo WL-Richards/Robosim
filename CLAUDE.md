@@ -81,7 +81,10 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
 
 - **Sim core** — Phase A scaffold + Phase B description loader +
   protocol schema/session + Tier 1 shared-memory transport + HAL shim
-  through cycle 24 (v0 outbound surface closed; **power_state read
+  through cycle 39 (Driver Station output pump after protocol v3
+  `user_program_observer_snapshot` publication and protocol v2
+  `joystick_output_batch` publication;
+  v0 outbound surface closed; **power_state read
   surface closed** + **clock_state read surface closed**; C HAL ABI
   surfaces wired so far: **`HAL_GetFPGATime`** +
   **`HAL_GetVinVoltage`** + **`HAL_GetVinCurrent`** +
@@ -100,6 +103,10 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   **`HAL_GetMatchTime`** from `latest_ds_state_`;
   plus **`HAL_GetJoystickAxes`** / **`HAL_GetJoystickPOVs`** /
   **`HAL_GetJoystickButtons`** from `latest_ds_state_`;
+  plus DS scalar/metadata reads, DS refresh/new-data events,
+  outputs-enabled, user-program observers, `HAL_SetJoystickOutputs`,
+  explicit joystick-output snapshot publication, and explicit
+  user-program observer snapshot publication, plus the DS-output pump;
   plus the process-global accessor;
   cycle 15 fixed a pre-existing `hal_bool` signedness parity bug;
   cycle 18 pinned D-C18-UINT32-TO-INT32-CAST for the schema-vs-WPILib
@@ -112,12 +119,25 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   `HAL_ControlWord` named-bit mapping; cycle 24 pinned joystick
   struct byte-copy, ABI layout, and invalid-index zero/default
   semantics).
-  Full project baseline **ctest 532/532** green under `build`; cycle 24
-  focused shim suite **217/217** green. Layer
+  Full project baseline **ctest 679/679** green under `build`; cycle 39
+  focused common suite **131/131** green; cycle 39 focused shim suite
+  **355/355** green. Layer
   3/4/5 not started.
 - **Visualizer** — Phases VA + VB + VC + VD all landed; v0 Edit mode
   functionally complete. **457/457** viz + description tests green.
-- **rio-bench** — pure-Java logic **41/41** green; HAL-bound code
-  compiles against WPILib 2026.2.1 and awaits a physical RIO 2 run.
+- **rio-bench** — pure-Java logic **76/76** green (cycle A landed:
+  `SATURATED_MULTI_THREAD` cross-product op-point + pure-Java
+  `WorkerSpec` table + software-driven CAN saturation per `D-RB-8`;
+  cycle B landed: `p50_us` + `p999_us` columns added inline
+  alongside `p99_us`, R-7 `percentileNs` lifted to a testable
+  helper; cycle C landed: `WorkerSpec` migrated to
+  `int canSpamWorkers`, four new operating points
+  `SATURATED_BUS_4` / `_8` / `_4_MULTI_THREAD` / `_8_MULTI_THREAD`
+  for software-driven device-count sweep, new pure-Java
+  `DeviceScan` helper for runtime CAN device discovery);
+  HAL-bound code compiles against WPILib 2026.2.1 and awaits a
+  physical RIO 2 run. Cycle C still needs the HAL-bound
+  `CallBindings.probeTalonFxAlive` shim + `Robot.autonomousInit`
+  wiring before first hardware run.
 
 Repo: `git@github.com:WL-Richards/Robosim.git`.

@@ -36,7 +36,8 @@ public final class CsvWriter {
         .busDevices()
         .ifPresent(n -> out.append("# bus_devices=").append(n).append('\n'));
 
-    out.append("call_class,operating_point,sample_count,mean_us,stddev_us,p99_us,outlier_rate\n");
+    out.append(
+        "call_class,operating_point,sample_count,mean_us,stddev_us,p50_us,p99_us,p999_us,outlier_rate\n");
 
     List<BenchmarkRecord> sorted = new ArrayList<>(records);
     sorted.sort(BenchmarkRecord.CSV_ORDER);

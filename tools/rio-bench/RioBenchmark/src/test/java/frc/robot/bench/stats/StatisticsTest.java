@@ -98,7 +98,9 @@ class StatisticsTest {
     Stats s = Statistics.compute(samples, 1);
     assertEquals(7.0, s.meanUs(), 0.0);
     assertEquals(0.0, s.stddevUs(), 0.0);
+    assertEquals(7.0, s.p50Us(), 0.0);
     assertEquals(7.0, s.p99Us(), 0.0);
+    assertEquals(7.0, s.p999Us(), 0.0);
     assertEquals(0.0, s.outlierRate(), 0.0);
   }
 
@@ -109,5 +111,58 @@ class StatisticsTest {
     Stats s = Statistics.compute(samples, 1);
     assertEquals(1.234, s.meanUs(), 1e-9);
     assertEquals(0.0, s.stddevUs(), 1e-9);
+  }
+
+  @Test
+  void percentile_ns_helper_returns_R7_value_for_canonical_dataset() {
+    // S13: directly pin the lifted percentileNs helper across boundary p
+    // values. Catches a refactor that picks nearest-rank instead of R-7,
+    // and an off-by-one at p=1.0 that would access sorted[n].
+    long[] sorted = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    assertEquals(10.0, Statistics.percentileNs(sorted, 0.0), 1e-12);
+    assertEquals(55.0, Statistics.percentileNs(sorted, 0.5), 1e-12);
+    assertEquals(99.1, Statistics.percentileNs(sorted, 0.99), 1e-12);
+    assertEquals(99.91, Statistics.percentileNs(sorted, 0.999), 1e-12);
+    assertEquals(100.0, Statistics.percentileNs(sorted, 1.0), 1e-12);
+  }
+
+  @Test
+  void compute_returns_p50_via_R7_on_known_dataset() {
+    // S14: pins compute → percentileNs(., 0.5) wiring. Distinct from the
+    // existing p99 test (S5) so an argument-collision defect (passing the
+    // same p to both) is caught.
+    long[] samples = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    Stats s = Statistics.compute(samples, 1);
+    assertEquals(0.055, s.p50Us(), 1e-12);
+  }
+
+  @Test
+  void compute_returns_p999_via_R7_on_known_dataset() {
+    // S15: pins compute → percentileNs(., 0.999) wiring.
+    long[] samples = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    Stats s = Statistics.compute(samples, 1);
+    assertEquals(0.09991, s.p999Us(), 1e-12);
+  }
+
+  @Test
+  void compute_p50_and_p999_respect_block_size_division() {
+    // S16: per-call division must apply to all three percentiles, not
+    // just p99. Identical samples force p50 = p99 = p999 = mean exactly.
+    long[] samples = new long[10];
+    for (int i = 0; i < samples.length; i++) samples[i] = 10000L;
+    Stats s = Statistics.compute(samples, 100);
+    assertEquals(0.1, s.p50Us(), 1e-12);
+    assertEquals(0.1, s.p999Us(), 1e-12);
+  }
+
+  @Test
+  void compute_p999_well_defined_for_three_sample_input() {
+    // S17: small-N at p=0.999. Floor/fraction near the last index must
+    // not throw or return NaN. v0 S6 covers the same dataset at p=0.99
+    // and expects 0.0298; this expects 0.02998 (not the same value —
+    // do not confuse the two).
+    long[] samples = {10, 20, 30};
+    Stats s = Statistics.compute(samples, 1);
+    assertEquals(0.02998, s.p999Us(), 1e-12);
   }
 }
