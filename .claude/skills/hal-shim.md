@@ -1,6 +1,6 @@
 ---
 name: hal-shim
-description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 8: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` / `notifier_state` / `notifier_alarm_batch` / `error_message_batch` cache slots (the four variable-size — `can_frame_batch`, `notifier_state`, `notifier_alarm_batch`, `error_message_batch` — use active-prefix memcpy with zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path. **All 8 per-tick payload schemas are now wired**; the per-tick set is closed. Does not yet cover the C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`, `HAL_Notifier*`, `HAL_SendError`, etc.), outbound traffic past boot, on-demand request/reply, CAN RX queueing semantics (deferred to whichever cycle wires the C HAL CAN consumer), threading, or reset/reconnect.
+description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 11: boot handshake, inbound `clock_state` / `power_state` / `ds_state` / `can_frame_batch` / `can_status` / `notifier_state` / `notifier_alarm_batch` / `error_message_batch` cache slots (the four variable-size — `can_frame_batch`, `notifier_state`, `notifier_alarm_batch`, `error_message_batch` — use active-prefix memcpy with zero-init-before-write semantics; the rest are fixed-size byte-copy), shutdown terminal receive path, **plus the outbound `send_can_frame_batch` (cycle 9), `send_notifier_state` (cycle 10), and `send_error_message_batch` (cycle 11) surfaces — all three outbound-meaningful schemas wired — publishing as `tick_boundary` envelopes into `backend_to_core` via the production `active_prefix_bytes` overloads in the schema headers (extracted at cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX), with the same shutdown-terminal short-circuit as `poll()` per typed method**. All 8 per-tick payload schemas are wired inbound; **all three outbound-meaningful schemas wired** (`can_frame_batch`, `notifier_state`, `error_message_batch` — the v0 outbound surface is closed). Does not yet cover the C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`, `HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`, `HAL_Notifier*`, `HAL_SendError`, etc.), on-demand request/reply, shim-initiated shutdown, CAN RX queueing semantics (deferred to whichever cycle wires the C HAL CAN consumer), threading, or reset/reconnect.
 ---
 
 # HAL shim core
@@ -41,17 +41,99 @@ schema, distinguished by having **zero implicit C++ padding** (its
 (D-C8-PROBE-RETIRED) since no per-tick schema remains unsupported
 and closed a pre-existing C7-6 determinism gap where
 `notifier_alarm_batch` had been inadvertently omitted from the
-"AllSevenSlots" replay despite the test name. Future cycles cover
-outbound traffic past `boot`, on-demand request/reply, the C HAL
-ABI, threading, and reset/reconnect — the per-tick payload schema
-set is closed.
+"AllSevenSlots" replay despite the test name. **Cycle 9 added
+the first outbound-past-boot surface: `send_can_frame_batch`
+publishes a `can_frame_batch` payload as a `tick_boundary`
+envelope into `backend_to_core`. Inlined active-prefix size
+computation (D-C9-NO-HELPER) mirrors the inbound D-C4-VARIABLE-
+SIZE on the outbound side. The same shutdown-terminal short-
+circuit as `poll()` (cycle-1 design decision #6) applies: once
+`is_shutting_down()` is true, the send returns
+`shutdown_already_observed` without calling `endpoint_.send`,
+so neither the lane nor the session counter is touched. The
+shared `wrap_send_error` lambda's message string was generalized
+from "transport rejected outbound boot envelope" to "transport
+rejected outbound envelope" so it serves both call sites
+(D-C9-WRAPPED-SEND-ERROR). Cycle 10 added the second outbound-
+meaningful schema (`send_notifier_state`) and cashed in
+D-C9-NO-HELPER's "second-call-site" trigger by extracting the
+active-prefix size computation into production `active_prefix_bytes`
+overloads in the schema headers (`can_frame.h` and
+`notifier_state.h`) per D-C10-EXTRACT-ACTIVE-PREFIX. Both
+`send_can_frame_batch` (refactored) and `send_notifier_state`
+(new) call the production helpers; the test-side overloads in
+`tests/backend/tier1/test_helpers.h` for these two schemas were
+deleted, and tests resolve to the production version via ADL.
+Cycle 10 also explicitly trimmed per-method test mirrors of the
+cycle-9 cross-cutting contracts (D-C10-INBOUND-INDEPENDENCE-
+INHERITS, D-C10-NO-CONNECT-GATE-INHERITS, D-C10-RECEIVE-COUNTER-
+INDEPENDENCE-INHERITS, plus the lane_in_progress mirror) on the
+test-reviewer's explicit endorsement that those contracts are
+session/transport-level, not per-method, and don't need re-
+verification per outbound schema. Only D-C10-SHUTDOWN-TERMINAL-
+INHERITS gets a per-method test (C10-5) because each typed
+`send_*` method carries its own short-circuit code. Cycle 11
+added the third (and final v0) outbound-meaningful schema
+(`send_error_message_batch`) and added the third production
+`active_prefix_bytes` overload to `error_message.h` (plus a
+`static_assert(offsetof(error_message_batch, messages) == 8)`
+recommended by the cycle-11 reviewer). The cycle-10 trim
+convention applied unchanged. With cycle 11, the v0 outbound
+surface is **closed** for the three semantically-meaningful
+schemas; the five sim-authoritative schemas remain
+intentionally absent from the outbound API per D-C9-TYPED-
+OUTBOUND.** Future cycles cover on-demand request/reply, shim-
+initiated `shutdown`, the C HAL ABI, threading, and reset/
+reconnect.
 
 ## Scope
 
-**In (cycles 1–8):**
+**In (cycles 1–11):**
 - `shim_core::make(endpoint, desc, sim_time_us)` — moves the caller-
   owned `tier1_endpoint` into the shim and immediately publishes one
   `boot` envelope carrying `desc` via `endpoint.send`.
+- `shim_core::send_can_frame_batch(batch, sim_time_us)` (cycle 9;
+  refactored at cycle 10 to call the production
+  `backend::active_prefix_bytes(batch)` helper instead of the inlined
+  computation) — publishes `batch` as a `tick_boundary` envelope into
+  the shim's outbound `backend_to_core` lane. Sends exactly the
+  active prefix (`offsetof(can_frame_batch, frames) + batch.count *
+  sizeof(can_frame)`). Wraps transport errors via the shared
+  `wrap_send_error`. Short-circuits with `shutdown_already_observed`
+  once `is_shutting_down()` is true, without touching the lane or
+  the session counter.
+- `shim_core::send_notifier_state(state, sim_time_us)` (cycle 10) —
+  publishes `state` as a `tick_boundary` envelope into the shim's
+  outbound `backend_to_core` lane. Sends exactly the active prefix
+  (`offsetof(notifier_state, slots) + state.count *
+  sizeof(notifier_slot)` — note the **8-byte header** offset, not 4,
+  because `notifier_slot` has `alignof == 8`). Same shutdown short-
+  circuit and `wrap_send_error` semantics as `send_can_frame_batch`.
+  Calls the production `backend::active_prefix_bytes(state)` helper
+  in `notifier_state.h`.
+- `shim_core::send_error_message_batch(batch, sim_time_us)` (cycle 11)
+  — publishes `batch` as a `tick_boundary` envelope into the shim's
+  outbound `backend_to_core` lane. Sends exactly the active prefix
+  (`offsetof(error_message_batch, messages) + batch.count *
+  sizeof(error_message)`). The 8-byte header offset comes from a
+  **NAMED `reserved_pad[4]` field** (not implicit padding); per
+  D-C8-PADDING-FREE the schema has zero implicit C++ padding. Same
+  shutdown short-circuit and `wrap_send_error` semantics. Calls the
+  production `backend::active_prefix_bytes(batch)` helper in
+  `error_message.h`.
+- `backend::active_prefix_bytes(const can_frame_batch&)`,
+  `backend::active_prefix_bytes(const notifier_state&)`, and
+  `backend::active_prefix_bytes(const error_message_batch&)` —
+  production helpers in `src/backend/common/can_frame.h`,
+  `notifier_state.h`, and `error_message.h` respectively (extracted
+  at cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX, with the third
+  overload added at cycle 11). Each returns a span over the schema's
+  active-prefix bytes. Tests resolve to these via ADL; the test-side
+  overloads in `tests/backend/tier1/test_helpers.h` for these three
+  schemas were deleted as each cycle landed. The only remaining
+  test-side overload is `notifier_alarm_batch` (sim-authoritative;
+  no production caller because it is never published outbound by
+  the shim).
 - `shim_core::poll()` — drains zero-or-one inbound message per call;
   dispatches by `(envelope_kind, schema_id)`:
   - `boot_ack` → flips `is_connected()` to true.
@@ -137,13 +219,11 @@ set is closed.
 
 **Out:**
 - The per-tick payload schema set is closed at cycle 8 (all 8
-  schemas wired). On-demand replies (`on_demand_request` /
-  `on_demand_reply`) and outbound traffic follow as separate
-  cycles. The `unsupported_payload_schema` arm is retained as
-  a defensive forward-compat guard; if a post-v0 schema is
-  added to `protocol_version.h` and the validator's allowed set
-  but not yet wired in dispatch, the loud reject path still
-  fires.
+  schemas wired) on the inbound side. The
+  `unsupported_payload_schema` arm is retained as a defensive
+  forward-compat guard; if a post-v0 schema is added to
+  `protocol_version.h` and the validator's allowed set but not
+  yet wired in dispatch, the loud reject path still fires.
 - **CAN RX queueing semantics.** `latest_can_frame_batch_` uses
   latest-wins (D-C4-LATEST-WINS) — a deferred decision pinned by
   the cycle-4 tests. Cycle-1 D #7 anticipated that CAN RX may
@@ -151,15 +231,43 @@ set is closed.
   requirement yet. The cycle that wires `HAL_CAN_ReadStreamSession`
   brings the queue contract with it; until then, latest-wins is
   the explicit and tested behavior.
-- All outbound traffic past the construction-time `boot`. Cycle 3+
-  adds shim-side `tick_boundary` (notifier registrations, error
-  messages, CAN TX), `on_demand_request`, and shim-initiated
-  `shutdown`.
+- The five inbound-only schemas (`clock_state`, `power_state`,
+  `ds_state`, `can_status`, `notifier_alarm_batch`) are sim-
+  authoritative and have no outbound API by design
+  (D-C9-TYPED-OUTBOUND makes wrong-direction publishing impossible
+  at the API boundary). With cycle 11, the three semantically-
+  meaningful outbound schemas (`can_frame_batch`, `notifier_state`,
+  `error_message_batch`) are all wired; the v0 outbound surface is
+  closed.
+- `on_demand_request` / `on_demand_reply` envelopes (in either
+  direction). Future cycle drives the `protocol_session`'s
+  single-flight pairing surface.
+- Shim-initiated `shutdown` envelope. Future cycle.
 - The exported C HAL ABI (`HAL_GetFPGATime`, `HAL_Initialize`,
-  `HAL_GetAlliance`, etc.). Cycle 4+ adds these as separate
-  surface-files that read from / write to the shim's cache.
-- Threading. The shim is single-threaded; the caller drives `poll()`.
-- Reset / reconnect. After shutdown, the shim object is dead.
+  `HAL_GetAlliance`, `HAL_CAN_SendMessage`, `HAL_SendError`,
+  `HAL_Notifier*`, etc.). Future cycle adds these as separate
+  surface-files that read from the shim's cache and write into
+  the shim's outbound API. The C HAL CAN TX cycle that wires
+  `HAL_CAN_SendMessage` will own the per-frame-batching and
+  per-tick-flush discipline that drives `send_can_frame_batch`;
+  cycle 9 stops at the C++ shim API.
+- Outbound oversize-count validation for both `send_can_frame_batch`
+  (`count > kMaxCanFramesPerBatch == 64`) and `send_notifier_state`
+  (`count > kMaxNotifiers == 32`). Both methods trust the caller to
+  pass a well-constructed batch; the production
+  `active_prefix_bytes` overloads read `count` directly. Upstream,
+  `protocol_session::build_envelope` and the validator catch
+  oversize batches with `payload_size_mismatch`, but the shim's
+  read past `frames[63]` / `slots[31]` is UB that the validator
+  surfaces only after the read has already happened. The C HAL ABI
+  cycles (`HAL_CAN_SendMessage`, `HAL_Notifier*`) own the count-
+  clamping discipline at the untrusted-caller seam.
+- Threading. The shim is single-threaded; the caller drives both
+  `poll()` and `send_can_frame_batch`. The C HAL ABI cycle that
+  introduces multi-thread call sites also introduces the
+  threading model.
+- Reset / reconnect. After shutdown, the shim object is dead —
+  on both the inbound (`poll()`) and outbound (`send_*`) sides.
 - LD_PRELOAD libc time interception. Separate cycle.
 - Tier 2 socket transport. The shim today consumes a concrete
   `tier1::tier1_endpoint`; the seam will generalize when tier 2 lands.
@@ -177,6 +285,18 @@ set is closed.
 - `shim_core::make(tier1::tier1_endpoint, const boot_descriptor&,`
   ` std::uint64_t sim_time_us)` — factory.
 - `shim_core::poll()` — drain one inbound; apply.
+- `shim_core::send_can_frame_batch(const can_frame_batch&,`
+  ` std::uint64_t sim_time_us)` (cycle 9) — publish a
+  `tick_boundary` envelope carrying the batch's active prefix.
+  Refactored at cycle 10 to call `backend::active_prefix_bytes`.
+- `shim_core::send_notifier_state(const notifier_state&,`
+  ` std::uint64_t sim_time_us)` (cycle 10) — publish a
+  `tick_boundary` envelope carrying the state's active prefix
+  (8-byte header + count*88 bytes).
+- `shim_core::send_error_message_batch(const error_message_batch&,`
+  ` std::uint64_t sim_time_us)` (cycle 11) — publish a
+  `tick_boundary` envelope carrying the batch's active prefix
+  (8-byte header from named `reserved_pad[4]` + count*2324 bytes).
 - `shim_core::is_connected()`, `is_shutting_down()`,
   `latest_clock_state()`, `latest_power_state()`,
   `latest_ds_state()`, `latest_can_frame_batch()`,
@@ -309,6 +429,122 @@ set is closed.
 8. **Move-only RAII.** `shim_core` is non-copyable, move-only. The
    destructor is implicit (the wrapped endpoint cleans up on its own).
 
+13. **Typed outbound API per schema, not generic
+    `send_tick_boundary(schema_id, ...)`** (D-C9-TYPED-OUTBOUND,
+    cycle 9). `send_can_frame_batch` is a typed entry point;
+    future cycles will add `send_notifier_state` and
+    `send_error_message_batch` as siblings. Two reasons: (a) the
+    typed method makes wrong-schema-id passing impossible at the
+    call site, mirroring how `make()` takes a typed
+    `boot_descriptor&` rather than `(schema_id::boot_descriptor,
+    span<bytes>)`; (b) the shim's outbound surface is intentionally
+    narrow — only the three semantically-meaningful outbound
+    schemas get methods, and there is no API path to publish a
+    sim-authoritative `clock_state` / `power_state` / `ds_state` /
+    `can_status` / `notifier_alarm_batch` by accident, even though
+    the validator's `kPerKindAllowedSchemas` table allows them
+    under `tick_boundary` in either direction.
+
+14. **Outbound active-prefix discipline mirrors inbound**
+    (D-C9-ACTIVE-PREFIX-OUT, cycle 9). `send_can_frame_batch`
+    publishes exactly `offsetof(can_frame_batch, frames) +
+    batch.count * sizeof(can_frame)` bytes onto the wire, NOT
+    `sizeof(can_frame_batch)`. This is the outbound mirror of
+    D-C4-VARIABLE-SIZE on the inbound side, and it is what makes
+    `protocol_session::build_envelope`'s payload-bytes validation
+    hold (the validator's `expected_variable_payload_size` decodes
+    the count header from the payload prefix and enforces
+    `payload_bytes == header_size + count * element_size`). The
+    size computation is **inlined** in `send_can_frame_batch` per
+    D-C9-NO-HELPER — when a second outbound variable-size schema
+    lands, the duplication between the inlined production path and
+    the test-side `tier1::helpers::active_prefix_bytes` is the
+    trigger for lifting a shared helper into production code; one
+    call site is not enough to justify the abstraction (code-style.md
+    "Don't add features past Phase B 'just because.'").
+
+15. **Outbound shutdown short-circuits before transport**
+    (D-C9-SHUTDOWN-TERMINAL, cycle 9). Once `is_shutting_down()`
+    is true, `send_can_frame_batch` returns
+    `shutdown_already_observed` without calling `endpoint_.send`.
+    Mirror of `poll()`'s short-circuit (cycle-1 design decision
+    #6). Rationale: the terminal-state non-negotiable applies
+    symmetrically to send and receive; publishing wire bytes after
+    the peer has signaled shutdown is wasted work and clouds the
+    "shim is dead" semantic. The short-circuit returns before
+    `endpoint_.send` is called, so neither the lane nor the session
+    counter is touched — the test's lane-state == empty + the
+    `transport_error == nullopt` assertion together prove this.
+
+16. **Shared `wrap_send_error` with generic message**
+    (D-C9-WRAPPED-SEND-ERROR, cycle 9). Cycle 9's two send call
+    sites (boot in `make()`, tick_boundary in
+    `send_can_frame_batch`) both consume the same
+    `wrap_send_error` lambda; the message string was generalized
+    from "transport rejected outbound boot envelope" to "transport
+    rejected outbound envelope" so it serves both. Diagnostic
+    information lives in the typed `kind` and the
+    `offending_field_name` carried from the underlying transport
+    error, not the human-readable message — and the existing tests
+    assert on `kind` and `transport_error.kind`, never on the
+    message string, so the rename was test-safe.
+
+17. **No outbound connect-gate** (D-C9-NO-CONNECT-GATE, cycle 9).
+    `send_can_frame_batch` succeeds even when `is_connected() ==
+    false`. The protocol_session's `validate_send_order` only
+    requires `has_sent_boot_` for backend-side non-boot sends
+    (`protocol_session.cpp:162-166`); `has_received_boot_ack_` is
+    not on the send-side path. The protocol explicitly permits
+    both peers to begin streaming `tick_boundary` after sending
+    their handshake half, without requiring the other side to ack
+    first. A "shim author defensively requires `is_connected()`
+    before allowing outbound" bug would block the publish; the
+    protocol does not require it.
+
+18. **Active-prefix size lives in the schema headers**
+    (D-C10-EXTRACT-ACTIVE-PREFIX, cycle 10). The cycle-9
+    `send_can_frame_batch` deferred extracting the
+    `offsetof(B, elements) + count*sizeof(E)` computation from the
+    inlined production path until a second outbound variable-size
+    schema landed. Cycle 10's `send_notifier_state` is that second
+    site, so the helper extracts to `inline std::span<const
+    std::uint8_t> active_prefix_bytes(const X&)` overloads in the
+    schema headers themselves (`can_frame.h`, `notifier_state.h`).
+    Both shim send paths call `backend::active_prefix_bytes`. The
+    test-side overloads in `tests/backend/tier1/test_helpers.h` for
+    these two schemas were deleted; tests resolve to the production
+    version via ADL since `can_frame_batch` and `notifier_state`
+    live in `robosim::backend`. The `notifier_alarm_batch` and
+    `error_message_batch` overloads stay in `test_helpers.h` until
+    their respective outbound cycles land — "no production helper
+    without a production caller" is the rule (test-reviewer
+    explicitly endorsed). Extraction location: per-schema-header
+    inline rather than a new aggregator header, because (a) callers
+    already including the schema header get the helper for free,
+    (b) the helper is a pure function of the struct it operates on,
+    and (c) an aggregator would force including all four schema
+    headers including the two with no production caller.
+
+19. **Per-method test mirrors are trimmed for outbound cycles past
+    cycle 9** (D-C10-INBOUND-INDEPENDENCE-INHERITS / D-C10-NO-
+    CONNECT-GATE-INHERITS / D-C10-RECEIVE-COUNTER-INDEPENDENCE-
+    INHERITS, cycle 10). The cycle-9 cross-cutting contracts
+    (inbound-independence, no-connect-gate, receive-counter-
+    independence, lane_in_progress wrapping) are session/transport-
+    level rather than per-method, so each new outbound schema cycle
+    does NOT re-test them. The one cycle-9 contract that DOES
+    require a per-method test is the shutdown short-circuit
+    (D-C10-SHUTDOWN-TERMINAL-INHERITS pinned by C10-5) because
+    each typed `send_*` method carries its own short-circuit code
+    block. Test-reviewer ruling: "A future reviewer should not
+    revert to 10-test coverage without a concrete new bug class
+    that the trim fails to catch." This is a deliberate departure
+    from the inbound-cycle precedent (cycles 2–8 maintained full
+    per-schema family coverage) because the outbound path does NOT
+    have per-schema branching analogous to `poll()`'s dispatch arms
+    — each new typed method is a thin wrapper around the shared
+    `endpoint_.send` infrastructure.
+
 ## Cycle-1 control flow
 
 ```
@@ -374,9 +610,57 @@ Structural feature; no physical source data applies.
   recommendation), all addressed in rev 2. Cycle 8 retires
   test 10 outright (D-C8-PROBE-RETIRED) since no per-tick
   schema remains unsupported.
+- Cycle-9 plan approved by the `test-reviewer` agent on
+  2026-04-29 after two review rounds
+  (`tests/backend/shim/TEST_PLAN_CYCLE9.md`). Round-1 verdict
+  `not-ready` with two blockers (C9-5's contradictory "drain"
+  setup step against an already-empty lane; D-C9-INBOUND-
+  INDEPENDENCE cross-referenced "C9-7" but the test was C9-6)
+  plus three non-blocking items (C9-1b missing explicit
+  `sequence == 1` assertion; `lane_in_progress` outbound gap;
+  outbound `count > kMaxCanFramesPerBatch` documentation gap).
+  Auditing the cross-references during rev 2 surfaced a systemic
+  off-by-one error affecting four decision blocks (only one of
+  which the reviewer caught), all corrected; rev 2 also added
+  C9-3b for the `lane_in_progress` outbound failure mode (mirror
+  of cycle-1 test 13 for the inbound side). Round-2 verdict
+  `ready-to-implement` with one residual stale comment in the
+  `drain_boot_only` helper docstring (corrected after round 2
+  closed).
+- Cycle-10 plan approved by the `test-reviewer` agent on
+  2026-04-29 after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE10.md`). Round-1 verdict
+  `ready-to-implement` with one required clarification (C10-1's
+  memcmp range-coverage explicit) and one non-blocking
+  improvement (C10-2 mirror that language) — both addressed
+  in-place. The reviewer **explicitly endorsed** the cycle's
+  three open questions: OQ-C10-PER-METHOD-MIRRORS (trim from 10
+  to 6 tests by skipping cross-cutting cycle-9 mirrors —
+  endorsed with the directive "A future reviewer should not
+  revert to 10-test coverage without a concrete new bug class
+  that the trim fails to catch"); OQ-C10-HELPER-LOCATION (per-
+  schema-header inline placement endorsed over an aggregator
+  header); OQ-C10-NOTIFIER-ALARM-OVERLOAD (test-only overload
+  stays since notifier_alarm_batch has no production caller).
+- Cycle-11 plan approved by the `test-reviewer` agent on
+  2026-04-30 after a single review round
+  (`tests/backend/shim/TEST_PLAN_CYCLE11.md`). Round-1 verdict
+  `ready-to-implement` with no blockers and one non-blocking
+  recommendation (add `static_assert(offsetof(error_message_batch,
+  messages) == 8)` to `error_message.h`, addressed in-place
+  during implementation). Reviewer explicitly resolved both
+  open questions: OQ-C11-FULL-CAPACITY-TEST (do NOT add a
+  count=8 boundary test — the arithmetic is already exercised
+  at counts 0/2/3/4 across the suite and the lane-capacity
+  boundary is owned by tier1 tests); OQ-C11-MEMCMP-IN-DETERMINISM
+  (keep the C11-7 memcmp companion despite being byte-equivalent
+  to `vector::operator==` for this padding-free schema, for
+  cross-cycle structural parity with C9-7 / C10-7). Cycle 11
+  introduces no new design decisions; every contract inherits
+  from cycles 9 and 10.
 - `tests/backend/shim/shim_core_test.cpp` covers, across cycles
-  1–8, 91 tests: boot publish layout, make-failure-atomicity (lane
-  busy), wrong-direction endpoint surfacing
+  1–11, **113 tests**: boot publish layout, make-failure-atomicity
+  (lane busy), wrong-direction endpoint surfacing
   `boot_wrong_direction`, post-make observer initial state for all
   eight cache slots, empty-poll no-op, boot_ack handshake,
   post-connect byte-equal caching for `clock_state` / `power_state`
@@ -392,45 +676,111 @@ Structural feature; no physical source data applies.
   with all eight slots asserted at every step, covering 14
   cross-population directions added at cycle 8), shutdown
   handling, post-shutdown terminal, `lane_in_progress` error
-  wrapping, and a 10-step interleaved-scenario determinism
-  replay (`RepeatedRunsProduceByteIdenticalAllEightSlots`,
-  introduced at cycle 8 to replace and correct the landed
-  C7-6) asserting byte-identical contents for all eight
-  slots — including direct `std::memcmp` on
+  wrapping (both inbound poll path and outbound send path),
+  a 10-step interleaved-scenario determinism replay
+  (`RepeatedRunsProduceByteIdenticalAllEightSlots`,
+  introduced at cycle 8) asserting byte-identical contents
+  for all eight slots — including direct `std::memcmp` on
   `latest_ds_state()`, `latest_can_frame_batch()`,
   `latest_notifier_state()`, and
   `latest_notifier_alarm_batch()` to pin padding-byte
   determinism (no memcmp on `error_message_batch` per
-  D-C8-PADDING-FREE). Test 10 (the cycles-2-through-7
-  unsupported-schema reject + recovery probe) was retired at
-  cycle 8 (D-C8-PROBE-RETIRED) since no still-unsupported
-  per-tick schema remains; the production-code dispatch arm
-  for `unsupported_payload_schema` is retained as a defensive
+  D-C8-PADDING-FREE), **and the 10 cycle-9 outbound tests in
+  the new `ShimCoreSend` suite** plus the
+  `ShimCoreDeterminism.RepeatedRunsProduceByteIdenticalOutboundCanFrameBatch`
+  outbound determinism replay: positive publish (3-frame and
+  empty batches), sequence-counter advance on success and
+  preservation on both `lane_busy` and `lane_in_progress`
+  failure modes, no-connect-gate (publishes before boot_ack
+  is consumed), post-shutdown send short-circuit (proves
+  `endpoint_.send` not called via lane-state == empty +
+  `transport_error == nullopt`), 8-cache-slot inbound
+  independence after a successful send, and a receive-counter
+  non-perturbation indirect verification via 3 sends followed
+  by a valid inbound at sequence 1. **Cycle 10 added 6 more
+  outbound tests in the same `ShimCoreSend` suite plus
+  `ShimCoreDeterminism.RepeatedRunsProduceByteIdenticalOutboundNotifierState`**:
+  positive `send_notifier_state` publish (3-slot batch with
+  payload_bytes == 272 = 8 + 3*88, with the 16 implicit padding
+  bytes within the active prefix explicitly memcmp'd; and the
+  count=0 boundary case at payload_bytes == 8), sequence-counter
+  advance to 2 across two sends with different counts (184 and
+  360 bytes), `lane_busy` preservation with recovery proof,
+  per-method post-shutdown short-circuit (the one D-C9-derived
+  contract that needs per-method verification per
+  D-C10-SHUTDOWN-TERMINAL-INHERITS), and outbound determinism
+  pinning the 4-byte interior `count → slots` pad plus the
+  per-slot trailing 4 bytes inside each active slot. Cycle 10
+  deliberately trimmed the cycle-9 cross-cutting mirrors
+  (`lane_in_progress` outbound, no-connect-gate, inbound-cache
+  independence, receive-counter independence) per the test-
+  reviewer's OQ-C10-PER-METHOD-MIRRORS endorsement — those
+  contracts are session/transport-level and were verified once
+  through `send_can_frame_batch` at cycle 9. **Cycle 11 added 6
+  more outbound tests in the same `ShimCoreSend` suite plus
+  `ShimCoreDeterminism.RepeatedRunsProduceByteIdenticalOutboundError`
+  `MessageBatch`**: positive `send_error_message_batch` publish
+  (3-message batch with payload_bytes == 6980 = 8 + 3*2324; the
+  count=0 boundary case at payload_bytes == 8 covering count
+  word + named `reserved_pad[4]`), sequence-counter advance to
+  2 across counts 2 and 4 (4656 and 9304 bytes), `lane_busy`
+  preservation with recovery proof, per-method post-shutdown
+  short-circuit, and outbound determinism. Per D-C8-PADDING-FREE
+  the schema has zero implicit C++ padding (both `reserved_pad`
+  fields are NAMED), so the C11-7 memcmp companions are byte-
+  equivalent to `vector::operator==` but kept for cross-cycle
+  structural parity per the test-reviewer's OQ-C11-MEMCMP-IN-
+  DETERMINISM resolution. Same trim convention as cycle 10.
+  Test 10 (the cycles-2-through-7 unsupported-schema reject +
+  recovery probe) was retired at cycle 8 (D-C8-PROBE-RETIRED);
+  the production-code dispatch arm for
+  `unsupported_payload_schema` is retained as a defensive
   forward-compat structural guard (D-C8-DEAD-BRANCH).
 - Verification run: `ctest --test-dir build` and `ctest --test-dir
-  build-asan` both green for the 91-test shim suite under clang
+  build-asan` both green for the 113-test shim suite under clang
   Debug and GCC Debug + ASan + UBSan respectively (and
-  406/406 across the full project ctest under both toolchains).
+  428/428 across the full project ctest under both toolchains).
 
 ## Known Limits
 
 - All eight inbound per-tick state schemas wired (`clock_state`,
   `power_state`, `ds_state`, `can_frame_batch`, `can_status`,
   `notifier_state`, `notifier_alarm_batch`,
-  `error_message_batch`); the per-tick set is closed.
-  On-demand replies (via `on_demand_reply`) and outbound
-  traffic past `boot` follow as their own TDD cycle(s).
+  `error_message_batch`); the per-tick set is closed on the
+  inbound side. On-demand replies (via `on_demand_reply`)
+  follow as their own TDD cycle.
 - CAN RX queueing is **not implemented**; `latest_can_frame_batch_`
   is latest-wins. Per D-C4-LATEST-WINS this is deferred until the
   cycle that wires `HAL_CAN_ReadStreamSession`.
-- No outbound traffic past `boot`. The shim does not yet emit
-  `tick_boundary`, `on_demand_request`, or `shutdown`.
-- No threading model. Caller drives `poll()`. No notifications, no
+- All three outbound-meaningful schemas wired
+  (`send_can_frame_batch` at cycle 9 + `send_notifier_state` at
+  cycle 10 + `send_error_message_batch` at cycle 11); the v0
+  outbound surface is closed for tick_boundary publishing. The
+  five inbound-only schemas are intentionally absent from the
+  outbound API (D-C9-TYPED-OUTBOUND).
+- No outbound oversize-count clamp on any send method
+  (`count > kMaxCanFramesPerBatch == 64` for `send_can_frame_batch`,
+  `count > kMaxNotifiers == 32` for `send_notifier_state`,
+  `count > kMaxErrorsPerBatch == 8` for `send_error_message_batch`).
+  Reading past the last valid element is UB that the upstream
+  validator surfaces only after the read. The C HAL ABI cycles
+  that wire `HAL_CAN_SendMessage`, `HAL_Notifier*`, and
+  `HAL_SendError` own the seam-level count clamp.
+- No `on_demand_request` / `on_demand_reply` traffic in either
+  direction. Single-flight pairing in `protocol_session` exists
+  but is not yet driven by the shim.
+- No shim-initiated `shutdown` envelope. Cycle 9 covers post-
+  inbound-shutdown's effect on outbound (the
+  `shutdown_already_observed` short-circuit); emitting
+  `shutdown` from the shim is a separate concern.
+- No threading model. Caller drives `poll()` and
+  `send_can_frame_batch` in alternation. No notifications, no
   waits.
 - No reset / reconnect. After `is_shutting_down()` becomes true,
-  the shim object is unusable.
+  the shim object is unusable on both inbound and outbound paths.
 - No C HAL surface (`HAL_*` symbols). Future cycles add per-surface
-  exports that read from / write to the cache.
+  exports that read from the cache and write into the outbound
+  send API.
 - Bound to `tier1::tier1_endpoint` directly. Generalization to a
   tier-agnostic transport seam waits until tier 2 lands.
 
@@ -489,8 +839,48 @@ Structural feature; no physical source data applies.
   forward-compat structural guard; C8-6 corrected the landed
   C7-6's silent omission of `notifier_alarm_batch` from the
   determinism replay).
+- `tests/backend/shim/TEST_PLAN_CYCLE9.md` — approved cycle-9
+  addendum (first outbound-past-boot surface;
+  `send_can_frame_batch` publishes `can_frame_batch` as a
+  `tick_boundary` envelope; D-C9-TYPED-OUTBOUND for the typed-
+  per-schema API shape; D-C9-ACTIVE-PREFIX-OUT for the outbound
+  mirror of D-C4-VARIABLE-SIZE; D-C9-NO-HELPER for the inlined
+  size computation deferred until cycle 10's second site;
+  D-C9-SHUTDOWN-TERMINAL for the symmetric short-circuit on
+  `is_shutting_down()`; D-C9-NO-CONNECT-GATE pinning that
+  outbound does not require `boot_ack`; D-C9-WRAPPED-SEND-ERROR
+  refactoring the shared `wrap_send_error` to a generic message;
+  new C9-3b for the `lane_in_progress` outbound failure mode
+  added in rev 2 to close the round-1 reviewer's coverage gap).
+- `tests/backend/shim/TEST_PLAN_CYCLE10.md` — approved cycle-10
+  addendum (second outbound-meaningful schema;
+  `send_notifier_state` publishes `notifier_state` as a
+  `tick_boundary` envelope with the 8-byte header offset;
+  D-C10-EXTRACT-ACTIVE-PREFIX cashes in cycle 9's deferred
+  helper extraction by moving `active_prefix_bytes` overloads
+  to the schema headers; D-C10-{INBOUND-INDEPENDENCE / NO-
+  CONNECT-GATE / RECEIVE-COUNTER-INDEPENDENCE}-INHERITS
+  document which cycle-9 contracts apply unchanged and need no
+  per-method test; D-C10-SHUTDOWN-TERMINAL-INHERITS gets a
+  per-method test (C10-5) because the short-circuit lives in
+  per-method code; trimmed test set of 6 endorsed by
+  test-reviewer with the directive that future reviewers
+  should not revert without a concrete new bug class).
+- `tests/backend/shim/TEST_PLAN_CYCLE11.md` — approved cycle-11
+  addendum (third and final outbound-meaningful schema;
+  `send_error_message_batch` publishes `error_message_batch`
+  as a `tick_boundary` envelope; D-C10-EXTRACT-ACTIVE-PREFIX
+  extended to add the third production helper to
+  `error_message.h` plus the recommended
+  `static_assert(offsetof(error_message_batch, messages) == 8)`;
+  no new design decisions — every contract inherits from cycles
+  9 and 10; per-method trim convention applied unchanged from
+  cycle 10; OQ-C11-FULL-CAPACITY-TEST resolved as "do not add"
+  and OQ-C11-MEMCMP-IN-DETERMINISM resolved as "keep for
+  parity"; this cycle closes the v0 outbound surface for the
+  three semantically-meaningful outbound schemas).
 - `tests/backend/shim/shim_core_test.cpp` — implementation of the
-  approved cycle-1 through cycle-8 tests.
+  approved cycle-1 through cycle-11 tests.
 - `tests/backend/tier1/test_helpers.h` — shared test helpers
   (`manually_fill_lane`, `make_envelope`, payload constructors,
   endpoint factories, `complete_handshake`) consumed by both the

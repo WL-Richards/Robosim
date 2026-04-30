@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace robosim::backend {
@@ -78,5 +79,23 @@ static_assert(sizeof(error_message_batch) ==
               "changed) and validator's offsetof-based active-prefix "
               "math plus shim cycle-8 dispatch arm need re-verifying.");
 static_assert(sizeof(error_message_batch) == 18600);
+static_assert(offsetof(error_message_batch, messages) == 8,
+              "error_message_batch header is 4-byte count + named "
+              "reserved_pad[4]; the production active_prefix_bytes "
+              "overload below depends on this offset.");
+
+// Active-prefix wire bytes: 8-byte header (count word + named
+// reserved_pad[4]) + count*element bytes. NOT
+// sizeof(error_message_batch). Per D-C8-PADDING-FREE the schema has
+// zero implicit padding — both reserved_pad fields are named — so
+// every byte in the returned span is part of a named field that
+// participates in operator==.
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const error_message_batch& batch) {
+  const std::size_t active_size =
+      offsetof(error_message_batch, messages) +
+      static_cast<std::size_t>(batch.count) * sizeof(error_message);
+  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
+}
 
 }  // namespace robosim::backend

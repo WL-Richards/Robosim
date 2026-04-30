@@ -32,6 +32,11 @@ using tier1::helpers::make_backend;
 using tier1::helpers::make_core;
 using tier1::helpers::make_envelope;
 using tier1::helpers::manually_fill_lane;
+// active_prefix_bytes resolves via the production overloads in
+// can_frame.h / notifier_state.h for those two schemas (extracted in
+// cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX) and via test_helpers.h for
+// notifier_alarm_batch / error_message_batch (which have no production
+// outbound caller — sim-authoritative and not-yet-wired respectively).
 using tier1::helpers::active_prefix_bytes;
 using tier1::helpers::valid_boot_descriptor;
 using tier1::helpers::valid_can_frame;
@@ -67,6 +72,26 @@ shim_core make_connected_shim(tier1_shared_region& region, tier1_endpoint& core)
   EXPECT_TRUE(poll_result.has_value());
   EXPECT_TRUE(shim_or->is_connected());
   return std::move(*shim_or);
+}
+
+// Cycle-9 helper. Drains the shim's outbound boot envelope from the
+// core peer's inbound side, leaving backend_to_core empty so the
+// shim's first post-boot send can take the lane. Mirrors the *first
+// half* of make_connected_shim's drain step but does NOT send
+// boot_ack — useful for C9-4 (D-C9-NO-CONNECT-GATE).
+void drain_boot_only(tier1_endpoint& core) {
+  auto boot = core.try_receive();
+  ASSERT_TRUE(boot.has_value());
+}
+
+// Cycle-9 helper. Pulls one envelope from the shim's backend_to_core
+// lane via the core peer and returns the receiver-owned tier1_message.
+// The caller asserts on it. Used by every C9 test that inspects the
+// published wire bytes.
+tier1::tier1_message receive_from_shim(tier1_endpoint& core) {
+  auto msg = core.try_receive();
+  EXPECT_TRUE(msg.has_value());
+  return std::move(*msg);
 }
 
 }  // namespace
@@ -3378,6 +3403,963 @@ TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalAllEightSlots) {
 
   EXPECT_TRUE(shim_a.is_connected());
   EXPECT_TRUE(shim_b.is_connected());
+}
+
+// ============================================================================
+// Cycle 9 — outbound can_frame_batch (`send_can_frame_batch`).
+// First post-boot outbound surface; see TEST_PLAN_CYCLE9.md.
+// ============================================================================
+
+// ============================================================================
+// Test C9-1: send_can_frame_batch publishes a tick_boundary envelope
+// carrying exactly the active prefix of the input batch (NOT
+// sizeof(can_frame_batch)). Pins D-C9-ACTIVE-PREFIX-OUT and the
+// first-post-boot sequence == 1 contract.
+// ============================================================================
+TEST(ShimCoreSend, PublishesCanFrameBatchAsTickBoundaryWithActivePrefixWireBytes) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<can_frame, 3> frames{
+      valid_can_frame(/*message_id=*/0x101, /*timestamp_us=*/1'000,
+                      /*data_size=*/4, /*fill_byte=*/0xA1),
+      valid_can_frame(0x202, 2'000, 8, 0xB2),
+      valid_can_frame(0x303, 3'000, 0, 0xC3)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  auto sent = shim.send_can_frame_batch(batch, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::can_frame_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);  // boot took 0.
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 64u);  // 4 + 3*20.
+  ASSERT_EQ(msg.payload.size(), 64u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &batch, 64), 0);
+}
+
+// ============================================================================
+// Test C9-1b: an empty (count=0) batch is a legal publish; the active
+// prefix is the 4-byte count word. Pins D-C9-EMPTY-BATCH-OUT.
+// ============================================================================
+TEST(ShimCoreSend, PublishesEmptyCanFrameBatchAsHeaderOnlyTickBoundary) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto empty_batch = valid_can_frame_batch();
+
+  auto sent = shim.send_can_frame_batch(empty_batch, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::can_frame_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 4u);  // count word only.
+  ASSERT_EQ(msg.payload.size(), 4u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &empty_batch, 4), 0);
+}
+
+// ============================================================================
+// Test C9-2: a second send advances the outbound sequence counter to 2.
+// Different counts (2 then 4) catch a "sequence advances by frame count"
+// bug. Pins D-C9-SEQUENCE-ADVANCE positive arm.
+// ============================================================================
+TEST(ShimCoreSend, SecondSendAdvancesOutboundSequenceToTwo) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<can_frame, 2> first_frames{
+      valid_can_frame(0x111, 1'000, 4, 0xAA),
+      valid_can_frame(0x222, 2'000, 8, 0xBB)};
+  const auto first = valid_can_frame_batch(first_frames);
+
+  ASSERT_TRUE(shim.send_can_frame_batch(first, /*sim_time_us=*/100'000).has_value());
+  const auto first_msg = receive_from_shim(core);
+  EXPECT_EQ(first_msg.envelope.sequence, 1u);
+  EXPECT_EQ(first_msg.envelope.payload_bytes, 44u);  // 4 + 2*20.
+  ASSERT_EQ(first_msg.payload.size(), 44u);
+  EXPECT_EQ(std::memcmp(first_msg.payload.data(), &first, 44), 0);
+
+  const std::array<can_frame, 4> second_frames{
+      valid_can_frame(0x333, 3'000, 4, 0xCC),
+      valid_can_frame(0x444, 4'000, 8, 0xDD),
+      valid_can_frame(0x555, 5'000, 0, 0xEE),
+      valid_can_frame(0x666, 6'000, 6, 0xFF)};
+  const auto second = valid_can_frame_batch(second_frames);
+
+  ASSERT_TRUE(shim.send_can_frame_batch(second, /*sim_time_us=*/200'000).has_value());
+  const auto second_msg = receive_from_shim(core);
+  EXPECT_EQ(second_msg.envelope.sequence, 2u);
+  EXPECT_EQ(second_msg.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(second_msg.envelope.payload_bytes, 84u);  // 4 + 4*20.
+  ASSERT_EQ(second_msg.payload.size(), 84u);
+  EXPECT_EQ(std::memcmp(second_msg.payload.data(), &second, 84), 0);
+}
+
+// ============================================================================
+// Test C9-3: lane_busy on send is rejected with the underlying
+// transport diagnostic preserved, AND the outbound sequence counter
+// is NOT consumed. Pins D-C9-SEQUENCE-ADVANCE negative arm + D-C9-
+// WRAPPED-SEND-ERROR for lane_busy.
+// ============================================================================
+TEST(ShimCoreSend, LaneBusySendIsRejectedAndPreservesSequenceCounter) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  // Boot is now in region.backend_to_core, lane state full. Core has
+  // not drained it. Capture the boot bytes so we can assert non-clobber.
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  std::array<std::uint8_t, sizeof(boot_descriptor)> boot_bytes_before{};
+  std::memcpy(boot_bytes_before.data(), region.backend_to_core.payload.data(),
+              sizeof(boot_descriptor));
+  const auto boot_envelope_before = region.backend_to_core.envelope;
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  auto first_attempt = shim_or->send_can_frame_batch(batch, /*sim_time_us=*/100'000);
+  ASSERT_FALSE(first_attempt.has_value());
+  EXPECT_EQ(first_attempt.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(first_attempt.error().transport_error.has_value());
+  EXPECT_EQ(first_attempt.error().transport_error->kind,
+            tier1_transport_error_kind::lane_busy);
+  EXPECT_EQ(first_attempt.error().offending_field_name, "lane");
+
+  // Boot envelope and payload bytes unchanged: the shim must not have
+  // clobbered the lane mid-rejection.
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region.backend_to_core.envelope, boot_envelope_before);
+  EXPECT_EQ(std::memcmp(region.backend_to_core.payload.data(),
+                        boot_bytes_before.data(), sizeof(boot_descriptor)),
+            0);
+
+  // Recovery proof: drain boot via the core peer, then resend the same
+  // batch. The recovery send must succeed at sequence == 1, NOT 2 — if
+  // the failed attempt had advanced the counter, the recovery would
+  // publish at sequence 2 and the core peer's session would reject it
+  // as sequence_mismatch.
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto boot_drained = core.try_receive();
+  ASSERT_TRUE(boot_drained.has_value());
+
+  ASSERT_TRUE(shim_or->send_can_frame_batch(batch, 100'000).has_value());
+  const auto recovery_msg = receive_from_shim(core);
+  EXPECT_EQ(recovery_msg.envelope.sequence, 1u);
+}
+
+// ============================================================================
+// Test C9-3b: lane_in_progress on send is rejected with the underlying
+// transport diagnostic preserved, AND the outbound sequence counter
+// is NOT consumed. Outbound mirror of test 13 (the inbound poll
+// analogue). Pins D-C9-SEQUENCE-ADVANCE negative arm + D-C9-WRAPPED-
+// SEND-ERROR for the lane_in_progress branch — a path the lane_busy
+// test cannot exercise because it goes through a different make_error
+// call site in shared_memory_transport.cpp.
+// ============================================================================
+TEST(ShimCoreSend, LaneInProgressSendIsRejectedAndPreservesSequenceCounter) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  // Plant a synthetic `writing` state on the outbound lane. No live
+  // peer can produce this in a single-process test; it models a peer
+  // that crashed mid-publish.
+  region.backend_to_core.state.store(
+      static_cast<std::uint32_t>(tier1_lane_state::writing),
+      std::memory_order_release);
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  auto attempt = shim.send_can_frame_batch(batch, /*sim_time_us=*/100'000);
+  ASSERT_FALSE(attempt.has_value());
+  EXPECT_EQ(attempt.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(attempt.error().transport_error.has_value());
+  EXPECT_EQ(attempt.error().transport_error->kind,
+            tier1_transport_error_kind::lane_in_progress);
+  EXPECT_EQ(attempt.error().offending_field_name, "state");
+
+  // Lane state unchanged: the shim must not have reset or advanced it.
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::writing));
+
+  // Recovery proof: clear the synthetic state, retry. Sequence must be
+  // 1 — if the failed attempt had advanced the counter, recovery would
+  // be rejected by the core peer's session.
+  region.backend_to_core.state.store(
+      static_cast<std::uint32_t>(tier1_lane_state::empty),
+      std::memory_order_release);
+  ASSERT_TRUE(shim.send_can_frame_batch(batch, 100'000).has_value());
+  const auto recovery_msg = receive_from_shim(core);
+  EXPECT_EQ(recovery_msg.envelope.sequence, 1u);
+}
+
+// ============================================================================
+// Test C9-4: send_can_frame_batch publishes successfully even when
+// is_connected() == false, as long as the outbound lane is drainable.
+// The protocol explicitly permits backend-side outbound traffic before
+// boot_ack arrives. Pins D-C9-NO-CONNECT-GATE.
+// ============================================================================
+TEST(ShimCoreSend, PublishesBeforeBootAckIsReceivedSinceOutboundDoesNotGateOnConnect) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+
+  // Drain the boot envelope on the core side, but do NOT send boot_ack
+  // and do NOT poll the shim. is_connected() stays false.
+  drain_boot_only(core);
+  ASSERT_FALSE(shim_or->is_connected());
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  auto sent = shim_or->send_can_frame_batch(batch, /*sim_time_us=*/100'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::can_frame_batch);
+
+  // Outbound publishing must NOT have flipped is_connected() as a side
+  // effect (would indicate a copy-paste-from-poll's-boot_ack-arm bug).
+  EXPECT_FALSE(shim_or->is_connected());
+}
+
+// ============================================================================
+// Test C9-5: post-shutdown send is rejected with shutdown_already_observed
+// and does NOT call endpoint_.send (transport_error nullopt; lane
+// untouched). Pins D-C9-SHUTDOWN-TERMINAL.
+// ============================================================================
+TEST(ShimCoreSend, PostShutdownSendIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  // Precondition: outbound lane is empty (boot was drained inside
+  // make_connected_shim; the shim has not sent anything since). The
+  // post-action `state == empty` assertion below would be tautological
+  // against a non-empty lane — this assertion catches a future "boot
+  // envelope leaks past make()" refactor that would invalidate the
+  // test's claim.
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  auto sent = shim.send_can_frame_batch(batch, /*sim_time_us=*/250'000);
+  ASSERT_FALSE(sent.has_value());
+  EXPECT_EQ(sent.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_FALSE(sent.error().transport_error.has_value());
+  EXPECT_EQ(sent.error().offending_field_name, "kind");
+
+  // Lane untouched: proves endpoint_.send was never called, which in
+  // turn proves the session counter was not mutated.
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// ============================================================================
+// Test C9-6: a successful send_can_frame_batch does NOT mutate any of
+// the eight inbound cache slots. Pins D-C9-INBOUND-INDEPENDENCE — the
+// outbound path operates only on the outbound lane and the session's
+// send-side counter; touching latest_can_frame_batch_ (the inbound
+// cache slot whose name shadows the outbound payload's schema name)
+// would be a copy-paste-from-poll() bug.
+// ============================================================================
+TEST(ShimCoreSend, SuccessfulSendDoesNotMutateAnyInboundCacheSlot) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_FALSE(shim.latest_clock_state().has_value());
+  ASSERT_FALSE(shim.latest_power_state().has_value());
+  ASSERT_FALSE(shim.latest_ds_state().has_value());
+  ASSERT_FALSE(shim.latest_can_frame_batch().has_value());
+  ASSERT_FALSE(shim.latest_can_status().has_value());
+  ASSERT_FALSE(shim.latest_notifier_state().has_value());
+  ASSERT_FALSE(shim.latest_notifier_alarm_batch().has_value());
+  ASSERT_FALSE(shim.latest_error_message_batch().has_value());
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  ASSERT_TRUE(shim.send_can_frame_batch(batch, /*sim_time_us=*/250'000).has_value());
+
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+  EXPECT_FALSE(shim.latest_can_frame_batch().has_value());
+  EXPECT_FALSE(shim.latest_can_status().has_value());
+  EXPECT_FALSE(shim.latest_notifier_state().has_value());
+  EXPECT_FALSE(shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(shim.latest_error_message_batch().has_value());
+}
+
+// ============================================================================
+// Test C9-7: two independent setups running the same outbound scenario
+// produce byte-identical published wire bytes. Outbound determinism;
+// non-negotiable #5. Mirror of C8-6 on the outbound side.
+// ============================================================================
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundCanFrameBatch) {
+  const std::array<can_frame, 3> first_frames{
+      valid_can_frame(0x101, 1'000, 4, 0xA1),
+      valid_can_frame(0x202, 2'000, 8, 0xB2),
+      valid_can_frame(0x303, 3'000, 0, 0xC3)};
+  const auto first_batch = valid_can_frame_batch(first_frames);
+  const std::array<can_frame, 1> second_frames{
+      valid_can_frame(0x404, 4'000, 6, 0xD4)};
+  const auto second_batch = valid_can_frame_batch(second_frames);
+
+  const auto run_setup = [&](tier1_shared_region& region,
+                             tier1_endpoint& core,
+                             tier1::tier1_message& out_first,
+                             tier1::tier1_message& out_second) {
+    core = make_core(region);
+    auto endpoint = make_backend(region);
+    auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), 0);
+    ASSERT_TRUE(shim_or.has_value());
+    auto boot = core.try_receive();
+    ASSERT_TRUE(boot.has_value());
+    ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, 0));
+    ASSERT_TRUE(shim_or->poll().has_value());
+    ASSERT_TRUE(shim_or->is_connected());
+
+    ASSERT_TRUE(shim_or->send_can_frame_batch(first_batch, 250'000).has_value());
+    auto first = core.try_receive();
+    ASSERT_TRUE(first.has_value());
+    out_first = std::move(*first);
+
+    ASSERT_TRUE(shim_or->send_can_frame_batch(second_batch, 500'000).has_value());
+    auto second = core.try_receive();
+    ASSERT_TRUE(second.has_value());
+    out_second = std::move(*second);
+  };
+
+  tier1_shared_region region_a{};
+  tier1_shared_region region_b{};
+  tier1_endpoint core_a{tier1_endpoint::make(region_a, direction::core_to_backend).value()};
+  tier1_endpoint core_b{tier1_endpoint::make(region_b, direction::core_to_backend).value()};
+  tier1::tier1_message first_a, second_a;
+  tier1::tier1_message first_b, second_b;
+  run_setup(region_a, core_a, first_a, second_a);
+  run_setup(region_b, core_b, first_b, second_b);
+
+  EXPECT_EQ(first_a.envelope, first_b.envelope);
+  EXPECT_EQ(first_a.payload, first_b.payload);
+  ASSERT_EQ(first_a.payload.size(), first_b.payload.size());
+  EXPECT_EQ(std::memcmp(first_a.payload.data(),
+                        first_b.payload.data(),
+                        first_a.payload.size()),
+            0);
+
+  EXPECT_EQ(second_a.envelope, second_b.envelope);
+  EXPECT_EQ(second_a.payload, second_b.payload);
+  ASSERT_EQ(second_a.payload.size(), second_b.payload.size());
+  EXPECT_EQ(std::memcmp(second_a.payload.data(),
+                        second_b.payload.data(),
+                        second_a.payload.size()),
+            0);
+}
+
+// ============================================================================
+// Test C9-8: send mutates only the send-side session counter, never
+// the receive-side counter. Indirect verification: after three outbound
+// sends the shim must still accept an inbound clock_state at the
+// next-expected receive sequence (1) and cache it correctly. A "send
+// mutates receive counter" bug would either reject the inbound on
+// sequence_mismatch or mis-cache.
+// ============================================================================
+TEST(ShimCoreSend, SendDoesNotPerturbProtocolSessionsReceiveExpectedSequence) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<can_frame, 1> frames{valid_can_frame(0x101, 1'000, 4, 0xA1)};
+  const auto batch = valid_can_frame_batch(frames);
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(shim.send_can_frame_batch(batch, /*sim_time_us=*/100'000).has_value());
+    auto drained = core.try_receive();
+    ASSERT_TRUE(drained.has_value());
+  }
+
+  // Core's next_sequence_to_send_ is still 1 (boot_ack was 0; core has
+  // not sent anything else). Send a clock_state at sequence 1 and verify
+  // the shim accepts it — proving its receive counter is still 1, not
+  // perturbed by the three outbound sends.
+  const auto state = valid_clock_state(/*sim_time_us=*/100'000);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::clock_state,
+                        bytes_of(state),
+                        100'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  EXPECT_EQ(*shim.latest_clock_state(), state);
+}
+
+// ============================================================================
+// Cycle 10 — outbound notifier_state (`send_notifier_state`).
+// Second outbound-meaningful schema; cashes in D-C9-NO-HELPER's
+// active-prefix-helper extraction. See TEST_PLAN_CYCLE10.md.
+// ============================================================================
+
+// ============================================================================
+// Test C10-1: send_notifier_state publishes a tick_boundary envelope
+// carrying exactly the active prefix (offsetof(notifier_state, slots)
+// + count*sizeof(notifier_slot) = 8 + 3*88 = 272 bytes for a 3-slot
+// batch). Pins D-C10-ACTIVE-PREFIX-OUT-INHERITS (in particular the
+// 8-byte header offset, NOT cycle-9's 4-byte one) and verifies the
+// extracted production active_prefix_bytes helper.
+//
+// The 272-byte memcmp covers 16 implicit padding bytes within the
+// active prefix: the 4-byte interior count→slots pad at offsets 4–7,
+// plus the 4-byte trailing pad inside each of the 3 active
+// notifier_slot entries. valid_notifier_state's notifier_state{}
+// zero-init makes the comparison deterministic on the source side.
+// ============================================================================
+TEST(ShimCoreSend, PublishesNotifierStateAsTickBoundaryWithActivePrefixWireBytes) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<notifier_slot, 3> slots{
+      valid_notifier_slot(/*trigger_time_us=*/1'000'000, /*handle=*/10,
+                          /*alarm_active=*/1, /*canceled=*/0,
+                          /*name=*/"alpha"),
+      valid_notifier_slot(2'000'000, 20, 0, 1, "beta"),
+      valid_notifier_slot(3'000'000, 30, 1, 1, "gamma")};
+  const auto state = valid_notifier_state(slots);
+
+  auto sent = shim.send_notifier_state(state, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::notifier_state);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 272u);  // 8 + 3*88.
+  ASSERT_EQ(msg.payload.size(), 272u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &state, 272), 0);
+}
+
+// ============================================================================
+// Test C10-1b: an empty (count=0) notifier_state batch is a legal
+// publish; the active prefix is the 8-byte header (count word + the
+// 4-byte interior pad to satisfy alignof(notifier_slot) == 8). Pins
+// D-C10-EMPTY-BATCH-OUT-INHERITS and the count=0 boundary of the
+// active-prefix discipline. The 8-byte memcmp covers the count word
+// AND the interior pad, both byte-zero from the notifier_state{}
+// zero-init in valid_notifier_state.
+// ============================================================================
+TEST(ShimCoreSend, PublishesEmptyNotifierStateAsHeaderOnlyTickBoundary) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto empty_state = valid_notifier_state();
+
+  auto sent = shim.send_notifier_state(empty_state, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::notifier_state);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 8u);  // header-only.
+  ASSERT_EQ(msg.payload.size(), 8u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &empty_state, 8), 0);
+}
+
+// ============================================================================
+// Test C10-2: a second send_notifier_state call advances the outbound
+// sequence counter to 2. Different counts (2 then 4) catch a "sequence
+// advances by slot count" bug, AND verify the extracted helper produces
+// the right size for both counts (184 = 8+2*88; 360 = 8+4*88).
+// ============================================================================
+TEST(ShimCoreSend, SecondNotifierStateSendAdvancesOutboundSequenceToTwo) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<notifier_slot, 2> first_slots{
+      valid_notifier_slot(100, 11, 1, 0, "first0"),
+      valid_notifier_slot(200, 22, 0, 1, "first1")};
+  const auto first = valid_notifier_state(first_slots);
+
+  ASSERT_TRUE(shim.send_notifier_state(first, /*sim_time_us=*/100'000).has_value());
+  const auto first_msg = receive_from_shim(core);
+  EXPECT_EQ(first_msg.envelope.sequence, 1u);
+  EXPECT_EQ(first_msg.envelope.payload_bytes, 184u);  // 8 + 2*88.
+  ASSERT_EQ(first_msg.payload.size(), 184u);
+  EXPECT_EQ(std::memcmp(first_msg.payload.data(), &first, 184), 0);
+
+  const std::array<notifier_slot, 4> second_slots{
+      valid_notifier_slot(300, 33, 1, 1, "second0"),
+      valid_notifier_slot(400, 44, 0, 0, "second1"),
+      valid_notifier_slot(500, 55, 1, 0, "second2"),
+      valid_notifier_slot(600, 66, 0, 1, "second3")};
+  const auto second = valid_notifier_state(second_slots);
+
+  ASSERT_TRUE(shim.send_notifier_state(second, /*sim_time_us=*/200'000).has_value());
+  const auto second_msg = receive_from_shim(core);
+  EXPECT_EQ(second_msg.envelope.sequence, 2u);
+  EXPECT_EQ(second_msg.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(second_msg.envelope.payload_bytes, 360u);  // 8 + 4*88.
+  ASSERT_EQ(second_msg.payload.size(), 360u);
+  EXPECT_EQ(std::memcmp(second_msg.payload.data(), &second, 360), 0);
+}
+
+// ============================================================================
+// Test C10-3: lane_busy on send_notifier_state is rejected with the
+// underlying transport diagnostic preserved, AND the outbound sequence
+// counter is NOT consumed. Pins D-C10-SEQUENCE-ADVANCE-INHERITS
+// negative arm + D-C10-WRAPPED-SEND-ERROR-INHERITS for the new method.
+// ============================================================================
+TEST(ShimCoreSend, LaneBusyNotifierStateSendIsRejectedAndPreservesSequenceCounter) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  std::array<std::uint8_t, sizeof(boot_descriptor)> boot_bytes_before{};
+  std::memcpy(boot_bytes_before.data(), region.backend_to_core.payload.data(),
+              sizeof(boot_descriptor));
+  const auto boot_envelope_before = region.backend_to_core.envelope;
+
+  const std::array<notifier_slot, 1> slots{
+      valid_notifier_slot(1'000'000, 10, 1, 0, "alpha")};
+  const auto state = valid_notifier_state(slots);
+
+  auto first_attempt = shim_or->send_notifier_state(state, /*sim_time_us=*/100'000);
+  ASSERT_FALSE(first_attempt.has_value());
+  EXPECT_EQ(first_attempt.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(first_attempt.error().transport_error.has_value());
+  EXPECT_EQ(first_attempt.error().transport_error->kind,
+            tier1_transport_error_kind::lane_busy);
+  EXPECT_EQ(first_attempt.error().offending_field_name, "lane");
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region.backend_to_core.envelope, boot_envelope_before);
+  EXPECT_EQ(std::memcmp(region.backend_to_core.payload.data(),
+                        boot_bytes_before.data(), sizeof(boot_descriptor)),
+            0);
+
+  // Recovery proof: drain boot, resend, assert sequence == 1.
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto boot_drained = core.try_receive();
+  ASSERT_TRUE(boot_drained.has_value());
+
+  ASSERT_TRUE(shim_or->send_notifier_state(state, 100'000).has_value());
+  const auto recovery_msg = receive_from_shim(core);
+  EXPECT_EQ(recovery_msg.envelope.sequence, 1u);
+}
+
+// ============================================================================
+// Test C10-5: post-shutdown send_notifier_state is rejected with
+// shutdown_already_observed and does NOT call endpoint_.send. Pins
+// D-C10-SHUTDOWN-TERMINAL-INHERITS — the one D-C9-derived contract
+// that needs per-method verification because each typed send_*
+// method carries its own short-circuit code. An "implementer added
+// the new method but forgot the short-circuit" bug is a real risk
+// per-method.
+// ============================================================================
+TEST(ShimCoreSend, PostShutdownNotifierStateSendIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const std::array<notifier_slot, 1> slots{
+      valid_notifier_slot(1'000'000, 10, 1, 0, "alpha")};
+  const auto state = valid_notifier_state(slots);
+
+  auto sent = shim.send_notifier_state(state, /*sim_time_us=*/250'000);
+  ASSERT_FALSE(sent.has_value());
+  EXPECT_EQ(sent.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_FALSE(sent.error().transport_error.has_value());
+  EXPECT_EQ(sent.error().offending_field_name, "kind");
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// ============================================================================
+// Test C10-7: two independent setups running the same outbound
+// notifier_state scenario produce byte-identical published wire bytes.
+// Outbound determinism for the schema with the most demanding padding
+// profile (132 implicit pad bytes total; 4 + 4*count within the
+// active prefix). The std::memcmp companion is load-bearing in a way
+// C9-7's was not: notifier_state has the 4-byte interior count→slots
+// pad that can_frame_batch lacks, so a "shim reads from a source
+// that wasn't zero-initialized" bug would leak uninit stack bytes
+// into offsets 4–7 and diverge between two runs.
+// ============================================================================
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundNotifierState) {
+  const std::array<notifier_slot, 3> first_slots{
+      valid_notifier_slot(1'000'000, 10, 1, 0, "alpha"),
+      valid_notifier_slot(2'000'000, 20, 0, 1, "beta"),
+      valid_notifier_slot(3'000'000, 30, 1, 1, "gamma")};
+  const auto first_state = valid_notifier_state(first_slots);
+  const std::array<notifier_slot, 1> second_slots{
+      valid_notifier_slot(4'000'000, 40, 1, 1, "delta")};
+  const auto second_state = valid_notifier_state(second_slots);
+
+  const auto run_setup = [&](tier1_shared_region& region,
+                             tier1_endpoint& core,
+                             tier1::tier1_message& out_first,
+                             tier1::tier1_message& out_second) {
+    core = make_core(region);
+    auto endpoint = make_backend(region);
+    auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), 0);
+    ASSERT_TRUE(shim_or.has_value());
+    auto boot = core.try_receive();
+    ASSERT_TRUE(boot.has_value());
+    ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, 0));
+    ASSERT_TRUE(shim_or->poll().has_value());
+    ASSERT_TRUE(shim_or->is_connected());
+
+    ASSERT_TRUE(shim_or->send_notifier_state(first_state, 250'000).has_value());
+    auto first = core.try_receive();
+    ASSERT_TRUE(first.has_value());
+    out_first = std::move(*first);
+
+    ASSERT_TRUE(shim_or->send_notifier_state(second_state, 500'000).has_value());
+    auto second = core.try_receive();
+    ASSERT_TRUE(second.has_value());
+    out_second = std::move(*second);
+  };
+
+  tier1_shared_region region_a{};
+  tier1_shared_region region_b{};
+  tier1_endpoint core_a{tier1_endpoint::make(region_a, direction::core_to_backend).value()};
+  tier1_endpoint core_b{tier1_endpoint::make(region_b, direction::core_to_backend).value()};
+  tier1::tier1_message first_a, second_a;
+  tier1::tier1_message first_b, second_b;
+  run_setup(region_a, core_a, first_a, second_a);
+  run_setup(region_b, core_b, first_b, second_b);
+
+  EXPECT_EQ(first_a.envelope, first_b.envelope);
+  EXPECT_EQ(first_a.payload, first_b.payload);
+  ASSERT_EQ(first_a.payload.size(), first_b.payload.size());
+  EXPECT_EQ(std::memcmp(first_a.payload.data(),
+                        first_b.payload.data(),
+                        first_a.payload.size()),
+            0);
+
+  EXPECT_EQ(second_a.envelope, second_b.envelope);
+  EXPECT_EQ(second_a.payload, second_b.payload);
+  ASSERT_EQ(second_a.payload.size(), second_b.payload.size());
+  EXPECT_EQ(std::memcmp(second_a.payload.data(),
+                        second_b.payload.data(),
+                        second_a.payload.size()),
+            0);
+}
+
+// ============================================================================
+// Cycle 11 — outbound error_message_batch (`send_error_message_batch`).
+// Third and final outbound-meaningful schema; closes the v0 outbound
+// surface set. See TEST_PLAN_CYCLE11.md.
+// ============================================================================
+
+// ============================================================================
+// Test C11-1: send_error_message_batch publishes a tick_boundary
+// envelope carrying exactly the active prefix (8 + 3*2324 = 6980 bytes
+// for a 3-message batch). Pins D-C9-ACTIVE-PREFIX-OUT for the third
+// outbound schema and verifies the new production active_prefix_bytes
+// helper in error_message.h.
+//
+// Per D-C8-PADDING-FREE the schema has zero implicit C++ padding —
+// both reserved_pad fields are NAMED — so the 6980-byte memcmp is
+// byte-equivalent to defaulted operator==. Kept memcmp-shaped for
+// parity with C9-1 / C10-1.
+// ============================================================================
+TEST(ShimCoreSend, PublishesErrorMessageBatchAsTickBoundaryWithActivePrefixWireBytes) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<error_message, 3> messages{
+      valid_error_message(/*error_code=*/100, /*severity=*/1,
+                          /*is_lv_code=*/0, /*print_msg=*/1,
+                          /*truncation_flags=*/0,
+                          "first detail", "first location",
+                          "first call stack"),
+      valid_error_message(200, 0, 1, 0, kErrorTruncDetails,
+                          "second detail", "second location",
+                          "second call stack"),
+      valid_error_message(300, 1, 0, 1,
+                          kErrorTruncLocation | kErrorTruncCallStack,
+                          "third detail", "third location",
+                          "third call stack")};
+  const auto batch = valid_error_message_batch(messages);
+
+  auto sent = shim.send_error_message_batch(batch, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::error_message_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 6980u);  // 8 + 3*2324.
+  ASSERT_EQ(msg.payload.size(), 6980u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &batch, 6980), 0);
+}
+
+// ============================================================================
+// Test C11-1b: an empty (count=0) error_message_batch is a legal
+// publish; the active prefix is the 8-byte header (count word + the
+// NAMED reserved_pad[4]). The 8-byte memcmp covers both, byte-zero
+// from valid_error_message_batch's zero-init.
+// ============================================================================
+TEST(ShimCoreSend, PublishesEmptyErrorMessageBatchAsHeaderOnlyTickBoundary) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto empty_batch = valid_error_message_batch();
+
+  auto sent = shim.send_error_message_batch(empty_batch, /*sim_time_us=*/250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::error_message_batch);
+  EXPECT_EQ(msg.envelope.sender, direction::backend_to_core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, 8u);  // header-only.
+  ASSERT_EQ(msg.payload.size(), 8u);
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &empty_batch, 8), 0);
+}
+
+// ============================================================================
+// Test C11-2: a second send advances the outbound sequence counter to
+// 2. Different counts (2 then 4) catch a "sequence advances by message
+// count" bug AND verify the helper produces the right size for both.
+// ============================================================================
+TEST(ShimCoreSend, SecondErrorMessageBatchSendAdvancesOutboundSequenceToTwo) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array<error_message, 2> first_messages{
+      valid_error_message(10, 1, 0, 1, 0,
+                          "alpha details", "alpha location", "alpha stack"),
+      valid_error_message(20, 0, 1, 0, kErrorTruncDetails,
+                          "beta details", "beta location", "beta stack")};
+  const auto first = valid_error_message_batch(first_messages);
+
+  ASSERT_TRUE(shim.send_error_message_batch(first, /*sim_time_us=*/100'000).has_value());
+  const auto first_msg = receive_from_shim(core);
+  EXPECT_EQ(first_msg.envelope.sequence, 1u);
+  EXPECT_EQ(first_msg.envelope.payload_bytes, 4656u);  // 8 + 2*2324.
+  ASSERT_EQ(first_msg.payload.size(), 4656u);
+  EXPECT_EQ(std::memcmp(first_msg.payload.data(), &first, 4656), 0);
+
+  const std::array<error_message, 4> second_messages{
+      valid_error_message(50, 1, 1, 1, kErrorTruncLocation,
+                          "delta details", "delta location", "delta stack"),
+      valid_error_message(60, 0, 0, 0,
+                          kErrorTruncDetails | kErrorTruncCallStack,
+                          "epsilon details", "epsilon location", "epsilon stack"),
+      valid_error_message(70, 1, 0, 1, kErrorTruncCallStack,
+                          "zeta details", "zeta location", "zeta stack"),
+      valid_error_message(80, 0, 1, 1, 0,
+                          "eta details", "eta location", "eta stack")};
+  const auto second = valid_error_message_batch(second_messages);
+
+  ASSERT_TRUE(shim.send_error_message_batch(second, /*sim_time_us=*/200'000).has_value());
+  const auto second_msg = receive_from_shim(core);
+  EXPECT_EQ(second_msg.envelope.sequence, 2u);
+  EXPECT_EQ(second_msg.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(second_msg.envelope.payload_bytes, 9304u);  // 8 + 4*2324.
+  ASSERT_EQ(second_msg.payload.size(), 9304u);
+  EXPECT_EQ(std::memcmp(second_msg.payload.data(), &second, 9304), 0);
+}
+
+// ============================================================================
+// Test C11-3: lane_busy on send is rejected; sequence counter not
+// consumed. Recovery proof: drain boot, resend, sequence == 1.
+// ============================================================================
+TEST(ShimCoreSend, LaneBusyErrorMessageBatchSendIsRejectedAndPreservesSequenceCounter) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  std::array<std::uint8_t, sizeof(boot_descriptor)> boot_bytes_before{};
+  std::memcpy(boot_bytes_before.data(), region.backend_to_core.payload.data(),
+              sizeof(boot_descriptor));
+  const auto boot_envelope_before = region.backend_to_core.envelope;
+
+  const std::array<error_message, 1> messages{
+      valid_error_message(100, 1, 0, 1, 0, "detail", "location", "stack")};
+  const auto batch = valid_error_message_batch(messages);
+
+  auto first_attempt = shim_or->send_error_message_batch(batch, /*sim_time_us=*/100'000);
+  ASSERT_FALSE(first_attempt.has_value());
+  EXPECT_EQ(first_attempt.error().kind, shim_error_kind::send_failed);
+  ASSERT_TRUE(first_attempt.error().transport_error.has_value());
+  EXPECT_EQ(first_attempt.error().transport_error->kind,
+            tier1_transport_error_kind::lane_busy);
+  EXPECT_EQ(first_attempt.error().offending_field_name, "lane");
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region.backend_to_core.envelope, boot_envelope_before);
+  EXPECT_EQ(std::memcmp(region.backend_to_core.payload.data(),
+                        boot_bytes_before.data(), sizeof(boot_descriptor)),
+            0);
+
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto boot_drained = core.try_receive();
+  ASSERT_TRUE(boot_drained.has_value());
+
+  ASSERT_TRUE(shim_or->send_error_message_batch(batch, 100'000).has_value());
+  const auto recovery_msg = receive_from_shim(core);
+  EXPECT_EQ(recovery_msg.envelope.sequence, 1u);
+}
+
+// ============================================================================
+// Test C11-5: post-shutdown send_error_message_batch is rejected with
+// shutdown_already_observed; transport_error nullopt proves
+// endpoint_.send was NOT called. Per-method verification per
+// D-C10-SHUTDOWN-TERMINAL-INHERITS — each typed send_* method carries
+// its own short-circuit code.
+// ============================================================================
+TEST(ShimCoreSend, PostShutdownErrorMessageBatchSendIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const std::array<error_message, 1> messages{
+      valid_error_message(100, 1, 0, 1, 0, "detail", "location", "stack")};
+  const auto batch = valid_error_message_batch(messages);
+
+  auto sent = shim.send_error_message_batch(batch, /*sim_time_us=*/250'000);
+  ASSERT_FALSE(sent.has_value());
+  EXPECT_EQ(sent.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_FALSE(sent.error().transport_error.has_value());
+  EXPECT_EQ(sent.error().offending_field_name, "kind");
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// ============================================================================
+// Test C11-7: two independent setups produce byte-identical wire
+// output. Determinism guarantee for the third (and final) outbound
+// schema. Per D-C8-PADDING-FREE the memcmp companion is byte-
+// equivalent to vector::operator==; kept for cross-cycle parity with
+// C9-7 / C10-7.
+// ============================================================================
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundErrorMessageBatch) {
+  const std::array<error_message, 3> first_messages{
+      valid_error_message(100, 1, 0, 1, 0,
+                          "first detail", "first location", "first call stack"),
+      valid_error_message(200, 0, 1, 0, kErrorTruncDetails,
+                          "second detail", "second location", "second call stack"),
+      valid_error_message(300, 1, 0, 1,
+                          kErrorTruncLocation | kErrorTruncCallStack,
+                          "third detail", "third location", "third call stack")};
+  const auto first_batch = valid_error_message_batch(first_messages);
+  const std::array<error_message, 1> second_messages{
+      valid_error_message(400, 0, 1, 1,
+                          kErrorTruncDetails | kErrorTruncLocation |
+                              kErrorTruncCallStack,
+                          "delta detail", "delta location", "delta call stack")};
+  const auto second_batch = valid_error_message_batch(second_messages);
+
+  const auto run_setup = [&](tier1_shared_region& region,
+                             tier1_endpoint& core,
+                             tier1::tier1_message& out_first,
+                             tier1::tier1_message& out_second) {
+    core = make_core(region);
+    auto endpoint = make_backend(region);
+    auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), 0);
+    ASSERT_TRUE(shim_or.has_value());
+    auto boot = core.try_receive();
+    ASSERT_TRUE(boot.has_value());
+    ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, 0));
+    ASSERT_TRUE(shim_or->poll().has_value());
+    ASSERT_TRUE(shim_or->is_connected());
+
+    ASSERT_TRUE(shim_or->send_error_message_batch(first_batch, 250'000).has_value());
+    auto first = core.try_receive();
+    ASSERT_TRUE(first.has_value());
+    out_first = std::move(*first);
+
+    ASSERT_TRUE(shim_or->send_error_message_batch(second_batch, 500'000).has_value());
+    auto second = core.try_receive();
+    ASSERT_TRUE(second.has_value());
+    out_second = std::move(*second);
+  };
+
+  tier1_shared_region region_a{};
+  tier1_shared_region region_b{};
+  tier1_endpoint core_a{tier1_endpoint::make(region_a, direction::core_to_backend).value()};
+  tier1_endpoint core_b{tier1_endpoint::make(region_b, direction::core_to_backend).value()};
+  tier1::tier1_message first_a, second_a;
+  tier1::tier1_message first_b, second_b;
+  run_setup(region_a, core_a, first_a, second_a);
+  run_setup(region_b, core_b, first_b, second_b);
+
+  EXPECT_EQ(first_a.envelope, first_b.envelope);
+  EXPECT_EQ(first_a.payload, first_b.payload);
+  ASSERT_EQ(first_a.payload.size(), first_b.payload.size());
+  EXPECT_EQ(std::memcmp(first_a.payload.data(),
+                        first_b.payload.data(),
+                        first_a.payload.size()),
+            0);
+
+  EXPECT_EQ(second_a.envelope, second_b.envelope);
+  EXPECT_EQ(second_a.payload, second_b.payload);
+  ASSERT_EQ(second_a.payload.size(), second_b.payload.size());
+  EXPECT_EQ(std::memcmp(second_a.payload.data(),
+                        second_b.payload.data(),
+                        second_a.payload.size()),
+            0);
 }
 
 }  // namespace robosim::backend::shim

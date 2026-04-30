@@ -235,8 +235,8 @@ move-only fd/mapping RAII. Blocking waits, cross-process stress,
 named shared-memory discovery, and reset/reconnect behavior remain
 future cycles.
 
-The **HAL shim core (cycles 1–8)** is implemented and 91-test
-green; full project ctest 406/406 green under both clang Debug
+The **HAL shim core (cycles 1–11)** is implemented and 113-test
+green; full project ctest 428/428 green under both clang Debug
 and gcc Debug + ASan + UBSan. See `.claude/skills/hal-shim.md`
 for the working knowledge: boot publish on construction,
 single-threaded `poll()`-driven inbound drain, dispatch by
@@ -249,34 +249,67 @@ schemas wired** as independent latest-wins state-cache slots
 variable-size active-prefix memcpy with zero-init-before-write
 for the four variable-size schemas (`can_frame_batch`,
 `notifier_state`, `notifier_alarm_batch`,
-`error_message_batch`), terminal post-shutdown short-circuit,
-direct `std::memcmp` padding-byte determinism on the four
-padding-bearing schemas (`ds_state`, `can_frame_batch`,
-`notifier_state`, `notifier_alarm_batch` — `error_message_batch`
-is padding-free per D-C8-PADDING-FREE because both its
-`reserved_pad` fields are named), and a defensively-retained
+`error_message_batch`), terminal post-shutdown short-circuit
+on both `poll()` and outbound send paths, direct `std::memcmp`
+padding-byte determinism on the four padding-bearing schemas
+(`ds_state`, `can_frame_batch`, `notifier_state`,
+`notifier_alarm_batch` — `error_message_batch` is padding-free
+per D-C8-PADDING-FREE because both its `reserved_pad` fields
+are named), and a defensively-retained
 `unsupported_payload_schema` reject branch (D-C8-DEAD-BRANCH)
 that becomes unreachable from valid traffic at cycle 8 but
-remains a forward-compat structural guard. The shim's surface
-is a C++ API; the C HAL ABI (`HAL_GetFPGATime`,
-`HAL_GetVinVoltage`, `HAL_GetControlWord`,
-`HAL_CAN_ReadStreamSession`, `HAL_CAN_GetCANStatus`,
-`HAL_Initialize`, `HAL_Notifier*`, `HAL_SendError`, etc.), CAN
-RX queueing semantics (deferred per D-C4-LATEST-WINS), all
-outbound traffic past `boot`, on-demand request/reply, and
-threading remain future cycles.
+remains a forward-compat structural guard. **Cycle 9 added the
+first outbound-past-boot surface: `send_can_frame_batch` publishes
+a `can_frame_batch` payload as a `tick_boundary` envelope into
+`backend_to_core`. Cycle 10 added the second outbound-meaningful
+schema: `send_notifier_state` publishes `notifier_state` (with
+the 8-byte header offset, vs cycle 9's 4-byte) and cashed in
+cycle 9's deferred D-C9-NO-HELPER trigger by extracting
+`active_prefix_bytes` overloads into the schema headers
+(`can_frame.h`, `notifier_state.h`) per D-C10-EXTRACT-ACTIVE-
+PREFIX. Both outbound methods now call the production
+`backend::active_prefix_bytes` helpers; the duplicated test-side
+overloads in `test_helpers.h` were deleted and tests resolve via
+ADL. Typed-per-schema API per D-C9-TYPED-OUTBOUND makes wrong-
+direction publishing of sim-authoritative schemas impossible at
+the API boundary. Outbound does not gate on `is_connected()`
+(D-C9-NO-CONNECT-GATE). Outbound determinism verified for all
+three schemas. Cycle 10 also formalized the per-method-test
+trim convention (D-C10-{INBOUND-INDEPENDENCE / NO-CONNECT-GATE
+/ RECEIVE-COUNTER-INDEPENDENCE}-INHERITS): cycle-9's cross-
+cutting contracts are session/transport-level and don't need
+re-verification per outbound schema; only the shutdown short-
+circuit needs per-method coverage. Cycle 11 added the third
+(and final v0) outbound schema `send_error_message_batch`,
+extended D-C10-EXTRACT-ACTIVE-PREFIX to add the third
+production helper to `error_message.h`, and added the
+recommended `static_assert(offsetof(error_message_batch,
+messages) == 8)` for the named-reserved_pad header layout.
+With cycle 11, the v0 outbound surface is closed for the
+three semantically-meaningful schemas; the five sim-
+authoritative schemas remain intentionally absent per
+D-C9-TYPED-OUTBOUND.** The shim's surface is a C++ API; the
+C HAL ABI (`HAL_GetFPGATime`, `HAL_GetVinVoltage`,
+`HAL_GetControlWord`, `HAL_CAN_ReadStreamSession`,
+`HAL_CAN_GetCANStatus`, `HAL_Initialize`, `HAL_Notifier*`,
+`HAL_SendError`, `HAL_CAN_SendMessage`, etc.), CAN RX queueing
+semantics (deferred per D-C4-LATEST-WINS), on-demand
+request/reply, shim-initiated `shutdown`, and threading remain
+future cycles.
 
 Still ahead, each its own TDD cycle:
-- Outbound traffic past `boot` — shim-side `tick_boundary`
-  (notifier registrations, CAN TX, error reporting) and
-  shim-initiated `shutdown`.
+- Shim-initiated `shutdown` envelope (the outbound mirror of
+  the inbound shutdown that cycle 1 pinned on the receive
+  path).
 - On-demand request/reply (`on_demand_request` from shim,
   `on_demand_reply` from sim core), driving the
   protocol_session's pairing surface.
 - Exported C HAL ABI surfaces — the largest remaining shim
   chunk; promotes `latest_can_frame_batch_` from latest-wins
   to a queue when `HAL_CAN_ReadStreamSession` lands
-  (D-C4-LATEST-WINS deferral cashes in here).
+  (D-C4-LATEST-WINS deferral cashes in here). The
+  `HAL_CAN_SendMessage` cycle owns the per-frame-batching and
+  per-tick-flush discipline that drives `send_can_frame_batch`.
 - Threading model — single-threaded today, but the C HAL
   surface is callable from any robot thread.
 - Transport lifecycle: T1 waits/reset/named discovery and T2
@@ -305,10 +338,18 @@ Still ahead, each its own TDD cycle:
   `notifier_alarm_batch`, `error_message_batch`), dispatch by
   `(envelope_kind, schema_id)`, variable-size active-prefix
   memcpy with zero-init-before-write for the four variable-size
-  schemas, padding-byte determinism. Cycles 1–8 landed (the
-  per-tick payload set is closed); next major work is outbound
-  traffic past `boot`, on-demand request/reply, and the C HAL
-  ABI surfaces.
+  schemas, padding-byte determinism, **plus all three outbound-meaningful surfaces
+  `send_can_frame_batch` (cycle 9), `send_notifier_state`
+  (cycle 10), and `send_error_message_batch` (cycle 11) —
+  typed-per-schema API per D-C9-TYPED-OUTBOUND, production
+  active-prefix helpers in the schema headers per
+  D-C10-EXTRACT-ACTIVE-PREFIX, symmetric shutdown short-
+  circuit per D-C9-SHUTDOWN-TERMINAL (verified per-method per
+  D-C10-SHUTDOWN-TERMINAL-INHERITS), no connect-gate per
+  D-C9-NO-CONNECT-GATE; the v0 outbound surface is closed**.
+  Cycles 1–11 landed; next major work is shim-initiated
+  `shutdown`, on-demand request/reply, and the C HAL ABI
+  surfaces.
 - `robot-description-loader.md` — what we read to enumerate CAN IDs
   and pin firmware versions.
 - `docs/ARCHITECTURE.md` — process model, HAL boundary protocol,

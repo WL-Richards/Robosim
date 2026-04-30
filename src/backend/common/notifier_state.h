@@ -3,7 +3,9 @@
 #include "types.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace robosim::backend {
@@ -47,6 +49,19 @@ struct notifier_state {
 
 static_assert(std::is_trivially_copyable_v<notifier_state>);
 static_assert(std::is_standard_layout_v<notifier_state>);
+
+// Active-prefix wire bytes: 8-byte header (count word + 4-byte
+// interior pad to align slots[] at offset 8 per
+// alignof(notifier_slot) == 8) + count*element bytes. NOT
+// sizeof(notifier_state). The 8-byte header is the load-bearing
+// difference from can_frame_batch's 4-byte header.
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const notifier_state& state) {
+  const std::size_t active_size =
+      offsetof(notifier_state, slots) +
+      static_cast<std::size_t>(state.count) * sizeof(notifier_slot);
+  return {reinterpret_cast<const std::uint8_t*>(&state), active_size};
+}
 
 // Fired alarm event. Layout pinned per K3:
 //   fired_at_us  at 0  (8 bytes)

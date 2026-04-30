@@ -107,15 +107,102 @@ Debug and GCC Debug + ASan + UBSan; see `.claude/skills/hal-shim.md`,
 `tests/backend/shim/TEST_PLAN_CYCLE6.md`,
 `tests/backend/shim/TEST_PLAN_CYCLE7.md`, and
 `tests/backend/shim/TEST_PLAN_CYCLE8.md`. The per-tick payload
-schema set is now closed; the next major shim work is outbound
-traffic past `boot`, the exported C HAL ABI surfaces (`HAL_*`
-symbols), and threading. CAN RX queueing semantics are deferred
+schema set is now closed on the inbound side; cycle 9 (below)
+opened the outbound side. CAN RX queueing semantics are deferred
 per D-C4-LATEST-WINS until the cycle that wires
-`HAL_CAN_ReadStreamSession`. The remaining HAL shim work
-(outbound traffic, C HAL ABI, threading), T1
-wait/reset/named-discovery work, T2 socket transport, and
-LD_PRELOAD libc shim each remain as future TDD cycles. Layer
-3/4/5 work has not started.
+`HAL_CAN_ReadStreamSession`. T1 wait/reset/named-discovery
+work, T2 socket transport, and LD_PRELOAD libc shim each
+remain as future TDD cycles. Layer 3/4/5 work has not started.
+
+Cycle 9 added the **first outbound-past-boot** surface,
+promoting the shim from "send-only-once-at-construction" to a
+working duplex: `send_can_frame_batch(const can_frame_batch&,
+uint64_t sim_time_us)` publishes a `can_frame_batch` payload as
+a `tick_boundary` envelope into `backend_to_core`. The
+implementation inlines the active-prefix size computation
+(`offsetof(can_frame_batch, frames) + batch.count *
+sizeof(can_frame)`) per D-C9-NO-HELPER — outbound mirror of the
+inbound D-C4-VARIABLE-SIZE active-prefix discipline. The same
+shutdown-terminal short-circuit as `poll()` applies on the
+outbound path (D-C9-SHUTDOWN-TERMINAL). The shim's outbound
+API uses typed-per-schema methods (D-C9-TYPED-OUTBOUND), so the
+five sim-authoritative schemas (`clock_state`, `power_state`,
+`ds_state`, `can_status`, `notifier_alarm_batch`) are
+intentionally absent from the outbound surface — wrong-direction
+publishing is impossible at the API boundary. Outbound does not
+gate on `is_connected()` (D-C9-NO-CONNECT-GATE), matching the
+protocol's bidirectional-handshake-overlap allowance. The
+shared `wrap_send_error` lambda was generalized from "transport
+rejected outbound boot envelope" to "transport rejected outbound
+envelope" so it serves both call sites (D-C9-WRAPPED-SEND-ERROR).
+Cycle 9 added 10 new tests (the new `ShimCoreSend` suite plus
+`ShimCoreDeterminism.RepeatedRunsProduceByteIdentical`
+`OutboundCanFrameBatch`); the suite now covered 101 shim tests
+green (full project ctest 416/416) under both clang Debug and
+GCC Debug + ASan + UBSan. See `.claude/skills/hal-shim.md` and
+`tests/backend/shim/TEST_PLAN_CYCLE9.md`.
+
+Cycle 10 added the **second outbound-meaningful schema**:
+`send_notifier_state(const notifier_state&, uint64_t sim_time_us)`
+publishes `notifier_state` as a `tick_boundary` envelope into
+`backend_to_core`. The schema's 8-byte header offset (vs cycle
+9's 4-byte) and 132 implicit padding bytes (the most demanding
+of any outbound v0 schema) made it the natural follow-on. Cycle
+10 also **cashed in cycle 9's deferred D-C9-NO-HELPER trigger**
+by extracting `active_prefix_bytes` overloads into the schema
+headers (`src/backend/common/can_frame.h` for `can_frame_batch`
+and `src/backend/common/notifier_state.h` for `notifier_state`)
+per D-C10-EXTRACT-ACTIVE-PREFIX. Both `send_can_frame_batch`
+(refactored) and `send_notifier_state` (new) call the production
+helpers; the duplicated test-side overloads in
+`tests/backend/tier1/test_helpers.h` for those two schemas were
+deleted, and tests resolve to the production version via ADL.
+Cycle 10 also formalized the per-method-test trim convention
+(D-C10-{INBOUND-INDEPENDENCE / NO-CONNECT-GATE / RECEIVE-COUNTER-
+INDEPENDENCE}-INHERITS): the test-reviewer explicitly endorsed
+that cycle-9's cross-cutting contracts are session/transport-
+level and don't need re-verification per outbound schema; only
+the shutdown short-circuit needs per-method coverage
+(D-C10-SHUTDOWN-TERMINAL-INHERITS, pinned by C10-5). Cycle 10
+landed 6 new tests (5 in `ShimCoreSend` plus
+`ShimCoreDeterminism.RepeatedRunsProduceByteIdenticalOutbound`
+`NotifierState`); the suite covered 107 shim tests green
+(full project ctest 422/422) under both clang Debug and GCC
+Debug + ASan + UBSan. See `.claude/skills/hal-shim.md` and
+`tests/backend/shim/TEST_PLAN_CYCLE10.md`.
+
+Cycle 11 added the **third (and final v0) outbound-meaningful
+schema**: `send_error_message_batch(const error_message_batch&,
+uint64_t sim_time_us)` publishes `error_message_batch` as a
+`tick_boundary` envelope into `backend_to_core`. Cycle 11
+extended D-C10-EXTRACT-ACTIVE-PREFIX by adding the third
+production `active_prefix_bytes` overload to
+`src/backend/common/error_message.h` plus a recommended
+`static_assert(offsetof(error_message_batch, messages) == 8)`
+that pins the named-`reserved_pad[4]`-derived header layout.
+The schema is the only outbound v0 schema with **zero implicit
+C++ padding** (D-C8-PADDING-FREE inherited from cycle 8 — both
+`reserved_pad` fields are NAMED), so cycle 11's memcmp
+companions are byte-equivalent to `vector::operator==` but
+kept for cross-cycle structural parity per the test-reviewer's
+OQ-C11-MEMCMP-IN-DETERMINISM resolution. Cycle 11 introduces
+**no new design decisions** — every contract inherits from
+cycles 9 and 10, and the per-method-test trim convention
+applies unchanged. With cycle 11, the **v0 outbound surface is
+closed** for the three semantically-meaningful outbound
+schemas; the five sim-authoritative schemas remain
+intentionally absent per D-C9-TYPED-OUTBOUND. Cycle 11 landed
+6 new tests (5 in `ShimCoreSend` plus
+`ShimCoreDeterminism.RepeatedRunsProduceByteIdenticalOutbound`
+`ErrorMessageBatch`); the suite now covers 113 shim tests green
+(full project ctest 428/428) under both clang Debug and GCC
+Debug + ASan + UBSan. See `.claude/skills/hal-shim.md` and
+`tests/backend/shim/TEST_PLAN_CYCLE11.md`. The next major shim
+work is shim-initiated `shutdown`, on-demand request/reply, and
+the C HAL ABI surfaces (`HAL_GetFPGATime`, `HAL_CAN_SendMessage`,
+`HAL_SendError`, `HAL_Notifier*`, etc.) — the largest remaining
+chunk and the cycle that promotes `latest_can_frame_batch_`
+from latest-wins to a queue per D-C4-LATEST-WINS.
 
 In parallel, the visualizer subsystem (`src/viz/`,
 `ROBOSIM_BUILD_VIZ=ON` opt-in) has Phase VA scaffold + Phase VB

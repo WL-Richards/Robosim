@@ -52,6 +52,36 @@ class shim_core {
 
   [[nodiscard]] std::expected<void, shim_error> poll();
 
+  // Publishes `batch` as a tick_boundary envelope into the shim's
+  // outbound backend_to_core lane. Sends exactly the active prefix
+  // (offsetof(can_frame_batch, frames) + batch.count * sizeof(can_frame))
+  // — NOT sizeof(can_frame_batch) — so the validator's count-vs-length
+  // contract holds. Returns send_failed wrapping the underlying tier1
+  // transport error if the lane is busy / in-progress, or
+  // shutdown_already_observed once is_shutting_down() is true.
+  [[nodiscard]] std::expected<void, shim_error> send_can_frame_batch(
+      const can_frame_batch& batch, std::uint64_t sim_time_us);
+
+  // Publishes `state` as a tick_boundary envelope into the shim's
+  // outbound backend_to_core lane. Sends exactly the active prefix
+  // (offsetof(notifier_state, slots) + state.count *
+  // sizeof(notifier_slot)) — note the 8-byte header offset (not 4),
+  // because notifier_slot has alignof 8. Same shutdown_already_observed
+  // and send_failed semantics as send_can_frame_batch.
+  [[nodiscard]] std::expected<void, shim_error> send_notifier_state(
+      const notifier_state& state, std::uint64_t sim_time_us);
+
+  // Publishes `batch` as a tick_boundary envelope into the shim's
+  // outbound backend_to_core lane. Sends exactly the active prefix
+  // (offsetof(error_message_batch, messages) + batch.count *
+  // sizeof(error_message)). The 8-byte header offset comes from the
+  // NAMED reserved_pad[4] field (not implicit padding); per
+  // D-C8-PADDING-FREE the schema has zero implicit C++ padding.
+  // Same shutdown_already_observed and send_failed semantics as the
+  // other typed send methods.
+  [[nodiscard]] std::expected<void, shim_error> send_error_message_batch(
+      const error_message_batch& batch, std::uint64_t sim_time_us);
+
   [[nodiscard]] bool is_connected() const;
   [[nodiscard]] bool is_shutting_down() const;
   [[nodiscard]] const std::optional<clock_state>& latest_clock_state() const;

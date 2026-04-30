@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace robosim::backend {
@@ -44,5 +46,18 @@ struct can_frame_batch {
 
 static_assert(std::is_trivially_copyable_v<can_frame_batch>);
 static_assert(std::is_standard_layout_v<can_frame_batch>);
+
+// Active-prefix wire bytes: count word + count*element bytes (NOT
+// sizeof(can_frame_batch)). The shim's outbound send path consumes
+// this; the validator's expected_variable_payload_size mirrors the
+// same arithmetic. Inline here so callers including this header get
+// it without an extra include.
+inline std::span<const std::uint8_t> active_prefix_bytes(
+    const can_frame_batch& batch) {
+  const std::size_t active_size =
+      offsetof(can_frame_batch, frames) +
+      static_cast<std::size_t>(batch.count) * sizeof(can_frame);
+  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
+}
 
 }  // namespace robosim::backend

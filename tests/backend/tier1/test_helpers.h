@@ -147,19 +147,6 @@ inline can_frame_batch valid_can_frame_batch(
   return batch;
 }
 
-// Returns a span over the active prefix of a can_frame_batch — the
-// bytes that the wire payload should carry. The shim's variable-size
-// dispatch arm reads exactly this many bytes (D-C4-VARIABLE-SIZE).
-// Sending bytes_of(batch) instead would deliver 1284 bytes, which the
-// validator rejects on the count-vs-length contract.
-inline std::span<const std::uint8_t> active_prefix_bytes(
-    const can_frame_batch& batch) {
-  const std::size_t active_size =
-      offsetof(can_frame_batch, frames) +
-      static_cast<std::size_t>(batch.count) * sizeof(can_frame);
-  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
-}
-
 // Cycle-5 helper. can_status is fixed-size (20 bytes), no padding —
 // 5 × 4-byte fields all naturally aligned. Defaults: 25% bus
 // utilization, single-digit error counters; bit-distinct from
@@ -210,18 +197,6 @@ inline notifier_state valid_notifier_state(
     state.slots[i] = slots[i];
   }
   return state;
-}
-
-// Returns a span over the active prefix of a notifier_state — the
-// bytes that the wire payload should carry. notifier_state's header
-// is offsetof(notifier_state, slots) == 8 (not 4) because notifier_slot
-// has alignof == 8 from its uint64_t trigger_time_us field.
-inline std::span<const std::uint8_t> active_prefix_bytes(
-    const notifier_state& state) {
-  const std::size_t active_size =
-      offsetof(notifier_state, slots) +
-      static_cast<std::size_t>(state.count) * sizeof(notifier_slot);
-  return {reinterpret_cast<const std::uint8_t*>(&state), active_size};
 }
 
 // Cycle-7 helpers. notifier_alarm_event has a NAMED reserved_pad field
@@ -300,14 +275,6 @@ inline error_message_batch valid_error_message_batch(
   }
   // batch.reserved_pad stays zero from zero-init.
   return batch;
-}
-
-inline std::span<const std::uint8_t> active_prefix_bytes(
-    const error_message_batch& batch) {
-  const std::size_t active_size =
-      offsetof(error_message_batch, messages) +
-      static_cast<std::size_t>(batch.count) * sizeof(error_message);
-  return {reinterpret_cast<const std::uint8_t*>(&batch), active_size};
 }
 
 inline std::vector<std::uint8_t> boot_payload() {

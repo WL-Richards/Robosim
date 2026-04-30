@@ -12,7 +12,7 @@ namespace {
   return shim_error{shim_error_kind::send_failed,
                     std::move(err),
                     std::move(field),
-                    "transport rejected outbound boot envelope"};
+                    "transport rejected outbound envelope"};
 }
 
 [[nodiscard]] shim_error wrap_receive_error(tier1::tier1_transport_error err) {
@@ -156,6 +156,60 @@ std::expected<void, shim_error> shim_core::poll() {
                                         "kind",
                                         "shim cycle 1 does not handle this envelope kind"});
   }
+}
+
+std::expected<void, shim_error> shim_core::send_can_frame_batch(
+    const can_frame_batch& batch, std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  auto sent = endpoint_.send(envelope_kind::tick_boundary,
+                             schema_id::can_frame_batch,
+                             active_prefix_bytes(batch),
+                             sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(wrap_send_error(std::move(sent.error())));
+  }
+  return {};
+}
+
+std::expected<void, shim_error> shim_core::send_notifier_state(
+    const notifier_state& state, std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  auto sent = endpoint_.send(envelope_kind::tick_boundary,
+                             schema_id::notifier_state,
+                             active_prefix_bytes(state),
+                             sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(wrap_send_error(std::move(sent.error())));
+  }
+  return {};
+}
+
+std::expected<void, shim_error> shim_core::send_error_message_batch(
+    const error_message_batch& batch, std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  auto sent = endpoint_.send(envelope_kind::tick_boundary,
+                             schema_id::error_message_batch,
+                             active_prefix_bytes(batch),
+                             sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(wrap_send_error(std::move(sent.error())));
+  }
+  return {};
 }
 
 bool shim_core::is_connected() const {
