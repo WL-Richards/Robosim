@@ -100,6 +100,8 @@ desc::robot_description make_v0_arm_with_joint_origin(
     const desc::origin_pose& joint_origin) {
   desc::robot_description d = make_v0_arm_description();
   d.joints[0].origin = joint_origin;
+  d.links[0].visual_origin = desc::origin_pose{};
+  d.motors[0].visual_origin = desc::origin_pose{};
   return d;
 }
 

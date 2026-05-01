@@ -68,6 +68,16 @@ struct corner_box {
     case primitive_kind::sphere:
       return {{-p.radius_m, -p.radius_m, -p.radius_m},
               {p.radius_m, p.radius_m, p.radius_m}};
+    case primitive_kind::rotation_arrow:
+      return {{-p.radius_m, -p.radius_m, -0.001},
+              {p.radius_m, p.radius_m, 0.001}};
+    case primitive_kind::mesh:
+      return {{p.mesh_min_local[0] * p.mesh_scale_m_per_unit,
+               p.mesh_min_local[1] * p.mesh_scale_m_per_unit,
+               p.mesh_min_local[2] * p.mesh_scale_m_per_unit},
+              {p.mesh_max_local[0] * p.mesh_scale_m_per_unit,
+               p.mesh_max_local[1] * p.mesh_scale_m_per_unit,
+               p.mesh_max_local[2] * p.mesh_scale_m_per_unit}};
     case primitive_kind::box:
       return {{-p.half_extent_x_m, -p.half_extent_y_m, -p.half_extent_z_m},
               {p.half_extent_x_m, p.half_extent_y_m, p.half_extent_z_m}};

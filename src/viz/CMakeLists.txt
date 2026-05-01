@@ -85,6 +85,7 @@ target_link_libraries(robosim_viz_imguizmo
 # ---------------------------------------------------------------------------
 
 add_library(robosim_viz_core STATIC
+  attachment.cpp
   scene_snapshot.cpp
   camera.cpp
   picking.cpp
@@ -156,6 +157,10 @@ add_library(robosim_viz_renderer STATIC
   renderer.cpp
 )
 
+target_compile_definitions(robosim_viz_renderer
+  PRIVATE ROBOSIM_ASSET_ROOT="${CMAKE_SOURCE_DIR}/assets"
+)
+
 target_link_libraries(robosim_viz_renderer
   PUBLIC
     robosim_viz_core
@@ -184,11 +189,36 @@ target_link_libraries(robosim_viz_panels
 )
 
 # ---------------------------------------------------------------------------
+# robosim_viz_layout — ini-path resolver + default dock layout.
+# Pure C++ + ImGui::DockBuilder; no description / renderer dependency.
+# ---------------------------------------------------------------------------
+
+add_library(robosim_viz_layout STATIC
+  layout.cpp
+)
+
+target_include_directories(robosim_viz_layout PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
+target_link_libraries(robosim_viz_layout
+  PUBLIC robosim_viz_imgui
+  PRIVATE robosim_baseline
+)
+
+# ---------------------------------------------------------------------------
 # Renderer / loader isolation check (TEST_PLAN.md T1).
 # ---------------------------------------------------------------------------
 
 include("${CMAKE_SOURCE_DIR}/cmake/lint_renderer_isolation.cmake")
 robosim_viz_check_renderer_isolation()
+
+# ---------------------------------------------------------------------------
+# Gizmo window-flags lint (TEST_PLAN_VL.md G1).
+# ---------------------------------------------------------------------------
+
+include("${CMAKE_SOURCE_DIR}/cmake/lint_gizmo_window_flags.cmake")
+robosim_viz_check_gizmo_window_flags()
 
 # ---------------------------------------------------------------------------
 # robosim-viz binary.
@@ -204,6 +234,7 @@ target_link_libraries(robosim-viz
     robosim_viz_edit_builder
     robosim_viz_edit_apply
     robosim_viz_edit_session
+    robosim_viz_layout
     robosim_viz_renderer
     robosim_viz_panels
     robosim_viz_imgui

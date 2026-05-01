@@ -104,6 +104,16 @@ desc::transform_4x4 link_kinematic_world(const desc::robot_description& d,
   return joint_kinematic_world(d, *parent_joint);
 }
 
+const desc::joint* find_joint_by_name(const desc::robot_description& d,
+                                      const std::string& joint_name) {
+  for (const auto& j : d.joints) {
+    if (j.name == joint_name) {
+      return &j;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 desc::robot_description apply_gizmo_target(
@@ -138,6 +148,31 @@ desc::robot_description apply_gizmo_target(
     const desc::transform_4x4 new_origin =
         mul_4x4(inverse_rigid(parent_kinematic), target);
     j->origin = desc::decompose_origin(new_origin);
+    return result;
+  }
+
+  if (selected.kind == node_kind::motor ||
+      selected.kind == node_kind::motor_direction_arrow) {
+    desc::motor* m = nullptr;
+    for (auto& candidate : result.motors) {
+      if (candidate.name == selected.entity_name) {
+        m = &candidate;
+        break;
+      }
+    }
+    if (m == nullptr) {
+      return result;
+    }
+
+    const desc::joint* parent_joint = find_joint_by_name(result, m->joint_name);
+    if (parent_joint == nullptr) {
+      return result;
+    }
+    const desc::transform_4x4 joint_kinematic =
+        joint_kinematic_world(result, *parent_joint);
+    const desc::transform_4x4 new_visual_origin =
+        mul_4x4(inverse_rigid(joint_kinematic), target);
+    m->visual_origin = desc::decompose_origin(new_visual_origin);
     return result;
   }
 

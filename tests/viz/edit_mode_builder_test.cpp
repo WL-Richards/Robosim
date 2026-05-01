@@ -20,7 +20,7 @@ using testing::find_node_index;
 TEST(EditModeBuilder, SnapshotNodeCountMatchesLinksPlusJoints) {
   const auto snapshot = build_edit_mode_snapshot(testing::make_v0_arm_description());
 
-  EXPECT_EQ(snapshot.nodes.size(), 2U);
+  EXPECT_EQ(snapshot.nodes.size(), 4U);
 }
 
 TEST(EditModeBuilder, SnapshotDistinguishesLinkAndJointNodesByKind) {
@@ -30,10 +30,19 @@ TEST(EditModeBuilder, SnapshotDistinguishesLinkAndJointNodesByKind) {
       std::ranges::count_if(snapshot.nodes, [](auto& n) { return n.kind == node_kind::link; });
   const auto joint_count =
       std::ranges::count_if(snapshot.nodes, [](auto& n) { return n.kind == node_kind::joint; });
+  const auto motor_count =
+      std::ranges::count_if(snapshot.nodes, [](auto& n) { return n.kind == node_kind::motor; });
+  const auto motor_arrow_count = std::ranges::count_if(snapshot.nodes, [](auto& n) {
+    return n.kind == node_kind::motor_direction_arrow;
+  });
   EXPECT_EQ(link_count, 1);
   EXPECT_EQ(joint_count, 1);
+  EXPECT_EQ(motor_count, 1);
+  EXPECT_EQ(motor_arrow_count, 1);
   EXPECT_EQ(find_node(snapshot, node_kind::link, "arm").entity_name, "arm");
   EXPECT_EQ(find_node(snapshot, node_kind::joint, "shoulder").entity_name, "shoulder");
+  EXPECT_EQ(find_node(snapshot, node_kind::motor, "shoulder_motor").entity_name,
+            "shoulder_motor");
 }
 
 TEST(EditModeBuilder, LinkNodeHasCylinderPrimitiveWithCorrectDimensions) {
@@ -61,6 +70,36 @@ TEST(EditModeBuilder, JointNodeRecordsAxisInLocalFrame) {
 
   const auto& shoulder = find_node(snapshot, node_kind::joint, "shoulder");
   EXPECT_EQ(shoulder.joint_axis_local, (std::array{0.0, 1.0, 0.0}));
+}
+
+TEST(EditModeBuilder, KrakenMotorNodeHasMeshPrimitiveAndArrowIndicator) {
+  const auto snapshot = build_edit_mode_snapshot(testing::make_v0_arm_description());
+
+  const auto& motor = find_node(snapshot, node_kind::motor, "shoulder_motor");
+  ASSERT_TRUE(motor.shape.has_value());
+  EXPECT_EQ(motor.shape->kind, primitive_kind::mesh);
+  EXPECT_EQ(motor.shape->mesh_id, "kraken_x60");
+  EXPECT_DOUBLE_EQ(motor.shape->mesh_scale_m_per_unit, 0.001);
+  EXPECT_DOUBLE_EQ(motor.shape->mesh_min_local[2], -43.377052);
+  EXPECT_DOUBLE_EQ(motor.shape->mesh_max_local[2], 68.603653);
+
+  const auto& arrow = find_node(snapshot, node_kind::motor_direction_arrow, "shoulder_motor");
+  ASSERT_TRUE(arrow.shape.has_value());
+  EXPECT_EQ(arrow.shape->kind, primitive_kind::rotation_arrow);
+  EXPECT_DOUBLE_EQ(arrow.shape->radius_m, 0.022);
+  EXPECT_NEAR(arrow.world_from_local.m[3][2], -0.046377052, 1e-12);
+}
+
+TEST(EditModeBuilder, MotorArrowCanBeHiddenPerMotor) {
+  auto description = testing::make_v0_arm_description();
+  description.motors[0].show_direction_arrow = false;
+
+  const auto snapshot = build_edit_mode_snapshot(description);
+
+  const auto motor_arrow_count = std::ranges::count_if(snapshot.nodes, [](auto& n) {
+    return n.kind == node_kind::motor_direction_arrow;
+  });
+  EXPECT_EQ(motor_arrow_count, 0);
 }
 
 TEST(EditModeBuilder, ParentIndexesRepresentKinematicTree) {

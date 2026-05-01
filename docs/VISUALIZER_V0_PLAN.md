@@ -296,6 +296,33 @@ Original VD plan retained below for reference:
 Commit boundary: gizmo + selection + save flow as one commit; UI
 polish as a follow-up if needed.
 
+### Post-VD follow-up — Surface attachment ✓ LANDED
+
+Edit mode now has a Fusion-style two-click Attach command on top of
+the VD write path:
+
+- `viz::attachment` (`src/viz/attachment.{h,cpp}`) lives in
+  `robosim_viz_core` and is description-free.
+- `pick_attachment_plane(scene_snapshot, ray)` turns a viewport hover
+  or click into an attachment plane.
+- `compute_attachment_target(...)` computes the target transform from
+  the moving plane, target plane, and modifiers.
+- The UI flow is `Start attach` → click moving surface → click target
+  surface; the second click applies immediately through
+  `apply_gizmo_target`.
+- The Attach window only holds modifiers/status: `Offset m`,
+  `Quarter turns`, and `Flip normal`.
+- Hover preview draws a translucent temporary plane over the surface
+  that will be captured.
+- Supported v0 surfaces are cylinder/arrow caps and sides, box faces,
+  rotation-arrow box proxies, and mesh oriented-AABB faces. Kraken X60
+  picking/attachment accounts for the renderer's 180-degree Y rotation.
+
+Known follow-ups: keep the first selected plane visible after click
+one, add a live ghost preview before click two, add undo/redo, and
+eventually decide whether attachments become persistent mate records,
+fixed joints, or remain baked origin edits.
+
 ## What NOT to do in early sessions
 
 - **Don't break the snapshot seam.** Phase VB is the one chance to get

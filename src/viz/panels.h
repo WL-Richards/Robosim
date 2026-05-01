@@ -22,6 +22,7 @@ struct panels_state {
   // Loaded description (Edit mode source of truth). nullopt if loading
   // failed — error message goes in `load_error_message`.
   std::optional<robosim::description::robot_description> description;
+  bool description_dirty = false;
   std::string load_error_message;
   std::string source_path_display;
 };
@@ -29,6 +30,6 @@ struct panels_state {
 // Draws the scene tree, inspector, and status bar inside the current
 // ImGui frame. May mutate `s.selected_index` if the user clicks an
 // entry in the scene tree.
-void draw_panels(const panels_state& state, scene_snapshot& s);
+void draw_panels(panels_state& state, scene_snapshot& s);
 
 }  // namespace robosim::viz

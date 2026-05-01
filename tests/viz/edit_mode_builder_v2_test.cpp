@@ -217,13 +217,23 @@ TEST(EditModeBuilder, JointChainComposesOriginsLeftToRight) {
 // ---------------------------------------------------------------------
 
 TEST(EditModeBuilder, IdentityOriginsYieldIdentityWorldFromLocal) {
-  const auto loaded = desc::load_from_file(
-      std::filesystem::path(ROBOSIM_V0_ARM_FIXTURE_PATH));
-  ASSERT_TRUE(loaded.has_value());
+  auto description = testing::make_v0_arm_description();
+  for (auto& joint : description.joints) {
+    joint.origin = desc::origin_pose{};
+  }
+  for (auto& link : description.links) {
+    link.visual_origin = desc::origin_pose{};
+  }
+  for (auto& motor : description.motors) {
+    motor.visual_origin = desc::origin_pose{};
+  }
 
-  const auto snapshot = build_edit_mode_snapshot(*loaded);
+  const auto snapshot = build_edit_mode_snapshot(description);
 
   for (const auto& node : snapshot.nodes) {
+    if (node.kind == node_kind::motor_direction_arrow) {
+      continue;
+    }
     expect_identity_exact(node.world_from_local);
   }
 }

@@ -12,6 +12,7 @@
 // suppressed by the GLFW_INCLUDE_NONE macro below.
 
 #define GLFW_INCLUDE_NONE
+#include "attachment.h"
 #include "camera.h"
 #include "description/error.h"
 #include "description/loader.h"
@@ -19,6 +20,7 @@
 #include "edit_mode_apply.h"
 #include "edit_mode_builder.h"
 #include "edit_session.h"
+#include "layout.h"
 #include "panels.h"
 #include "picking.h"
 #include "renderer.h"
@@ -56,9 +58,28 @@ struct cli_options {
 struct gizmo_state {
   ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
   ImGuizmo::MODE mode = ImGuizmo::WORLD;
-  bool snap_enabled = false;
+  bool snap_enabled = true;
   float translate_snap_m = 0.05F;
   float rotate_snap_deg = 5.0F;
+};
+
+struct attach_tool_state {
+  enum class capture_mode {
+    none,
+    moving,
+    target,
+  };
+
+  robosim::viz::attachment_options options;
+  std::optional<std::size_t> moving_node_index;
+  std::optional<robosim::viz::attachment_plane> moving_plane;
+  std::optional<robosim::viz::attachment_plane> target_plane;
+  std::optional<robosim::viz::attachment_plane> hover_plane;
+  std::string moving_label;
+  std::string target_label;
+  std::string status;
+  capture_mode armed = capture_mode::none;
+  bool apply_requested = false;
 };
 
 void glfw_error_callback(int error_code, const char* description) {
@@ -140,6 +161,47 @@ std::array<float, 16> to_imguizmo_matrix(const std::array<std::array<double, 4>,
   return out;
 }
 
+std::array<double, 3> cross(std::array<double, 3> a, std::array<double, 3> b) {
+  return {a[1] * b[2] - a[2] * b[1],
+          a[2] * b[0] - a[0] * b[2],
+          a[0] * b[1] - a[1] * b[0]};
+}
+
+robosim::viz::transform plane_transform(
+    const robosim::viz::attachment_plane& plane) {
+  const auto normal = normalize(plane.normal_world);
+  const auto tangent = normalize(plane.tangent_world);
+  const auto bitangent = normalize(cross(normal, tangent));
+
+  auto t = robosim::viz::transform::identity();
+  for (int row = 0; row < 3; ++row) {
+    t.m[0][row] = tangent[row];
+    t.m[1][row] = bitangent[row];
+    t.m[2][row] = normal[row];
+    t.m[3][row] = plane.point_world[row] + (normal[row] * 0.006);
+  }
+  return t;
+}
+
+robosim::viz::scene_snapshot snapshot_with_attach_hover(
+    const robosim::viz::scene_snapshot& snapshot,
+    const attach_tool_state& attach) {
+  if (!attach.hover_plane.has_value() ||
+      attach.armed == attach_tool_state::capture_mode::none) {
+    return snapshot;
+  }
+
+  auto preview = snapshot;
+  robosim::viz::scene_node plane_node;
+  plane_node.entity_name = "__attach_hover_plane";
+  plane_node.kind = robosim::viz::node_kind::joint;
+  plane_node.world_from_local = plane_transform(*attach.hover_plane);
+  plane_node.shape = robosim::viz::primitive{
+      robosim::viz::primitive_kind::box, 0.0, 0.0, 0.18, 0.18, 0.004};
+  preview.nodes.push_back(std::move(plane_node));
+  return preview;
+}
+
 void copy_from_imguizmo_matrix(const std::array<float, 16>& source,
                                robosim::viz::transform& target) {
   for (int col = 0; col < 4; ++col) {
@@ -181,7 +243,8 @@ robosim::viz::ray mouse_ray_world(const robosim::viz::orbit_camera& camera,
 void handle_camera_input(robosim::viz::orbit_camera& camera,
                          robosim::viz::scene_snapshot& snapshot,
                          std::array<int, 2> framebuffer_size,
-                         gizmo_state& gizmo) {
+                         gizmo_state& gizmo,
+                         attach_tool_state& attach) {
   ImGuiIO& io = ImGui::GetIO();
 
   if (!io.WantCaptureKeyboard) {
@@ -207,16 +270,59 @@ void handle_camera_input(robosim::viz::orbit_camera& camera,
   }
 
   if (io.WantCaptureMouse || framebuffer_size[0] <= 0 || framebuffer_size[1] <= 0) {
+    attach.hover_plane = std::nullopt;
     return;
+  }
+
+  const auto ray = mouse_ray_world(camera, framebuffer_size, io.MousePos);
+  if (attach.armed != attach_tool_state::capture_mode::none) {
+    attach.hover_plane = robosim::viz::pick_attachment_plane(snapshot, ray);
+  } else {
+    attach.hover_plane = std::nullopt;
   }
 
   if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
     if (ImGuizmo::IsOver() || ImGuizmo::IsUsing()) {
       return;
     }
-    const auto hit =
-        robosim::viz::pick(snapshot, mouse_ray_world(camera, framebuffer_size, io.MousePos));
-    snapshot.selected_index = hit.has_value() ? std::optional{hit->node_index} : std::nullopt;
+    if (attach.armed != attach_tool_state::capture_mode::none) {
+      const auto plane = attach.hover_plane.has_value()
+          ? attach.hover_plane
+          : robosim::viz::pick_attachment_plane(snapshot, ray);
+      if (!plane.has_value()) {
+        attach.status = "No attachable surface under cursor.";
+        return;
+      }
+      const std::size_t node_index = plane->node_index;
+      snapshot.selected_index = node_index;
+      if (attach.armed == attach_tool_state::capture_mode::moving) {
+        attach.moving_node_index = node_index;
+        attach.moving_plane = *plane;
+        attach.moving_label = snapshot.nodes[node_index].entity_name;
+        attach.target_plane = std::nullopt;
+        attach.target_label.clear();
+        attach.apply_requested = false;
+        attach.armed = attach_tool_state::capture_mode::target;
+        attach.status = "First surface captured. Click the target surface.";
+      } else {
+        attach.target_plane = *plane;
+        attach.target_label = snapshot.nodes[node_index].entity_name;
+        attach.apply_requested = true;
+        attach.armed = attach_tool_state::capture_mode::none;
+        attach.status = "Target surface captured. Applying attach.";
+      }
+      attach.hover_plane = std::nullopt;
+      return;
+    }
+
+    const auto hit = robosim::viz::pick(snapshot, ray);
+    if (hit.has_value() &&
+        snapshot.nodes[hit->node_index].kind == robosim::viz::node_kind::motor_direction_arrow &&
+        snapshot.nodes[hit->node_index].parent_index.has_value()) {
+      snapshot.selected_index = *snapshot.nodes[hit->node_index].parent_index;
+    } else {
+      snapshot.selected_index = hit.has_value() ? std::optional{hit->node_index} : std::nullopt;
+    }
   }
 
   constexpr double orbit_radians_per_pixel = 0.005;
@@ -422,10 +528,23 @@ void draw_file_menu(robosim::viz::edit_session& session,
 }
 
 void draw_gizmo_controls(gizmo_state& gizmo) {
-  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_AlwaysAutoResize |
-                           ImGuiWindowFlags_NoSavedSettings;
-  ImGui::SetNextWindowPos(ImVec2(12.0F, 42.0F), ImGuiCond_FirstUseEver);
-  if (!ImGui::Begin("Gizmo", nullptr, flags)) {
+  // Floating HUD: anchored top-left on first launch, transparent
+  // background so the controls read as buttons over the viewport.
+  // NoDocking is intentional — docked windows render the dock
+  // node's background instead of the window's WindowBg, defeating
+  // the transparent-HUD intent. Position still persists across
+  // launches (no NoSavedSettings).
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 12.0F, vp->WorkPos.y + 12.0F),
+                          ImGuiCond_FirstUseEver);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0F, 0.0F, 0.0F, 0.0F));
+  const bool open = ImGui::Begin(robosim::viz::default_layout_gizmo_window,
+                                 nullptr,
+                                 ImGuiWindowFlags_AlwaysAutoResize |
+                                     ImGuiWindowFlags_NoTitleBar |
+                                     ImGuiWindowFlags_NoDocking);
+  ImGui::PopStyleColor();
+  if (!open) {
     ImGui::End();
     return;
   }
@@ -455,6 +574,92 @@ void draw_gizmo_controls(gizmo_state& gizmo) {
   ImGui::End();
 }
 
+void draw_attach_controls(attach_tool_state& attach,
+                          robosim::viz::edit_session& session,
+                          robosim::viz::scene_snapshot& snapshot) {
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 12.0F, vp->WorkPos.y + 210.0F),
+                          ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Attach", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::End();
+    return;
+  }
+
+  const bool capturing_moving =
+      attach.armed == attach_tool_state::capture_mode::moving;
+  if (attach.armed == attach_tool_state::capture_mode::none) {
+    if (ImGui::Button("Start attach")) {
+      attach.armed = attach_tool_state::capture_mode::moving;
+      attach.hover_plane = std::nullopt;
+      attach.moving_node_index = std::nullopt;
+      attach.moving_plane = std::nullopt;
+      attach.target_plane = std::nullopt;
+      attach.moving_label.clear();
+      attach.target_label.clear();
+      attach.apply_requested = false;
+      attach.status = "Click the surface that should move.";
+    }
+  } else {
+    ImGui::TextDisabled("%s",
+                        capturing_moving ? "Click first surface"
+                                         : "Click target surface");
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      attach.armed = attach_tool_state::capture_mode::none;
+      attach.hover_plane = std::nullopt;
+      attach.status = "Attach canceled.";
+    }
+  }
+
+  ImGui::TextDisabled("Moving: %s",
+                      attach.moving_label.empty() ? "none"
+                                                  : attach.moving_label.c_str());
+  ImGui::TextDisabled("Target: %s",
+                      attach.target_label.empty() ? "none"
+                                                  : attach.target_label.c_str());
+
+  float offset_m = static_cast<float>(attach.options.offset_m);
+  ImGui::SetNextItemWidth(110.0F);
+  if (ImGui::DragFloat("Offset m", &offset_m, 0.005F, -10.0F, 10.0F, "%.3f")) {
+    attach.options.offset_m = static_cast<double>(offset_m);
+  }
+  ImGui::SetNextItemWidth(90.0F);
+  ImGui::InputInt("Quarter turns", &attach.options.quarter_turns);
+  ImGui::Checkbox("Flip normal", &attach.options.flip);
+
+  const bool ready = attach.moving_node_index.has_value() &&
+                     attach.moving_plane.has_value() &&
+                     attach.target_plane.has_value() &&
+                     *attach.moving_node_index < snapshot.nodes.size();
+  if (attach.apply_requested && ready) {
+    const std::size_t moving_index = *attach.moving_node_index;
+    const auto target = robosim::viz::compute_attachment_target(
+        snapshot.nodes[moving_index],
+        *attach.moving_plane,
+        *attach.target_plane,
+        attach.options);
+    session.description = robosim::viz::apply_gizmo_target(
+        session.description, snapshot, moving_index, target);
+    session.dirty = true;
+    snapshot.selected_index = moving_index;
+    rebuild_snapshot_from_session(session, snapshot);
+    attach.status = "Attach applied.";
+    attach.armed = attach_tool_state::capture_mode::none;
+    attach.hover_plane = std::nullopt;
+    attach.apply_requested = false;
+  }
+
+  if (attach.apply_requested && !ready) {
+    attach.apply_requested = false;
+    attach.status = "Attach failed: missing surface.";
+  }
+
+  if (!attach.status.empty()) {
+    ImGui::TextDisabled("%s", attach.status.c_str());
+  }
+  ImGui::End();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -467,6 +672,7 @@ int main(int argc, char** argv) {
   robosim::viz::scene_snapshot snapshot;
   robosim::viz::orbit_camera camera;
   gizmo_state gizmo;
+  attach_tool_state attach;
   robosim::viz::edit_session session;
   file_menu_state file_menu;
   std::string save_error_message;
@@ -528,6 +734,22 @@ int main(int argc, char** argv) {
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   ImGui::StyleColorsDark();
 
+  // Resolve a stable per-user ini path. ImGui stores the pointer
+  // (does not copy), so the backing string must outlive the
+  // ImGui context — keep it in a static.
+  static std::string ini_path_storage;
+  bool needs_default_layout = false;
+  if (auto resolved = robosim::viz::resolve_imgui_ini_path(
+          std::getenv("XDG_CONFIG_HOME"), std::getenv("HOME"));
+      resolved.has_value()) {
+    if (robosim::viz::ensure_ini_parent_dir(*resolved)) {
+      ini_path_storage = resolved->string();
+      io.IniFilename = ini_path_storage.c_str();
+      needs_default_layout =
+          robosim::viz::should_apply_default_layout(*resolved);
+    }
+  }
+
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glsl_version.data());
 
@@ -558,27 +780,46 @@ int main(int argc, char** argv) {
       ImGui::NewFrame();
       ImGuizmo::BeginFrame();
 
-      handle_camera_input(camera, snapshot, {framebuffer_width, framebuffer_height}, gizmo);
+      handle_camera_input(camera,
+                          snapshot,
+                          {framebuffer_width, framebuffer_height},
+                          gizmo,
+                          attach);
 
-      scene_renderer.draw(snapshot,
+      const auto render_snapshot = snapshot_with_attach_hover(snapshot, attach);
+      scene_renderer.draw(render_snapshot,
                           camera.view_matrix(),
                           camera.projection_matrix(),
                           {framebuffer_width, framebuffer_height});
 
-      ImGui::DockSpaceOverViewport(
+      const ImGuiID dockspace_id = ImGui::DockSpaceOverViewport(
           0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+
+      if (needs_default_layout) {
+        robosim::viz::apply_default_dock_layout(dockspace_id);
+        needs_default_layout = false;
+      }
 
       // Sync the panels' inspector data each frame from the session
       // (cheap; description is small).
       panels.description =
           session_loaded ? std::optional{session.description} : std::nullopt;
+      panels.description_dirty = false;
       panels.source_path_display = session.source_path.string();
 
       if (session_loaded) {
         draw_file_menu(session, snapshot, panels, file_menu, save_error_message);
       }
       robosim::viz::draw_panels(panels, snapshot);
+      if (session_loaded && panels.description_dirty && panels.description.has_value()) {
+        session.description = std::move(*panels.description);
+        session.dirty = true;
+        rebuild_snapshot_from_session(session, snapshot);
+      }
       draw_gizmo_controls(gizmo);
+      if (session_loaded) {
+        draw_attach_controls(attach, session, snapshot);
+      }
 
       // Gizmo apply: capture the new world transform into target,
       // route through pure apply_gizmo_target, rebuild snapshot.
@@ -598,8 +839,17 @@ int main(int argc, char** argv) {
 
       glfwSwapBuffers(window);
 
+      // ImGui's per-frame docking update needs at least two frames
+      // to settle child dock-node sizes after a layout is restored
+      // from imgui.ini. Exiting after the first frame can trigger
+      // an IM_ASSERT in DockContextBindNodeToWindow on subsequent
+      // launches once a layout has been saved. Two frames give the
+      // tree-update walk time to propagate Size from SizeRef.
       if (cli->smoke_test) {
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
+        static int smoke_frames = 0;
+        if (++smoke_frames >= 2) {
+          glfwSetWindowShouldClose(window, GLFW_TRUE);
+        }
       }
     }
   }  // ~renderer here, while the GL context is still current.

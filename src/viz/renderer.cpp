@@ -8,6 +8,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace robosim::viz {
@@ -24,7 +29,13 @@ struct mesh {
 };
 
 constexpr int cylinder_segments = 32;
+constexpr int rotation_arrow_segments = 28;
 constexpr float pi_f = 3.14159265358979F;
+#ifndef ROBOSIM_ASSET_ROOT
+#define ROBOSIM_ASSET_ROOT "assets"
+#endif
+constexpr const char* kraken_x60_obj_path =
+    ROBOSIM_ASSET_ROOT "/meshes/motors/kraken_x60/kraken_x60_decimated.obj";
 
 [[nodiscard]] mesh build_indexed_mesh(const std::vector<float>& verts,
                                       const std::vector<unsigned int>& idx) {
@@ -76,6 +87,112 @@ constexpr float pi_f = 3.14159265358979F;
   m.element_count = static_cast<GLsizei>(verts.size() / 6);
   m.primitive_mode = GL_LINES;
   return m;
+}
+
+struct obj_vertex_ref {
+  int position_index = 0;
+  int normal_index = 0;
+};
+
+[[nodiscard]] std::optional<int> parse_obj_index(const std::string& text) {
+  if (text.empty()) return std::nullopt;
+  try {
+    return std::stoi(text);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+[[nodiscard]] std::optional<obj_vertex_ref> parse_obj_vertex_ref(
+    const std::string& token) {
+  const std::size_t first_slash = token.find('/');
+  if (first_slash == std::string::npos) {
+    const auto position_index = parse_obj_index(token);
+    if (!position_index.has_value()) return std::nullopt;
+    return obj_vertex_ref{*position_index, 0};
+  }
+
+  const std::string position = token.substr(0, first_slash);
+  const std::size_t second_slash = token.find('/', first_slash + 1);
+  const auto position_index = parse_obj_index(position);
+  if (!position_index.has_value()) return std::nullopt;
+
+  if (second_slash == std::string::npos) {
+    return obj_vertex_ref{*position_index, 0};
+  }
+
+  const auto normal_index = parse_obj_index(token.substr(second_slash + 1));
+  if (!normal_index.has_value()) return obj_vertex_ref{*position_index, 0};
+  return obj_vertex_ref{*position_index, *normal_index};
+}
+
+[[nodiscard]] std::optional<mesh> load_obj_mesh(const std::filesystem::path& path) {
+  std::ifstream input(path);
+  if (!input) {
+    std::fprintf(stderr, "robosim-viz: could not open mesh asset: %s\n",
+                 path.string().c_str());
+    return std::nullopt;
+  }
+
+  std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<float, 3>> normals;
+  std::vector<float> verts;
+  std::vector<unsigned int> idx;
+
+  auto append_vertex = [&](const obj_vertex_ref& ref) -> std::optional<unsigned int> {
+    if (ref.position_index <= 0 ||
+        static_cast<std::size_t>(ref.position_index) > positions.size()) {
+      return std::nullopt;
+    }
+    const auto& p = positions[static_cast<std::size_t>(ref.position_index - 1)];
+    std::array<float, 3> n{0.0F, 0.0F, 1.0F};
+    if (ref.normal_index > 0 &&
+        static_cast<std::size_t>(ref.normal_index) <= normals.size()) {
+      n = normals[static_cast<std::size_t>(ref.normal_index - 1)];
+    }
+    const unsigned int out = static_cast<unsigned int>(verts.size() / 6);
+    verts.insert(verts.end(), {p[0], p[1], p[2], n[0], n[1], n[2]});
+    return out;
+  };
+
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream row(line);
+    std::string tag;
+    row >> tag;
+    if (tag == "v") {
+      std::array<float, 3> p{};
+      row >> p[0] >> p[1] >> p[2];
+      positions.push_back(p);
+    } else if (tag == "vn") {
+      std::array<float, 3> n{};
+      row >> n[0] >> n[1] >> n[2];
+      normals.push_back(n);
+    } else if (tag == "f") {
+      std::vector<obj_vertex_ref> refs;
+      std::string token;
+      while (row >> token) {
+        auto parsed = parse_obj_vertex_ref(token);
+        if (parsed.has_value()) refs.push_back(*parsed);
+      }
+      if (refs.size() < 3) continue;
+      for (std::size_t tri = 1; tri + 1 < refs.size(); ++tri) {
+        const auto a = append_vertex(refs[0]);
+        const auto b = append_vertex(refs[tri]);
+        const auto c = append_vertex(refs[tri + 1]);
+        if (a.has_value() && b.has_value() && c.has_value()) {
+          idx.insert(idx.end(), {*a, *b, *c});
+        }
+      }
+    }
+  }
+
+  if (idx.empty()) {
+    std::fprintf(stderr, "robosim-viz: mesh asset has no triangles: %s\n",
+                 path.string().c_str());
+    return std::nullopt;
+  }
+  return build_indexed_mesh(verts, idx);
 }
 
 // Unit cylinder along +Z, radius 1, length 1, base at the local
@@ -208,6 +325,42 @@ constexpr float pi_f = 3.14159265358979F;
   return build_line_mesh(v);
 }
 
+[[nodiscard]] mesh build_unit_rotation_arrow() {
+  std::vector<float> v;
+  const float start = 0.35F;
+  const float end = 5.15F;
+  for (int i = 0; i < rotation_arrow_segments; ++i) {
+    const float t0 = static_cast<float>(i) / static_cast<float>(rotation_arrow_segments);
+    const float t1 = static_cast<float>(i + 1) / static_cast<float>(rotation_arrow_segments);
+    const float a0 = start + (end - start) * t0;
+    const float a1 = start + (end - start) * t1;
+    v.insert(v.end(), {std::cos(a0), -std::sin(a0), 0.0F, 0.0F, 0.0F, 1.0F});
+    v.insert(v.end(), {std::cos(a1), -std::sin(a1), 0.0F, 0.0F, 0.0F, 1.0F});
+  }
+
+  const float tip_x = std::cos(end);
+  const float tip_y = -std::sin(end);
+  const float tangent_x = -std::sin(end);
+  const float tangent_y = -std::cos(end);
+  const float radial_x = std::cos(end);
+  const float radial_y = -std::sin(end);
+  const float head_back = 0.24F;
+  const float head_side = 0.16F;
+  const std::array<float, 2> left = {
+      tip_x - head_back * tangent_x + head_side * radial_x,
+      tip_y - head_back * tangent_y + head_side * radial_y,
+  };
+  const std::array<float, 2> right = {
+      tip_x - head_back * tangent_x - head_side * radial_x,
+      tip_y - head_back * tangent_y - head_side * radial_y,
+  };
+  v.insert(v.end(), {tip_x, tip_y, 0.0F, 0.0F, 0.0F, 1.0F,
+                     left[0], left[1], 0.0F, 0.0F, 0.0F, 1.0F});
+  v.insert(v.end(), {tip_x, tip_y, 0.0F, 0.0F, 0.0F, 1.0F,
+                     right[0], right[1], 0.0F, 0.0F, 0.0F, 1.0F});
+  return build_line_mesh(v);
+}
+
 void destroy_mesh(mesh& m) {
   if (m.ebo != 0) glDeleteBuffers(1, &m.ebo);
   if (m.vbo != 0) glDeleteBuffers(1, &m.vbo);
@@ -233,13 +386,14 @@ constexpr const char* mesh_fragment_src = R"(
 in vec3 v_world_normal;
 out vec4 frag_color;
 uniform vec3 u_color;
+uniform float u_alpha;
 uniform vec3 u_light_dir;
 uniform float u_ambient;
 void main() {
   vec3 n = normalize(v_world_normal);
   float diffuse = max(dot(n, normalize(u_light_dir)), 0.0);
   vec3 lit = u_color * (u_ambient + (1.0 - u_ambient) * diffuse);
-  frag_color = vec4(lit, 1.0);
+  frag_color = vec4(lit, u_alpha);
 }
 )";
 
@@ -323,6 +477,19 @@ using mat4d = std::array<std::array<double, 4>, 4>;
   return r;
 }
 
+[[nodiscard]] mat4d rotate_y(double radians) {
+  mat4d r{};
+  const double c = std::cos(radians);
+  const double s = std::sin(radians);
+  r[0][0] = c;
+  r[0][2] = -s;
+  r[1][1] = 1.0;
+  r[2][0] = s;
+  r[2][2] = c;
+  r[3][3] = 1.0;
+  return r;
+}
+
 }  // namespace
 
 struct renderer::impl {
@@ -330,6 +497,7 @@ struct renderer::impl {
   GLint mesh_u_mvp = -1;
   GLint mesh_u_model = -1;
   GLint mesh_u_color = -1;
+  GLint mesh_u_alpha = -1;
   GLint mesh_u_light_dir = -1;
   GLint mesh_u_ambient = -1;
 
@@ -341,6 +509,8 @@ struct renderer::impl {
   mesh box_mesh;
   mesh sphere_mesh;
   mesh grid_mesh;
+  mesh rotation_arrow_mesh;
+  std::optional<mesh> kraken_x60_mesh;
 };
 
 renderer::renderer() : impl_(std::make_unique<impl>()) {
@@ -350,6 +520,7 @@ renderer::renderer() : impl_(std::make_unique<impl>()) {
   impl_->mesh_u_mvp = glGetUniformLocation(impl_->mesh_program, "u_mvp");
   impl_->mesh_u_model = glGetUniformLocation(impl_->mesh_program, "u_model");
   impl_->mesh_u_color = glGetUniformLocation(impl_->mesh_program, "u_color");
+  impl_->mesh_u_alpha = glGetUniformLocation(impl_->mesh_program, "u_alpha");
   impl_->mesh_u_light_dir =
       glGetUniformLocation(impl_->mesh_program, "u_light_dir");
   impl_->mesh_u_ambient =
@@ -365,6 +536,8 @@ renderer::renderer() : impl_(std::make_unique<impl>()) {
   impl_->box_mesh = build_unit_box();
   impl_->sphere_mesh = build_unit_sphere();
   impl_->grid_mesh = build_grid(5);
+  impl_->rotation_arrow_mesh = build_unit_rotation_arrow();
+  impl_->kraken_x60_mesh = load_obj_mesh(kraken_x60_obj_path);
 }
 
 renderer::~renderer() {
@@ -373,6 +546,10 @@ renderer::~renderer() {
     destroy_mesh(impl_->box_mesh);
     destroy_mesh(impl_->sphere_mesh);
     destroy_mesh(impl_->grid_mesh);
+    destroy_mesh(impl_->rotation_arrow_mesh);
+    if (impl_->kraken_x60_mesh.has_value()) {
+      destroy_mesh(*impl_->kraken_x60_mesh);
+    }
     if (impl_->mesh_program != 0) glDeleteProgram(impl_->mesh_program);
     if (impl_->line_program != 0) glDeleteProgram(impl_->line_program);
   }
@@ -385,6 +562,8 @@ void renderer::draw(
   glClearColor(0.10F, 0.11F, 0.12F, 1.0F);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glEnable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
   const mat4d vp = matmul(projection, view);
   const auto vp_f = to_float(vp);
@@ -404,6 +583,7 @@ void renderer::draw(
   for (std::size_t i = 0; i < s.nodes.size(); ++i) {
     const auto& node = s.nodes[i];
     if (!node.shape) continue;
+    const bool attach_hover = node.entity_name == "__attach_hover_plane";
 
     mat4d model = node.world_from_local.m;
     const mesh* m_ptr = nullptr;
@@ -425,6 +605,22 @@ void renderer::draw(
                             node.shape->half_extent_z_m);
         m_ptr = &impl_->box_mesh;
         break;
+      case primitive_kind::mesh:
+        if (node.shape->mesh_id == "kraken_x60") {
+          model = matmul(model, rotate_y(pi_f));
+        }
+        model = apply_scale(model, node.shape->mesh_scale_m_per_unit,
+                            node.shape->mesh_scale_m_per_unit,
+                            node.shape->mesh_scale_m_per_unit);
+        if (node.shape->mesh_id == "kraken_x60" &&
+            impl_->kraken_x60_mesh.has_value()) {
+          m_ptr = &*impl_->kraken_x60_mesh;
+        } else {
+          m_ptr = &impl_->box_mesh;
+        }
+        break;
+      case primitive_kind::rotation_arrow:
+        continue;
     }
     if (m_ptr == nullptr) continue;
 
@@ -436,20 +632,60 @@ void renderer::draw(
 
     const bool selected =
         s.selected_index.has_value() && *s.selected_index == i;
-    const bool is_joint = node.kind == node_kind::joint;
-    float r = is_joint ? 0.95F : 0.55F;
-    float g = is_joint ? 0.65F : 0.70F;
-    float b = is_joint ? 0.20F : 0.85F;
+    float r = 0.55F;
+    float g = 0.70F;
+    float b = 0.85F;
+    if (node.kind == node_kind::joint) {
+      r = 0.95F;
+      g = 0.65F;
+      b = 0.20F;
+    } else if (node.kind == node_kind::motor) {
+      r = 0.30F;
+      g = 0.85F;
+      b = 0.55F;
+    } else if (node.kind == node_kind::motor_direction_arrow) {
+      r = 1.0F;
+      g = 0.25F;
+      b = 0.20F;
+    }
     if (selected) {
       r = 1.0F;
       g = 0.85F;
       b = 0.20F;
     }
+    if (attach_hover) {
+      r = 0.10F;
+      g = 0.85F;
+      b = 1.0F;
+      glDepthMask(GL_FALSE);
+    }
     glUniform3f(impl_->mesh_u_color, r, g, b);
+    glUniform1f(impl_->mesh_u_alpha, attach_hover ? 0.42F : 1.0F);
 
     glBindVertexArray(m_ptr->vao);
     glDrawElements(GL_TRIANGLES, m_ptr->element_count, GL_UNSIGNED_INT,
                    nullptr);
+    if (attach_hover) {
+      glDepthMask(GL_TRUE);
+    }
+  }
+
+  // Flat rotation glyphs.
+  glUseProgram(impl_->line_program);
+  for (std::size_t i = 0; i < s.nodes.size(); ++i) {
+    const auto& node = s.nodes[i];
+    if (!node.shape || node.shape->kind != primitive_kind::rotation_arrow) {
+      continue;
+    }
+
+    const mat4d model =
+        apply_scale(node.world_from_local.m, node.shape->radius_m, node.shape->radius_m, 1.0);
+    const mat4d mvp = matmul(projection, matmul(view, model));
+    const auto mvp_f = to_float(mvp);
+    glUniformMatrix4fv(impl_->line_u_mvp, 1, GL_FALSE, &mvp_f[0][0]);
+    glUniform3f(impl_->line_u_color, 1.0F, 0.18F, 0.12F);
+    glBindVertexArray(impl_->rotation_arrow_mesh.vao);
+    glDrawArrays(GL_LINES, 0, impl_->rotation_arrow_mesh.element_count);
   }
   glBindVertexArray(0);
 }

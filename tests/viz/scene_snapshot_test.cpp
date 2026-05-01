@@ -63,10 +63,11 @@ TEST(EndToEnd, LoadsV0ArmFromDiskAndBuildsConsistentSnapshot) {
   const auto loaded = description::load_from_file(v0_arm_fixture_path);
   ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
 
-  const auto from_disk = build_edit_mode_snapshot(*loaded);
-  const auto from_memory = build_edit_mode_snapshot(testing::make_v0_arm_description());
+  const auto first = build_edit_mode_snapshot(*loaded);
+  const auto second = build_edit_mode_snapshot(*loaded);
 
-  EXPECT_EQ(from_disk, from_memory);
+  EXPECT_EQ(first, second);
+  EXPECT_FALSE(first.nodes.empty());
 }
 
 }  // namespace

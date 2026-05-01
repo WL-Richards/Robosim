@@ -21,19 +21,38 @@ enum class primitive_kind {
   box,
   sphere,
   arrow,
+  rotation_arrow,
+  mesh,
 };
 
 // Cylinder / arrow are anchored at the proximal cap (local origin
-// at z = 0) and extend along +Z to z = length_m. Box / sphere are
-// centered at the local origin. See tests/viz/TEST_PLAN.md
+// at z = 0) and extend along +Z to z = length_m. Rotation arrows
+// are flat glyphs centered at the local origin in the XY plane, with
+// radius_m as the ring radius. Box / sphere are centered at the local origin.
+// See tests/viz/TEST_PLAN.md
 // conventions #8 / #9 / #10 / #11.
 struct primitive {
-  primitive_kind kind;
-  double length_m;          // cylinder, arrow
-  double radius_m;          // cylinder, arrow, sphere
-  double half_extent_x_m;   // box
-  double half_extent_y_m;   // box
-  double half_extent_z_m;   // box
+  primitive() = default;
+  primitive(primitive_kind kind_in, double length_m_in, double radius_m_in,
+            double half_extent_x_m_in, double half_extent_y_m_in,
+            double half_extent_z_m_in)
+      : kind(kind_in),
+        length_m(length_m_in),
+        radius_m(radius_m_in),
+        half_extent_x_m(half_extent_x_m_in),
+        half_extent_y_m(half_extent_y_m_in),
+        half_extent_z_m(half_extent_z_m_in) {}
+
+  primitive_kind kind = primitive_kind::box;
+  double length_m = 0.0;          // cylinder, arrow
+  double radius_m = 0.0;          // cylinder, arrow, sphere, rotation_arrow
+  double half_extent_x_m = 0.0;   // box
+  double half_extent_y_m = 0.0;   // box
+  double half_extent_z_m = 0.0;   // box
+  std::string mesh_id;      // mesh
+  double mesh_scale_m_per_unit = 1.0;
+  std::array<double, 3> mesh_min_local{};
+  std::array<double, 3> mesh_max_local{};
 
   bool operator==(const primitive&) const = default;
 };
@@ -50,6 +69,8 @@ struct transform {
 enum class node_kind {
   link,
   joint,
+  motor,
+  motor_direction_arrow,
 };
 
 struct scene_node {

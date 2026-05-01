@@ -10,12 +10,14 @@ if(NOT ROBOSIM_BUILD_VIZ)
 endif()
 
 add_executable(robosim_viz_test
+  attachment_test.cpp
   camera_test.cpp
   edit_mode_apply_test.cpp
   edit_mode_builder_test.cpp
   edit_mode_builder_v2_test.cpp
   edit_session_test.cpp
   fixtures.cpp
+  layout_test.cpp
   picking_test.cpp
   scene_snapshot_test.cpp
   vd_e2e_test.cpp
@@ -27,6 +29,8 @@ target_link_libraries(robosim_viz_test
     robosim_viz_edit_apply
     robosim_viz_edit_builder
     robosim_viz_edit_session
+    robosim_viz_layout
+    robosim_viz_imgui
     robosim_description
     robosim_baseline
     GTest::gtest

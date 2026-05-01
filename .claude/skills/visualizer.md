@@ -39,8 +39,12 @@ knowledge for implementers; the architecture doc is the contract.
   joint's origin with Unreal-style ImGuizmo handles (translate /
   rotate, world / local toggle, W / E hotkeys). The gizmo target
   flows through `viz::apply_gizmo_target` (pure logic) into the
-  description's `joint.origin` / `link.visual_origin`; the snapshot
-  rebuilds on each apply.
+  description's `joint.origin` / `link.visual_origin` /
+  `motor.visual_origin`; the snapshot rebuilds on each apply.
+- Attach one entity surface to another with a two-click surface-mate
+  command. `viz::attachment` computes the target transform from two
+  clicked attachment planes, and the UI writes the result through the
+  same `apply_gizmo_target` path as the gizmo.
 - Save / Save As / Reload via the File menu, backed by
   `viz::save_session` and `viz::reload_session`. The serializer is
   `description::save_to_file` (Phase VC4).
@@ -74,8 +78,14 @@ knowledge for implementers; the architecture doc is the contract.
 | Mouse — pan camera              | RMB-drag pans.                                                |
 | Mouse — zoom camera             | Wheel zooms.                                                  |
 | Mouse — pick                    | LMB-click on a primitive selects the corresponding entity.    |
+| Attach command                  | In the Attach window, click `Start attach`; first viewport click captures the moving surface, second viewport click captures the target surface and applies immediately. Hover preview shows the plane that will be captured. |
+| Attach modifiers                | `Offset m` separates along the target normal; `Quarter turns` rotates around the target normal in 90-degree steps; `Flip normal` mates normals in the same direction instead of opposing directions. |
 | File menu                       | Save (writes back to `session.source_path`); Save As (text-input modal — no native file dialog in v0); Reload from disk (with "Discard unsaved changes?" modal when `session.dirty`). |
 | Internal headers (VD)           | `viz/edit_mode_apply.h` (`apply_gizmo_target`); `viz/edit_session.h` (`edit_session`, `load_session`, `save_session`, `reload_session`). |
+| Internal headers (attachment)   | `viz/attachment.h` (`attachment_plane`, `attachment_options`, `pick_attachment_plane`, `compute_attachment_target`). Pure math + picking helper; no description dependency. |
+| Internal headers (VL)           | `viz/layout.h` (`resolve_imgui_ini_path`, `ensure_ini_parent_dir`, `should_apply_default_layout`, `apply_default_dock_layout`, `default_layout_*_window` constants). |
+| Persisted ImGui state           | Saved to `$XDG_CONFIG_HOME/robosim-viz/imgui.ini`, falling back to `$HOME/.config/robosim-viz/imgui.ini`. ImGui handles save automatically on shutdown; the visualizer only resolves the path and creates the parent directory. If neither env var is usable, ImGui's default (`imgui.ini` in CWD) is left in effect. |
+| First-run dock layout           | When the resolved ini does not yet exist, `apply_default_dock_layout` builds Scene top-right, Inspector below it on the right, Gizmo top-left, central viewport bottom-left. Subsequent launches restore the user's saved layout. |
 
 The CLI / hotkeys / panel layout are the **stable public surface** for
 the visualizer. Internal headers (`scene_snapshot.h`,
@@ -223,6 +233,64 @@ These constants are v0 readability defaults, not schema. If schema v2
 adds `link.visual_radius_m`, the builder behavior becomes "use the
 field when present, otherwise keep the `0.05 m` default."
 
+## Surface Attachment
+
+Edit mode includes a Fusion-style surface-mate command for existing
+entities. This is not a persistent constraint solver yet; it is a
+direct edit command that computes a target `world_from_local` and
+writes that transform through `apply_gizmo_target`.
+
+Interaction:
+
+1. User clicks `Start attach` in the Attach window.
+2. First viewport click captures the moving surface.
+3. Second viewport click captures the target surface and applies the
+   attach immediately.
+4. The Attach window only holds modifiers/status:
+   - `Offset m` moves the final mate point along the target normal.
+   - `Quarter turns` rotates around the target normal in 90-degree
+     increments.
+   - `Flip normal` makes normals align in the same direction instead
+     of the default opposing-direction mate.
+
+While armed, the hover plane is shown as a translucent cyan overlay.
+It is intentionally generated as a temporary preview node in the
+render snapshot, not a real scene tree entity.
+
+Implementation shape:
+
+- `attachment_plane` stores `node_index`, `point_world`,
+  `normal_world`, and `tangent_world`.
+- `pick_attachment_plane(scene_snapshot, ray)` converts the current
+  hover/click ray into the surface plane that would be captured.
+- `compute_attachment_target(moving_node, moving_plane, fixed_plane,
+  options)` returns the target transform.
+- The UI applies that target with `apply_gizmo_target`, marks the
+  session dirty, and rebuilds the snapshot.
+
+Supported v0 surfaces:
+
+- Cylinder / arrow caps and cylinder side surfaces.
+- Box faces.
+- Rotation-arrow box proxy.
+- Mesh oriented-AABB faces. This is a proxy, not triangle-level CAD
+  face picking.
+
+Kraken X60 note: the renderer applies a 180-degree Y rotation to the
+Kraken mesh. Picking and attachment bounds account for that same
+orientation so the clicked / previewed face matches the rendered
+motor body.
+
+Current limits:
+
+- No persistent mate records; the result is baked into origins.
+- No constraint solver or automatic re-solving if parent geometry
+  changes later.
+- No live ghost preview of the moving object between click one and
+  click two.
+- No undo stack yet.
+- Mesh picking is by AABB face, not exact triangle face.
+
 ## Schema implications
 
 Edit-mode gizmo manipulation requires joint and link origin transforms
@@ -277,8 +345,22 @@ hidden from sim-core review.
 - **No undo / redo.** Users discard unsaved edits via Reload from
   disk (with confirmation modal). Single-step undo would warrant
   its own design pass on what "undo" means at the description level.
+- **Attachment is baked, not persistent.** The Attach command writes
+  origins immediately via `apply_gizmo_target`; it does not store a
+  persistent mate/constraint record or re-solve when related geometry
+  changes.
+- **Attachment mesh surfaces are approximate.** Mesh attachment uses
+  oriented-AABB faces, not exact mesh triangles or CAD faces. This is
+  acceptable for v0 primitive/mesh proxies but should be revisited
+  when CAD import lands.
 - **Single-node gizmo manipulation only.** v0 manipulates one
   selected node at a time; multi-select is a follow-up.
+- **`--smoke-test` renders two frames.** ImGui's per-frame docking
+  walk needs at least two frames to propagate child dock-node
+  `Size` from `SizeRef` after a saved layout is restored. Exiting
+  after one frame trips an `IM_ASSERT` in
+  `DockContextBindNodeToWindow`. Smoke mode therefore renders two
+  frames before requesting window close.
 
 ## Open follow-ups
 
@@ -297,6 +379,12 @@ hidden from sim-core review.
 - **Joint axis arrow orientation** — render the joint-axis arrow
   along `scene_node::joint_axis_local`, not always local `+Z`.
   Cosmetic but high-impact for non-trivial axes.
+- **Attach ghost preview** — after click one, keep the selected
+  attachment plane visible and show a live ghost of the moving object
+  as the cursor hovers over target surfaces.
+- **Persistent mate records / fixed joints** — decide whether future
+  authoring stores Fusion-style mate constraints, creates fixed joints,
+  or continues baking origins only.
 
 ## Cross-references
 

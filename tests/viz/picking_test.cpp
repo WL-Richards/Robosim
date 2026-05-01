@@ -171,6 +171,23 @@ TEST(Picking, PicksSphereWhenRayPassesThroughCenter) {
   EXPECT_NEAR(hit->t_along_ray, 9.5, kTolerance);
 }
 
+TEST(Picking, KrakenMeshPickUsesRenderedYFlipBounds) {
+  primitive p{};
+  p.kind = primitive_kind::mesh;
+  p.mesh_id = "kraken_x60";
+  p.mesh_scale_m_per_unit = 1.0;
+  p.mesh_min_local = {-1.0, -1.0, -2.0};
+  p.mesh_max_local = {1.0, 1.0, 4.0};
+
+  scene_snapshot snapshot;
+  snapshot.nodes.push_back(shaped_node(p, transform::identity()));
+
+  const auto hit = pick(snapshot, ray{{0.0, 0.0, 10.0}, {0.0, 0.0, -1.0}});
+
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_NEAR(hit->t_along_ray, 8.0, kTolerance);
+}
+
 TEST(Picking, MissesSphereWhenRayPassesOutsideRadius) {
   scene_snapshot snapshot;
   snapshot.nodes.push_back(shaped_node(primitive{primitive_kind::sphere, 0.0, 0.5, 0.0, 0.0, 0.0},

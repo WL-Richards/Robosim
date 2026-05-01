@@ -160,6 +160,23 @@ namespace {
                               p.half_extent_z_m);
     case primitive_kind::sphere:
       return ray_vs_sphere_local(o, d, p.radius_m);
+    case primitive_kind::rotation_arrow:
+      return ray_vs_box_local(o, d, p.radius_m, p.radius_m, 0.01);
+    case primitive_kind::mesh: {
+      const double scale = p.mesh_scale_m_per_unit;
+      const double hx = 0.5 * (p.mesh_max_local[0] - p.mesh_min_local[0]) * scale;
+      const double hy = 0.5 * (p.mesh_max_local[1] - p.mesh_min_local[1]) * scale;
+      const double hz = 0.5 * (p.mesh_max_local[2] - p.mesh_min_local[2]) * scale;
+      const double x_sign = p.mesh_id == "kraken_x60" ? -1.0 : 1.0;
+      const double z_sign = p.mesh_id == "kraken_x60" ? -1.0 : 1.0;
+      const std::array<double, 3> center = {
+          x_sign * 0.5 * (p.mesh_min_local[0] + p.mesh_max_local[0]) * scale,
+          0.5 * (p.mesh_min_local[1] + p.mesh_max_local[1]) * scale,
+          z_sign * 0.5 * (p.mesh_min_local[2] + p.mesh_max_local[2]) * scale,
+      };
+      return ray_vs_box_local({o[0] - center[0], o[1] - center[1], o[2] - center[2]},
+                              d, hx, hy, hz);
+    }
   }
   return std::nullopt;
 }

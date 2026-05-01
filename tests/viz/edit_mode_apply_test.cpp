@@ -227,6 +227,30 @@ TEST(EditModeApply, UnrelatedFieldsAreCopiedThrough) {
   EXPECT_NE(result.joints[0].origin, source.joints[0].origin);
 }
 
+TEST(EditModeApply, AppliesAtMotorWritesMotorVisualOrigin) {
+  const auto source = testing::make_v0_arm_description();
+  const auto snapshot = build_edit_mode_snapshot(source);
+  const auto motor_idx =
+      testing::find_node_index(snapshot, node_kind::motor, "shoulder_motor");
+
+  auto target = snapshot.nodes[motor_idx].world_from_local;
+  target.m[3][0] += 0.125;
+  target.m[3][1] += 0.03125;
+  target.m[3][2] -= 0.0625;
+  const auto result = apply_gizmo_target(source, snapshot, motor_idx, target);
+
+  EXPECT_NE(result.motors[0].visual_origin, source.motors[0].visual_origin);
+  EXPECT_EQ(result.joints, source.joints);
+  EXPECT_EQ(result.links, source.links);
+
+  const auto rebuilt = build_edit_mode_snapshot(result);
+  const auto rebuilt_motor_idx =
+      testing::find_node_index(rebuilt, node_kind::motor, "shoulder_motor");
+  expect_matrix_near(rebuilt.nodes[rebuilt_motor_idx].world_from_local,
+                     target,
+                     tol_1e_9);
+}
+
 // ---------------------------------------------------------------------
 // A6 — identity-rotation no-op apply at root joint returns equal description.
 // ---------------------------------------------------------------------

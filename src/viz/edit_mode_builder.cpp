@@ -20,29 +20,58 @@ namespace desc = robosim::description;
 constexpr double link_default_radius_m = 0.05;
 constexpr double arrow_default_length_m = 0.20;
 constexpr double arrow_default_radius_m = 0.01;
+constexpr double motor_body_half_extent_x_m = 0.08;
+constexpr double motor_body_half_extent_y_m = 0.08;
+constexpr double motor_body_half_extent_z_m = 0.15;
+constexpr double kraken_x60_mesh_scale_m_per_unit = 0.001;
+constexpr double kraken_x60_mesh_min_x = -30.045158;
+constexpr double kraken_x60_mesh_min_y = -33.396683;
+constexpr double kraken_x60_mesh_min_z = -43.377052;
+constexpr double kraken_x60_mesh_max_x = 30.044394;
+constexpr double kraken_x60_mesh_max_y = 32.478725;
+constexpr double kraken_x60_mesh_max_z = 68.603653;
+constexpr double motor_direction_arrow_radius_m = 0.022;
+constexpr double motor_direction_arrow_back_offset_m = 0.003;
 
 constexpr const char* world_parent_token = "world";
 
 primitive make_link_primitive(const desc::link& l) {
-  return primitive{
-      .kind = primitive_kind::cylinder,
-      .length_m = l.length_m,
-      .radius_m = link_default_radius_m,
-      .half_extent_x_m = 0.0,
-      .half_extent_y_m = 0.0,
-      .half_extent_z_m = 0.0,
-  };
+  return primitive{primitive_kind::cylinder, l.length_m, link_default_radius_m,
+                   0.0, 0.0, 0.0};
 }
 
 primitive make_joint_primitive() {
-  return primitive{
-      .kind = primitive_kind::arrow,
-      .length_m = arrow_default_length_m,
-      .radius_m = arrow_default_radius_m,
-      .half_extent_x_m = 0.0,
-      .half_extent_y_m = 0.0,
-      .half_extent_z_m = 0.0,
-  };
+  return primitive{primitive_kind::arrow, arrow_default_length_m,
+                   arrow_default_radius_m, 0.0, 0.0, 0.0};
+}
+
+primitive make_box_motor_body_primitive() {
+  return primitive{primitive_kind::box, 0.0, 0.0, motor_body_half_extent_x_m,
+                   motor_body_half_extent_y_m, motor_body_half_extent_z_m};
+}
+
+primitive make_kraken_x60_motor_body_primitive() {
+  primitive p{};
+  p.kind = primitive_kind::mesh;
+  p.mesh_id = "kraken_x60";
+  p.mesh_scale_m_per_unit = kraken_x60_mesh_scale_m_per_unit;
+  p.mesh_min_local = {kraken_x60_mesh_min_x, kraken_x60_mesh_min_y,
+                      kraken_x60_mesh_min_z};
+  p.mesh_max_local = {kraken_x60_mesh_max_x, kraken_x60_mesh_max_y,
+                      kraken_x60_mesh_max_z};
+  return p;
+}
+
+primitive make_motor_body_primitive(const desc::motor& m) {
+  if (m.motor_model == "kraken_x60") {
+    return make_kraken_x60_motor_body_primitive();
+  }
+  return make_box_motor_body_primitive();
+}
+
+primitive make_motor_direction_arrow_primitive() {
+  return primitive{primitive_kind::rotation_arrow, 0.0,
+                   motor_direction_arrow_radius_m, 0.0, 0.0, 0.0};
 }
 
 // 4x4 column-major homogeneous matmul: out = a * b. Used for the
@@ -80,11 +109,26 @@ desc::transform_4x4 identity_4x4() {
   return m;
 }
 
+desc::transform_4x4 translate_4x4(double x, double y, double z) {
+  desc::transform_4x4 m = identity_4x4();
+  m[3][0] = x;
+  m[3][1] = y;
+  m[3][2] = z;
+  return m;
+}
+
+double motor_back_z_m(const primitive& p) {
+  if (p.kind == primitive_kind::mesh) {
+    return p.mesh_min_local[2] * p.mesh_scale_m_per_unit;
+  }
+  return -p.half_extent_z_m;
+}
+
 }  // namespace
 
 scene_snapshot build_edit_mode_snapshot(const desc::robot_description& d) {
   scene_snapshot snapshot;
-  snapshot.nodes.reserve(d.links.size() + d.joints.size());
+  snapshot.nodes.reserve(d.links.size() + d.joints.size() + (2 * d.motors.size()));
 
   std::unordered_map<std::string, const desc::link*> link_by_name;
   link_by_name.reserve(d.links.size());
@@ -102,6 +146,7 @@ scene_snapshot build_edit_mode_snapshot(const desc::robot_description& d) {
 
   std::unordered_map<std::string, std::size_t> link_index_by_name;
   std::unordered_map<std::string, std::size_t> joint_index_by_name;
+  std::unordered_map<std::string, desc::transform_4x4> joint_kinematic_by_name;
 
   // Per-link kinematic frame in world. For a child link of joint j,
   // link_kinematic[link_name] = parent_link_kinematic *
@@ -139,6 +184,7 @@ scene_snapshot build_edit_mode_snapshot(const desc::robot_description& d) {
     }
     const std::size_t joint_idx = snapshot.nodes.size();
     joint_index_by_name.emplace(j.name, joint_idx);
+    joint_kinematic_by_name.emplace(j.name, joint_kinematic);
     snapshot.nodes.push_back(std::move(joint_node));
 
     const desc::link& child_link = *link_by_name.at(j.child);
@@ -165,6 +211,41 @@ scene_snapshot build_edit_mode_snapshot(const desc::robot_description& d) {
       for (const auto* child_jp : child_joints->second) {
         joint_queue.push({child_jp, link_kinematic});
       }
+    }
+  }
+
+  for (const auto& m : d.motors) {
+    auto joint_it = joint_kinematic_by_name.find(m.joint_name);
+    auto parent_it = joint_index_by_name.find(m.joint_name);
+    if (joint_it == joint_kinematic_by_name.end() || parent_it == joint_index_by_name.end()) {
+      continue;
+    }
+
+    const desc::transform_4x4 motor_visual =
+        mul_4x4(joint_it->second, desc::compose_origin(m.visual_origin));
+
+    scene_node motor_node;
+    motor_node.entity_name = m.name;
+    motor_node.kind = node_kind::motor;
+    motor_node.world_from_local = from_4x4(motor_visual);
+    motor_node.shape = make_motor_body_primitive(m);
+    motor_node.parent_index = parent_it->second;
+    const primitive motor_body_shape = *motor_node.shape;
+    const std::size_t motor_idx = snapshot.nodes.size();
+    snapshot.nodes.push_back(std::move(motor_node));
+
+    if (m.show_direction_arrow) {
+      scene_node arrow_node;
+      arrow_node.entity_name = m.name;
+      arrow_node.kind = node_kind::motor_direction_arrow;
+      arrow_node.world_from_local = from_4x4(mul_4x4(
+          motor_visual,
+          translate_4x4(0.0, 0.0,
+                        motor_back_z_m(motor_body_shape) -
+                            motor_direction_arrow_back_offset_m)));
+      arrow_node.shape = make_motor_direction_arrow_primitive();
+      arrow_node.parent_index = motor_idx;
+      snapshot.nodes.push_back(std::move(arrow_node));
     }
   }
 
