@@ -14,28 +14,18 @@ inline constexpr std::size_t kErrorDetailsLen   = 1024;
 inline constexpr std::size_t kErrorLocationLen  = 256;
 inline constexpr std::size_t kErrorCallStackLen = 1024;
 
-// Truncation flag bit assignments — pinned per L10. Mismatches are
-// silent corruption.
+/** Truncation flag bit assignments for error_message::truncation_flags. */
 inline constexpr std::uint8_t kErrorTruncDetails   = 0b0000'0001;
 inline constexpr std::uint8_t kErrorTruncLocation  = 0b0000'0010;
 inline constexpr std::uint8_t kErrorTruncCallStack = 0b0000'0100;
 
-// Mirrors HAL_SendError parameters. severity is hal_bool (decision #22):
-// 1 = error, 0 = warning/info, matching HAL_SendError's HAL_Bool isError.
-//
-// Field order chosen for zero interior pad: 4-byte primitives first,
-// then 1-byte truncation_flags + 3 trailing pad to align 4, then
-// fixed-size string buffers (alignof 1).
-//   error_code        at 0    (4 bytes)
-//   severity          at 4    (4 bytes)
-//   is_lv_code        at 8    (4 bytes)
-//   print_msg         at 12   (4 bytes)
-//   truncation_flags  at 16   (1 byte; trailing pad 17..19 to align 4)
-//   details           at 20   (1024 bytes)
-//   location          at 1044 (256 bytes)
-//   call_stack        at 1300 (1024 bytes)
-// sizeof = 2324, alignof = 4. Trailing 3 bytes of named-field-pad
-// after truncation_flags are explicit.
+/**
+ * Wire representation of one HAL_SendError call.
+ *
+ * severity mirrors HAL_SendError's HAL_Bool isError argument: 1 for error,
+ * 0 for warning/info. The trailing pad after truncation_flags is named so the
+ * schema has no implicit padding bytes in the serialized prefix.
+ */
 struct error_message {
   std::int32_t error_code;
   hal_bool severity;
@@ -59,6 +49,7 @@ static_assert(alignof(error_message) == 4);
 
 inline constexpr std::size_t kMaxErrorsPerBatch = 8;
 
+/** Bounded batch of HAL_SendError messages using active-prefix serialization. */
 struct error_message_batch {
   std::uint32_t count;
   std::array<std::uint8_t, 4> reserved_pad;  // pad to align 8 if any
@@ -84,12 +75,12 @@ static_assert(offsetof(error_message_batch, messages) == 8,
               "reserved_pad[4]; the production active_prefix_bytes "
               "overload below depends on this offset.");
 
-// Active-prefix wire bytes: 8-byte header (count word + named
-// reserved_pad[4]) + count*element bytes. NOT
-// sizeof(error_message_batch). Per D-C8-PADDING-FREE the schema has
-// zero implicit padding — both reserved_pad fields are named — so
-// every byte in the returned span is part of a named field that
-// participates in operator==.
+/**
+ * Returns the serialized active prefix for an error message batch.
+ *
+ * The prefix contains the 8-byte header and `count * sizeof(error_message)`;
+ * unused batch slots are intentionally omitted.
+ */
 inline std::span<const std::uint8_t> active_prefix_bytes(
     const error_message_batch& batch) {
   const std::size_t active_size =

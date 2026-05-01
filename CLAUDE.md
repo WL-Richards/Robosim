@@ -81,7 +81,11 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
 
 - **Sim core** — Phase A scaffold + Phase B description loader +
   protocol schema/session + Tier 1 shared-memory transport + HAL shim
-  through cycle 39 (Driver Station output pump after protocol v3
+  through cycle 46 (`HAL_GetComments` after `HAL_Report`,
+  `HAL_GetLastError` / `HAL_GetErrorMessage`, port handles,
+  `HAL_GetSerialNumber`, `HAL_GetFPGAVersion` / `HAL_GetFPGARevision`,
+  `HAL_GetTeamNumber`, and `HAL_GetRuntimeType`,
+  protocol v3
   `user_program_observer_snapshot` publication and protocol v2
   `joystick_output_batch` publication;
   v0 outbound surface closed; **power_state read
@@ -93,6 +97,14 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   **`HAL_GetSystemActive`**, **`HAL_GetSystemTimeValid`**,
   **`HAL_GetFPGAButton`**, **`HAL_GetRSLState`**) sharing a
   `clock_state_hal_bool_read` pointer-to-member helper; plus
+  **`HAL_GetRuntimeType`** returning `HAL_Runtime_RoboRIO2`; plus
+  **`HAL_GetTeamNumber`** reading retained boot metadata; plus
+  **`HAL_GetFPGAVersion`** / **`HAL_GetFPGARevision`** returning
+  deterministic v0 FPGA metadata constants with installed-shim status
+  semantics; plus **`HAL_GetSerialNumber`**, **`HAL_GetPort`** /
+  **`HAL_GetPortWithModule`**, **`HAL_GetLastError`** /
+  **`HAL_GetErrorMessage`**, **`HAL_Report`**, and
+  **`HAL_GetComments`**; plus
   **`HAL_SendError`** with per-shim pending buffer and explicit
   `flush_pending_errors`; plus **`HAL_CAN_SendMessage`** with
   per-shim pending CAN frame buffer and explicit
@@ -119,9 +131,9 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   `HAL_ControlWord` named-bit mapping; cycle 24 pinned joystick
   struct byte-copy, ABI layout, and invalid-index zero/default
   semantics).
-  Full project baseline **ctest 679/679** green under `build`; cycle 39
-  focused common suite **131/131** green; cycle 39 focused shim suite
-  **355/355** green. Layer
+  Full project baseline **ctest 729/729** green under `build`; cycle 46
+  focused common suite **131/131** green; cycle 46 focused shim suite
+  **405/405** green. Layer
   3/4/5 not started.
 - **Visualizer** — Phases VA + VB + VC + VD all landed; v0 Edit mode
   functionally complete. **457/457** viz + description tests green.

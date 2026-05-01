@@ -6,10 +6,12 @@
 #include "clock_state.h"
 #include "ds_state.h"
 #include "error_message.h"
+#include "joystick_output.h"
 #include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_session.h"
 #include "shared_memory_transport.h"
+#include "user_program_observer.h"
 
 #include <array>
 #include <cstdint>
@@ -69,6 +71,16 @@ struct joystick_output_state {
   bool operator==(const joystick_output_state&) const = default;
 };
 
+/** One HAL_Report usage entry observed from robot code. */
+struct usage_report_record {
+  std::int32_t resource;
+  std::int32_t instance_number;
+  std::int32_t context;
+  std::string feature;
+
+  bool operator==(const usage_report_record&) const = default;
+};
+
 /**
  * In-process backend-side orchestrator for the HAL <-> Sim Core protocol.
  *
@@ -115,6 +127,12 @@ class shim_core {
   /** Records the latest user-program observer state for host-side v0 use. */
   void observe_user_program(user_program_observer_state state) noexcept;
 
+  /** Records one HAL_Report usage entry and returns its 1-based report index. */
+  [[nodiscard]] std::int64_t record_usage_report(std::int32_t resource,
+                                                 std::int32_t instance_number,
+                                                 std::int32_t context,
+                                                 std::string_view feature);
+
   /** Records the latest joystick outputs for one valid joystick slot. */
   [[nodiscard]] std::int32_t set_joystick_outputs(std::int32_t joystick_num,
                                                   std::int64_t outputs,
@@ -137,6 +155,15 @@ class shim_core {
   /** Publishes a HAL_SendError batch using active-prefix serialization. */
   [[nodiscard]] std::expected<void, shim_error> send_error_message_batch(
       const error_message_batch& batch, std::uint64_t sim_time_us);
+
+  /** Publishes joystick output/rumble state using active-prefix serialization. */
+  [[nodiscard]] std::expected<void, shim_error> send_joystick_output_batch(
+      const joystick_output_batch& batch, std::uint64_t sim_time_us);
+
+  /** Publishes the latest user-program observer mode as one fixed-size snapshot. */
+  [[nodiscard]] std::expected<void, shim_error> send_user_program_observer_snapshot(
+      const ::robosim::backend::user_program_observer_snapshot& snapshot,
+      std::uint64_t sim_time_us);
 
   /** Enqueues one outbound HAL_SendError message, dropping it if the batch is full. */
   void enqueue_error(const error_message& msg) noexcept;
@@ -188,6 +215,31 @@ class shim_core {
   /** Publishes the current notifier table snapshot, including empty tables. */
   [[nodiscard]] std::expected<void, shim_error> flush_notifier_state(std::uint64_t sim_time_us);
 
+  /** Returns a compact active-prefix snapshot of written joystick output slots. */
+  [[nodiscard]] joystick_output_batch current_joystick_output_batch() const noexcept;
+
+  /** Publishes the current joystick output snapshot, including empty snapshots. */
+  [[nodiscard]] std::expected<void, shim_error> flush_joystick_outputs(
+      std::uint64_t sim_time_us);
+
+  /** Returns the latest observer state as a host-visible fixed-size snapshot. */
+  [[nodiscard]] ::robosim::backend::user_program_observer_snapshot
+  current_user_program_observer_snapshot() const noexcept;
+
+  /** Publishes the current observer snapshot, including the default none mode. */
+  [[nodiscard]] std::expected<void, shim_error> flush_user_program_observer(
+      std::uint64_t sim_time_us);
+
+  /**
+   * Publishes the next Driver Station output-side snapshot.
+   *
+   * The pump emits at most one message per call, alternating
+   * user_program_observer_snapshot then joystick_output_batch. It returns the
+   * schema that was published and advances only after a successful send.
+   */
+  [[nodiscard]] std::expected<schema_id, shim_error> flush_next_driver_station_output(
+      std::uint64_t sim_time_us);
+
   /** Waits for a fired alarm, stop wake, or clean wake for an active notifier. */
   [[nodiscard]] std::uint64_t wait_for_notifier_alarm(std::int32_t handle, std::int32_t& status);
 
@@ -231,9 +283,13 @@ class shim_core {
   [[nodiscard]] const std::optional<error_message_batch>& latest_error_message_batch() const;
   /** Latest user-program observer state reported by robot code. */
   [[nodiscard]] user_program_observer_state user_program_observer_state() const noexcept;
+  /** Usage reports recorded through HAL_Report, in call order. */
+  [[nodiscard]] std::span<const usage_report_record> usage_reports() const noexcept;
   /** Latest joystick output state for a valid slot, if one has been written. */
   [[nodiscard]] std::optional<joystick_output_state> joystick_outputs(
       std::int32_t joystick_num) const noexcept;
+  /** Boot descriptor retained from successful construction. */
+  [[nodiscard]] const boot_descriptor& boot_descriptor_snapshot() const noexcept;
 
   shim_core(const shim_core&) = delete;
   shim_core& operator=(const shim_core&) = delete;
@@ -255,7 +311,12 @@ class shim_core {
     shutdown,
   };
 
-  explicit shim_core(tier1::tier1_endpoint endpoint);
+  enum class driver_station_output_flush_phase {
+    user_program_observer,
+    joystick_outputs,
+  };
+
+  explicit shim_core(tier1::tier1_endpoint endpoint, const boot_descriptor& desc);
 
   [[nodiscard]] std::expected<inbound_dispatch_result, shim_error> poll_one();
   void wake_new_data_event_handles() const;
@@ -263,6 +324,7 @@ class shim_core {
   [[nodiscard]] std::int32_t find_notifier_slot(std::int32_t handle) const noexcept;
 
   tier1::tier1_endpoint endpoint_;
+  boot_descriptor boot_descriptor_{};
   bool connected_ = false;
   bool shutdown_observed_ = false;
   std::optional<clock_state> latest_clock_state_;
@@ -279,7 +341,10 @@ class shim_core {
   std::uint32_t pending_can_frame_count_ = 0;
   enum user_program_observer_state user_program_observer_state_ =
       static_cast<enum user_program_observer_state>(0);
+  std::vector<usage_report_record> usage_reports_;
   std::array<std::optional<joystick_output_state>, kMaxJoysticks> joystick_outputs_{};
+  driver_station_output_flush_phase driver_station_output_flush_phase_ =
+      driver_station_output_flush_phase::user_program_observer;
 
   struct can_stream_session {
     bool active = false;

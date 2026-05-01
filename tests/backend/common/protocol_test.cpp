@@ -10,12 +10,14 @@
 #include "clock_state.h"
 #include "ds_state.h"
 #include "error_message.h"
+#include "joystick_output.h"
 #include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_version.h"
 #include "sync_envelope.h"
 #include "truncate.h"
 #include "types.h"
+#include "user_program_observer.h"
 #include "validator.h"
 #include "validator_error.h"
 
@@ -64,6 +66,11 @@ void assert_byte_round_trip() {
     EXPECT_EQ(bytes_in[i] ^ bytes_out[i], 0)
         << "byte " << i << " differs after round-trip";
   }
+}
+
+template <typename T>
+std::span<const std::uint8_t> bytes_of(const T& value) {
+  return {reinterpret_cast<const std::uint8_t*>(&value), sizeof(T)};
 }
 
 // Build a valid envelope for a given kind/schema/payload-bytes. Used
@@ -349,6 +356,121 @@ TEST(Validator, VariableBatchOverCapacityRejected) {
   EXPECT_EQ(r.error().kind, validate_error_kind::payload_size_mismatch);
 }
 
+// Cycle 37 — joystick_output_batch protocol schema.
+TEST(JoystickOutputSchema, LayoutAndActivePrefixBytesArePinned) {
+  EXPECT_TRUE((std::is_trivially_copyable_v<joystick_output_state>));
+  EXPECT_TRUE((std::is_standard_layout_v<joystick_output_state>));
+  EXPECT_TRUE((std::is_aggregate_v<joystick_output_state>));
+  EXPECT_EQ(offsetof(joystick_output_state, joystick_num), 0u);
+  EXPECT_EQ(offsetof(joystick_output_state, reserved_pad), 4u);
+  EXPECT_EQ(offsetof(joystick_output_state, outputs), 8u);
+  EXPECT_EQ(offsetof(joystick_output_state, left_rumble), 16u);
+  EXPECT_EQ(offsetof(joystick_output_state, right_rumble), 20u);
+  EXPECT_EQ(sizeof(joystick_output_state), 24u);
+  EXPECT_EQ(alignof(joystick_output_state), 8u);
+
+  EXPECT_TRUE((std::is_trivially_copyable_v<joystick_output_batch>));
+  EXPECT_TRUE((std::is_standard_layout_v<joystick_output_batch>));
+  EXPECT_TRUE((std::is_aggregate_v<joystick_output_batch>));
+  EXPECT_EQ(offsetof(joystick_output_batch, count), 0u);
+  EXPECT_EQ(offsetof(joystick_output_batch, reserved_pad), 4u);
+  EXPECT_EQ(offsetof(joystick_output_batch, outputs), 8u);
+  EXPECT_EQ(alignof(joystick_output_batch), 8u);
+
+  joystick_output_batch empty{};
+  EXPECT_EQ(active_prefix_bytes(empty).size(), 8u);
+
+  joystick_output_batch two{};
+  two.count = 2;
+  EXPECT_EQ(active_prefix_bytes(two).size(), 56u);
+}
+
+TEST(Validator, JoystickOutputBatchAcceptsOnlyActivePrefixSizes) {
+  for (const std::uint32_t count : {0u, 2u, static_cast<std::uint32_t>(kMaxJoysticks)}) {
+    joystick_output_batch batch{};
+    batch.count = count;
+    auto env = make_envelope(envelope_kind::tick_boundary,
+                             schema_id::joystick_output_batch,
+                             static_cast<std::uint32_t>(active_prefix_bytes(batch).size()));
+    auto r = validate_envelope(env, direction::backend_to_core, 0, active_prefix_bytes(batch));
+    EXPECT_TRUE(r.has_value()) << "count " << count;
+  }
+
+  joystick_output_batch overflow{};
+  overflow.count = static_cast<std::uint32_t>(kMaxJoysticks + 1);
+  auto overflow_env =
+      make_envelope(envelope_kind::tick_boundary, schema_id::joystick_output_batch, 0xFFFF);
+  auto overflow_result =
+      validate_envelope(overflow_env, direction::backend_to_core, 0, bytes_of(overflow));
+  ASSERT_FALSE(overflow_result.has_value());
+  EXPECT_EQ(overflow_result.error().kind, validate_error_kind::payload_size_mismatch);
+
+  joystick_output_batch two{};
+  two.count = 2;
+  auto oversized_env = make_envelope(envelope_kind::tick_boundary,
+                                     schema_id::joystick_output_batch,
+                                     sizeof(joystick_output_batch));
+  auto oversized_result =
+      validate_envelope(oversized_env, direction::backend_to_core, 0, bytes_of(two));
+  ASSERT_FALSE(oversized_result.has_value());
+  EXPECT_EQ(oversized_result.error().kind, validate_error_kind::payload_size_mismatch);
+
+  const auto undersized_payload_bytes =
+      static_cast<std::uint32_t>(active_prefix_bytes(two).size() - 1);
+  auto undersized_env = make_envelope(
+      envelope_kind::tick_boundary, schema_id::joystick_output_batch, undersized_payload_bytes);
+  auto undersized_result =
+      validate_envelope(undersized_env, direction::backend_to_core, 0, bytes_of(two));
+  ASSERT_FALSE(undersized_result.has_value());
+  EXPECT_EQ(undersized_result.error().kind, validate_error_kind::payload_size_mismatch);
+}
+
+// Cycle 38 — user_program_observer_snapshot protocol schema.
+TEST(UserProgramObserverSchema, LayoutAndEnumValuesArePinned) {
+  EXPECT_TRUE((std::is_same_v<std::underlying_type_t<user_program_observer_mode>, std::int32_t>));
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::none), 0);
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::starting), 1);
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::disabled), 2);
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::autonomous), 3);
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::teleop), 4);
+  EXPECT_EQ(static_cast<std::int32_t>(user_program_observer_mode::test), 5);
+
+  EXPECT_TRUE((std::is_trivially_copyable_v<user_program_observer_snapshot>));
+  EXPECT_TRUE((std::is_standard_layout_v<user_program_observer_snapshot>));
+  EXPECT_TRUE((std::is_aggregate_v<user_program_observer_snapshot>));
+  EXPECT_EQ(offsetof(user_program_observer_snapshot, mode), 0u);
+  EXPECT_EQ(offsetof(user_program_observer_snapshot, reserved_pad), 4u);
+  EXPECT_EQ(sizeof(user_program_observer_snapshot), 8u);
+  EXPECT_EQ(alignof(user_program_observer_snapshot), 4u);
+}
+
+TEST(Validator, UserProgramObserverSnapshotRequiresFixedPayloadSize) {
+  user_program_observer_snapshot snapshot{};
+  snapshot.mode = user_program_observer_mode::teleop;
+
+  auto valid_env = make_envelope(envelope_kind::tick_boundary,
+                                 schema_id::user_program_observer_snapshot,
+                                 sizeof(user_program_observer_snapshot));
+  EXPECT_TRUE(validate_envelope(valid_env, direction::backend_to_core, 0, bytes_of(snapshot))
+                  .has_value());
+
+  auto undersized_env = make_envelope(envelope_kind::tick_boundary,
+                                      schema_id::user_program_observer_snapshot,
+                                      sizeof(user_program_observer_snapshot) - 1);
+  auto undersized =
+      validate_envelope(undersized_env, direction::backend_to_core, 0, bytes_of(snapshot));
+  ASSERT_FALSE(undersized.has_value());
+  EXPECT_EQ(undersized.error().kind, validate_error_kind::payload_size_mismatch);
+
+  auto oversized_env = make_envelope(envelope_kind::tick_boundary,
+                                     schema_id::user_program_observer_snapshot,
+                                     sizeof(user_program_observer_snapshot) + 1);
+  auto oversized =
+      validate_envelope(oversized_env, direction::backend_to_core, 0, bytes_of(snapshot));
+  ASSERT_FALSE(oversized.has_value());
+  EXPECT_EQ(oversized.error().kind, validate_error_kind::payload_size_mismatch);
+}
+
 // ---------------------------------------------------------------------------
 // E — round-trip byte-copy contract (every payload struct, pads
 // included)
@@ -362,6 +484,11 @@ TEST(RoundTrip, CanStatus)           { assert_byte_round_trip<can_status>(); }
 TEST(RoundTrip, NotifierSlot)        { assert_byte_round_trip<notifier_slot>(); }
 TEST(RoundTrip, NotifierAlarmEvent)  { assert_byte_round_trip<notifier_alarm_event>(); }
 TEST(RoundTrip, ErrorMessage)        { assert_byte_round_trip<error_message>(); }
+TEST(RoundTrip, JoystickOutputState) { assert_byte_round_trip<joystick_output_state>(); }
+TEST(RoundTrip, JoystickOutputBatch) { assert_byte_round_trip<joystick_output_batch>(); }
+TEST(RoundTrip, UserProgramObserverSnapshot) {
+  assert_byte_round_trip<user_program_observer_snapshot>();
+}
 TEST(RoundTrip, BootDescriptor)      { assert_byte_round_trip<boot_descriptor>(); }
 TEST(RoundTrip, JoystickAxes)        { assert_byte_round_trip<joystick_axes>(); }
 TEST(RoundTrip, JoystickButtons)     { assert_byte_round_trip<joystick_buttons>(); }
@@ -694,7 +821,7 @@ TEST(ErrorMessage, PopulateAndRoundTrip) {
 // ---------------------------------------------------------------------------
 
 TEST(Validator, AcceptsAllValidSchemaIds) {
-  // M1 — every schema_id 0..9 is recognized; specific kind/payload-size
+  // M1 — every schema_id 0..kSchemaIdMaxValid is recognized; specific kind/payload-size
   // constraints are tested in section Q. Here we just verify the
   // validator doesn't bail with unknown_schema_id for the closed set.
   for (std::uint8_t v = 0; v <= kSchemaIdMaxValid; ++v) {
@@ -718,7 +845,7 @@ TEST(Validator, AcceptsAllValidSchemaIds) {
 
 TEST(Validator, RejectsAllOutOfRangeSchemaIds) {
   // M2 — sample at a few out-of-range values
-  for (std::uint8_t v : {std::uint8_t{10}, std::uint8_t{50},
+  for (std::uint8_t v : {std::uint8_t{12}, std::uint8_t{50},
                          std::uint8_t{100}, std::uint8_t{255}}) {
     sync_envelope env{};
     env.magic = kProtocolMagic;
@@ -743,6 +870,13 @@ TEST(SchemaId, RoundTripPreservesUint8) {
     auto s = static_cast<schema_id>(v);
     EXPECT_EQ(static_cast<std::uint8_t>(s), v);
   }
+}
+
+TEST(ProtocolVersion, Cycle38BumpsProtocolForUserProgramObserverSnapshot) {
+  EXPECT_EQ(kProtocolVersion, 3u);
+  EXPECT_EQ(kSchemaIdMaxValid, 11u);
+  EXPECT_EQ(static_cast<std::uint8_t>(schema_id::joystick_output_batch), 10u);
+  EXPECT_EQ(static_cast<std::uint8_t>(schema_id::user_program_observer_snapshot), 11u);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +991,9 @@ TEST(PaddingHygiene, NotifierAlarmEventZeroInit) {
 TEST(PaddingHygiene, ErrorMessageZeroInit) {
   assert_padding_hygiene_zero_init<error_message>();
 }
+TEST(PaddingHygiene, UserProgramObserverSnapshotZeroInit) {
+  assert_padding_hygiene_zero_init<user_program_observer_snapshot>();
+}
 TEST(PaddingHygiene, BootDescriptorZeroInit) {
   assert_padding_hygiene_zero_init<boot_descriptor>();
 }
@@ -893,6 +1030,9 @@ std::uint32_t expected_payload_size_for(schema_id s) {
     case schema_id::notifier_state:       return offsetof(notifier_state, slots);
     case schema_id::notifier_alarm_batch: return offsetof(notifier_alarm_batch, events);
     case schema_id::error_message_batch:  return offsetof(error_message_batch, messages);
+    case schema_id::joystick_output_batch: return offsetof(joystick_output_batch, outputs);
+    case schema_id::user_program_observer_snapshot:
+      return sizeof(user_program_observer_snapshot);
   }
   return 0;
 }

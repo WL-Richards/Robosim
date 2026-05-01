@@ -21,8 +21,8 @@ have their own future TDD cycle.
   layout) that prefixes every HAL ↔ Sim Core exchange.
 - POD payload structs covering the v0 HAL surface: TimedRobot tick,
   Notifier, FPGA timestamp, DS protocol (control word, alliance,
-  match phase, joystick), CAN bus transport, power monitoring,
-  error/log (`HAL_SendError`).
+  match phase, joystick), joystick output publication, CAN bus
+  transport, power monitoring, error/log (`HAL_SendError`).
 - Closed enums: `envelope_kind`, `direction`, `schema_id`,
   `runtime_type`, `validate_error_kind`. Each has a `reserved = 0`
   uninitialized-struct guard where applicable.
@@ -81,6 +81,8 @@ have their own future TDD cycle.
 | `can_status.h`            | Field order matches `HAL_CAN_GetCANStatus` parameter order.                          |
 | `notifier_state.h`        | `notifier_slot`, `notifier_state`, `notifier_alarm_event`, `notifier_alarm_batch`.   |
 | `error_message.h`         | `error_message`, truncation-flag bit constants, `error_message_batch`.               |
+| `joystick_output.h`       | `joystick_output_state`, `joystick_output_batch`, and active-prefix helper for backend-to-core DS output commands. |
+| `user_program_observer.h` | `user_program_observer_mode` and fixed-size `user_program_observer_snapshot` for backend-to-core user-program observer state. |
 | `boot_descriptor.h`       | Boot-envelope payload: `runtime_type`, `team_number`, `vendor_capabilities`, `wpilib_version`. |
 | `validator.h`/`.cpp`      | Pure stateless `validate_envelope`. Owns the `kPerKindAllowedSchemas` table.         |
 | `validator_error.h`       | `validate_error_kind` enum, `validate_error` struct.                                 |
@@ -125,9 +127,11 @@ so future work can quote the right number.
 13. **Notifier table fixed at 32**.
 14. **Error/log truncation is silent with a flag bit** (fork F2 = A);
     truncation is performed by the pure `copy_truncated` helper.
-15. **`schema_id` enum is closed at v0**; adding one bumps
-    `kProtocolVersion`. `none` is valid only with `payload_bytes ==
-    0`.
+15. **`schema_id` enum is closed**; adding one bumps
+    `kProtocolVersion`. Cycle 37 bumped the protocol to v2 for
+    `schema_id::joystick_output_batch`; cycle 38 bumped it to v3 for
+    `schema_id::user_program_observer_snapshot`. `none` is valid only
+    with `payload_bytes == 0`.
 16. **`runtime_type` is closed; v0 accepts only `roborio_2`.**
 17. **`operator== = default` on every payload struct.**
 18. **One header per HAL subsystem** (RIOEmulator's per-FPGA-subsystem
@@ -180,8 +184,12 @@ forks":
 
 ## Schema evolution
 
-`kProtocolVersion` is pinned at the start of every envelope. The gate
-is fatal at the validator (decision #5). When v2 lands:
+`kProtocolVersion` is pinned at the start of every envelope. It is now
+3: cycle 37 added `schema_id::joystick_output_batch` for backend-to-core
+joystick output/rumble snapshots, and cycle 38 added
+`schema_id::user_program_observer_snapshot` for backend-to-core
+user-program observer mode snapshots. The gate is fatal at the validator
+(decision #5). When a future version lands:
 
 - Bump `kProtocolVersion`.
 - Add new `schema_id` values (additive; never reorder the existing
@@ -205,11 +213,11 @@ discipline.
 Structural feature, not a physical model — no real-world quantity to
 compare against. "Validation" here is:
 
-- **106-test suite** in `tests/backend/common/{protocol_test,
+- **131-test suite** in `tests/backend/common/{protocol_test,
   wpilib_parity_test}.cpp`, covering every section A–Q + M0 + O of
-  the approved test plan.
-- All 106 tests pass under `clang Debug`, `gcc Debug`, and
-  `clang Debug + ASAN + UBSAN`.
+  the approved test plan plus the cycle 37/38 DS output schemas.
+- Current local `clang Debug` verification is 131/131 green; older
+  cross-toolchain verification covered the original protocol-schema suite.
 - WPILib byte-parity baselined at v2026.2.2
   (`1fd159938f65ee9d0b22c8a369030b68e0efa82c`).
 

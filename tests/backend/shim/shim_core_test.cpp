@@ -7,12 +7,14 @@
 #include "ds_state.h"
 #include "error_message.h"
 #include "hal_c.h"
+#include "joystick_output.h"
 #include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_session.h"
 #include "protocol_version.h"
 #include "shared_memory_transport.h"
 #include "test_helpers.h"
+#include "user_program_observer.h"
 
 #include <gtest/gtest.h>
 
@@ -24,9 +26,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -45,6 +50,11 @@ extern "C" void WPI_SetEvent(unsigned int handle) {
 }
 
 namespace robosim::backend::shim {
+
+void set_hal_comments_machine_info_path_for_test(std::string_view path);
+void clear_hal_comments_machine_info_path_for_test();
+void reset_hal_comments_cache_for_test();
+
 namespace {
 
 using tier1::tier1_endpoint;
@@ -9857,6 +9867,1771 @@ TEST(HalSetJoystickOutputs, ShutdownMakesLaterCallsFailWithoutMutatingOldShim) {
 
   ASSERT_TRUE(shim.joystick_outputs(0).has_value());
   expect_joystick_output_state_eq(*shim.joystick_outputs(0), 0x11, 0x2222, 0x3333);
+}
+
+// ============================================================================
+// Cycle 37 — joystick output protocol publication.
+// ============================================================================
+
+namespace {
+
+::robosim::backend::joystick_output_state valid_wire_joystick_output(
+    std::int32_t joystick_num,
+    std::int64_t outputs,
+    std::int32_t left_rumble,
+    std::int32_t right_rumble) {
+  ::robosim::backend::joystick_output_state state{};
+  state.joystick_num = joystick_num;
+  state.outputs = outputs;
+  state.left_rumble = left_rumble;
+  state.right_rumble = right_rumble;
+  return state;
+}
+
+::robosim::backend::joystick_output_batch valid_joystick_output_batch(
+    std::span<const ::robosim::backend::joystick_output_state> states = {}) {
+  ::robosim::backend::joystick_output_batch batch{};
+  batch.count = static_cast<std::uint32_t>(states.size());
+  for (std::size_t i = 0; i < states.size() && i < batch.outputs.size(); ++i) {
+    batch.outputs[i] = states[i];
+  }
+  return batch;
+}
+
+::robosim::backend::joystick_output_batch decode_joystick_output_batch(
+    std::span<const std::uint8_t> payload) {
+  ::robosim::backend::joystick_output_batch batch{};
+  std::memcpy(&batch, payload.data(), payload.size());
+  return batch;
+}
+
+void expect_wire_joystick_output_eq(
+    const ::robosim::backend::joystick_output_state& actual,
+    std::int32_t joystick_num,
+    std::int64_t outputs,
+    std::int32_t left_rumble,
+    std::int32_t right_rumble) {
+  EXPECT_EQ(actual.joystick_num, joystick_num);
+  EXPECT_EQ(actual.outputs, outputs);
+  EXPECT_EQ(actual.left_rumble, left_rumble);
+  EXPECT_EQ(actual.right_rumble, right_rumble);
+}
+
+}  // namespace
+
+// C37-4. The typed publisher sends joystick output batches as active-prefix
+// tick_boundary payloads.
+TEST(ShimCoreSend, PublishesJoystickOutputBatchAsTickBoundaryWithActivePrefixWireBytes) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const std::array states{
+      valid_wire_joystick_output(0, 0x1'0000'0001ll, 0, 0xFFFF),
+      valid_wire_joystick_output(5, -1, 0x1234, 0x5678),
+  };
+  const auto batch = valid_joystick_output_batch(states);
+
+  auto sent = shim.send_joystick_output_batch(batch, 250'000);
+  ASSERT_TRUE(sent.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::joystick_output_batch);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  EXPECT_EQ(msg.envelope.payload_bytes, active_prefix_bytes(batch).size());
+  ASSERT_EQ(msg.payload.size(), active_prefix_bytes(batch).size());
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &batch, msg.payload.size()), 0);
+}
+
+// C37-5. A fresh shim flushes an empty snapshot instead of no-oping.
+TEST(HalSetJoystickOutputs, FreshShimFlushPublishesEmptyJoystickOutputSnapshot) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  auto flushed = shim.flush_joystick_outputs(250'000);
+  ASSERT_TRUE(flushed.has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::joystick_output_batch);
+  EXPECT_EQ(msg.envelope.payload_bytes, 8u);
+  ASSERT_EQ(msg.payload.size(), 8u);
+
+  const auto batch = decode_joystick_output_batch(msg.payload);
+  EXPECT_EQ(batch.count, 0u);
+}
+
+// C37-6. Flush compacts written slots in joystick-number order and publishes
+// the latest value for each slot.
+TEST(HalSetJoystickOutputs, FlushPublishesLatestCompactSnapshotSortedByJoystickSlot) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(5, 0x50, 0x1111, 0x2222), kHalSuccess);
+  ASSERT_EQ(HAL_SetJoystickOutputs(1, 0x1'0000'0001ll, -1, 0x1'0000), kHalSuccess);
+  ASSERT_EQ(HAL_SetJoystickOutputs(5, -1, 0x3333, 0x4444), kHalSuccess);
+
+  ASSERT_TRUE(shim.flush_joystick_outputs(300'000).has_value());
+  const auto msg = receive_from_shim(core);
+  const auto batch = decode_joystick_output_batch(msg.payload);
+
+  EXPECT_EQ(batch.count, 2u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 1, 0x1'0000'0001ll, -1, 0x1'0000);
+  expect_wire_joystick_output_eq(batch.outputs[1], 5, -1, 0x3333, 0x4444);
+}
+
+// C37-7. Robot-code HAL calls remain storage-only until host code flushes.
+TEST(HalSetJoystickOutputs, DoesNotPublishUntilExplicitFlush) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(2, 0x22, 0x3333, 0x4444), kHalSuccess);
+  EXPECT_FALSE(core.try_receive().has_value());
+
+  ASSERT_TRUE(shim.flush_joystick_outputs(350'000).has_value());
+  const auto msg = receive_from_shim(core);
+  const auto batch = decode_joystick_output_batch(msg.payload);
+  ASSERT_EQ(batch.count, 1u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 2, 0x22, 0x3333, 0x4444);
+}
+
+// C37-8. Flush republishes the latest snapshot rather than draining it.
+TEST(HalSetJoystickOutputs, RepeatedFlushRepublishesLatestSnapshotWithoutClearingIt) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(4, 0x44, 0x5555, 0x6666), kHalSuccess);
+
+  ASSERT_TRUE(shim.flush_joystick_outputs(100'000).has_value());
+  const auto first = receive_from_shim(core);
+  ASSERT_TRUE(shim.flush_joystick_outputs(200'000).has_value());
+  const auto second = receive_from_shim(core);
+
+  EXPECT_EQ(first.envelope.sequence, 1u);
+  EXPECT_EQ(second.envelope.sequence, 2u);
+  EXPECT_EQ(first.envelope.sim_time_us, 100'000u);
+  EXPECT_EQ(second.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(first.payload, second.payload);
+
+  const auto batch = decode_joystick_output_batch(second.payload);
+  ASSERT_EQ(batch.count, 1u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 4, 0x44, 0x5555, 0x6666);
+}
+
+// C37-9. After protocol shutdown, joystick-output publication short-circuits
+// without touching the outbound lane.
+TEST(HalSetJoystickOutputs, PostShutdownPublicationIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const std::array states{valid_wire_joystick_output(0, 0x11, 0x2222, 0x3333)};
+  const auto batch = valid_joystick_output_batch(states);
+
+  auto sent = shim.send_joystick_output_batch(batch, 250'000);
+  ASSERT_FALSE(sent.has_value());
+  EXPECT_EQ(sent.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  auto flushed = shim.flush_joystick_outputs(300'000);
+  ASSERT_FALSE(flushed.has_value());
+  EXPECT_EQ(flushed.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C37-10. The protocol may frame joystick output batches inbound, but this
+// shim treats them as unsupported host-output traffic.
+TEST(HalSetJoystickOutputs, ProtocolValidInboundJoystickOutputBatchIsRejectedByShim) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto clock = valid_clock_state(140'000);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  EXPECT_EQ(*shim.latest_clock_state(), clock);
+
+  const std::array states{valid_wire_joystick_output(3, 0x33, 0x4444, 0x5555)};
+  const auto batch = valid_joystick_output_batch(states);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::joystick_output_batch,
+                        active_prefix_bytes(batch),
+                        150'000));
+
+  auto polled = shim.poll();
+  ASSERT_FALSE(polled.has_value());
+  EXPECT_EQ(polled.error().kind, shim_error_kind::unsupported_payload_schema);
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  EXPECT_EQ(*shim.latest_clock_state(), clock);
+}
+
+// C37-11. User-program observer state is deliberately not encoded in the
+// joystick-output schema.
+TEST(HalSetJoystickOutputs, ObserverCallsAreNotIncludedInJoystickOutputPublication) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  HAL_ObserveUserProgramStarting();
+  HAL_ObserveUserProgramTeleop();
+  ASSERT_TRUE(shim.flush_joystick_outputs(100'000).has_value());
+  const auto first = receive_from_shim(core);
+  const auto first_batch = decode_joystick_output_batch(first.payload);
+  EXPECT_EQ(first_batch.count, 0u);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::teleop);
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(0, 0xAA, 0xBBBB, 0xCCCC), kHalSuccess);
+  HAL_ObserveUserProgramDisabled();
+  ASSERT_TRUE(shim.flush_joystick_outputs(200'000).has_value());
+  const auto second = receive_from_shim(core);
+  const auto second_batch = decode_joystick_output_batch(second.payload);
+  ASSERT_EQ(second_batch.count, 1u);
+  expect_wire_joystick_output_eq(second_batch.outputs[0], 0, 0xAA, 0xBBBB, 0xCCCC);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::disabled);
+}
+
+// C37-12. Repeating the same write/flush scenario produces byte-identical
+// joystick output payloads with zeroed reserved pads.
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundJoystickOutputBatch) {
+  const auto run = [] {
+    tier1_shared_region region{};
+    tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+    auto shim = make_connected_shim(region, core);
+    shim_global_install_guard guard{shim};
+
+    EXPECT_EQ(HAL_SetJoystickOutputs(3, 0x30, 0x1111, 0x2222), kHalSuccess);
+    EXPECT_EQ(HAL_SetJoystickOutputs(0, 0x1'0000'0001ll, -1, 0x1'0000), kHalSuccess);
+    EXPECT_EQ(HAL_SetJoystickOutputs(3, -1, 0x3333, 0x4444), kHalSuccess);
+    EXPECT_TRUE(shim.flush_joystick_outputs(123'000).has_value());
+    auto msg = core.try_receive();
+    EXPECT_TRUE(msg.has_value());
+    return std::move(msg->payload);
+  };
+
+  const auto first = run();
+  const auto second = run();
+
+  EXPECT_EQ(first, second);
+  ASSERT_EQ(first.size(), second.size());
+  EXPECT_EQ(std::memcmp(first.data(), second.data(), first.size()), 0);
+
+  const auto batch = decode_joystick_output_batch(first);
+  ASSERT_EQ(batch.count, 2u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 0, 0x1'0000'0001ll, -1, 0x1'0000);
+  expect_wire_joystick_output_eq(batch.outputs[1], 3, -1, 0x3333, 0x4444);
+  EXPECT_TRUE(std::ranges::all_of(batch.reserved_pad, [](std::uint8_t b) { return b == 0; }));
+  EXPECT_TRUE(
+      std::ranges::all_of(batch.outputs[0].reserved_pad, [](std::uint8_t b) { return b == 0; }));
+  EXPECT_TRUE(
+      std::ranges::all_of(batch.outputs[1].reserved_pad, [](std::uint8_t b) { return b == 0; }));
+}
+
+// ============================================================================
+// Cycle 38 — user-program observer protocol publication.
+// ============================================================================
+
+namespace {
+
+::robosim::backend::user_program_observer_snapshot observer_snapshot(
+    ::robosim::backend::user_program_observer_mode mode) {
+  ::robosim::backend::user_program_observer_snapshot snapshot{};
+  snapshot.mode = mode;
+  return snapshot;
+}
+
+::robosim::backend::user_program_observer_snapshot decode_user_program_observer_snapshot(
+    std::span<const std::uint8_t> payload) {
+  ::robosim::backend::user_program_observer_snapshot snapshot{};
+  std::memcpy(&snapshot, payload.data(), payload.size());
+  return snapshot;
+}
+
+void expect_observer_payload_mode(const tier1::tier1_message& msg,
+                                  ::robosim::backend::user_program_observer_mode mode) {
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(msg.envelope.payload_bytes,
+            sizeof(::robosim::backend::user_program_observer_snapshot));
+  ASSERT_EQ(msg.payload.size(), sizeof(::robosim::backend::user_program_observer_snapshot));
+  const auto snapshot = decode_user_program_observer_snapshot(msg.payload);
+  EXPECT_EQ(snapshot.mode, mode);
+  EXPECT_TRUE(std::ranges::all_of(snapshot.reserved_pad, [](std::uint8_t b) { return b == 0; }));
+}
+
+}  // namespace
+
+// C38-4. The typed publisher sends one fixed-size observer snapshot as a
+// tick_boundary payload.
+TEST(ShimCoreSend, PublishesUserProgramObserverSnapshotAsTickBoundaryWireBytes) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto snapshot = observer_snapshot(::robosim::backend::user_program_observer_mode::teleop);
+  ASSERT_TRUE(shim.send_user_program_observer_snapshot(snapshot, 250'000).has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.payload_schema, schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(msg.envelope.payload_bytes, sizeof(snapshot));
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  ASSERT_EQ(msg.payload.size(), sizeof(snapshot));
+  EXPECT_EQ(std::memcmp(msg.payload.data(), &snapshot, sizeof(snapshot)), 0);
+}
+
+// C38-5. A fresh shim can publish the default observer snapshot explicitly.
+TEST(HalObserveUserProgram, FreshShimFlushPublishesObserverNoneSnapshot) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  ASSERT_TRUE(shim.flush_user_program_observer(250'000).has_value());
+
+  const auto msg = receive_from_shim(core);
+  EXPECT_EQ(msg.envelope.sequence, 1u);
+  EXPECT_EQ(msg.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(msg.envelope.sim_time_us, 250'000u);
+  expect_observer_payload_mode(msg, ::robosim::backend::user_program_observer_mode::none);
+}
+
+// C38-6. Each HAL observer mode maps to the matching host-visible enum value.
+TEST(HalObserveUserProgram, FlushPublishesLatestObserverModeMapping) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  HAL_ObserveUserProgramStarting();
+  ASSERT_TRUE(shim.flush_user_program_observer(100'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::starting);
+
+  HAL_ObserveUserProgramDisabled();
+  ASSERT_TRUE(shim.flush_user_program_observer(200'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::disabled);
+
+  HAL_ObserveUserProgramAutonomous();
+  ASSERT_TRUE(shim.flush_user_program_observer(300'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::autonomous);
+
+  HAL_ObserveUserProgramTeleop();
+  ASSERT_TRUE(shim.flush_user_program_observer(400'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::teleop);
+
+  HAL_ObserveUserProgramTest();
+  ASSERT_TRUE(shim.flush_user_program_observer(500'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::test);
+}
+
+// C38-7. Observer HAL calls remain storage-only until the host flushes the
+// observer snapshot explicitly.
+TEST(HalObserveUserProgram, DoesNotPublishUntilExplicitObserverFlush) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+  ASSERT_FALSE(core.try_receive().has_value());
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+  HAL_ObserveUserProgramTeleop();
+  EXPECT_FALSE(core.try_receive().has_value());
+
+  ASSERT_TRUE(shim.flush_user_program_observer(125'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::teleop);
+}
+
+// C38-8. Flush republishes the latest observer snapshot instead of clearing it.
+TEST(HalObserveUserProgram, RepeatedFlushRepublishesLatestObserverSnapshotWithoutClearingIt) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  HAL_ObserveUserProgramAutonomous();
+
+  ASSERT_TRUE(shim.flush_user_program_observer(100'000).has_value());
+  const auto first = receive_from_shim(core);
+  ASSERT_TRUE(shim.flush_user_program_observer(200'000).has_value());
+  const auto second = receive_from_shim(core);
+
+  EXPECT_EQ(first.envelope.sequence, 1u);
+  EXPECT_EQ(second.envelope.sequence, 2u);
+  EXPECT_EQ(first.envelope.sim_time_us, 100'000u);
+  EXPECT_EQ(second.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(first.payload, second.payload);
+  expect_observer_payload_mode(first, ::robosim::backend::user_program_observer_mode::autonomous);
+  expect_observer_payload_mode(second, ::robosim::backend::user_program_observer_mode::autonomous);
+}
+
+// C38-9. After protocol shutdown, observer publication short-circuits before
+// touching the outbound lane.
+TEST(HalObserveUserProgram, PostShutdownObserverPublicationIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const auto snapshot = observer_snapshot(::robosim::backend::user_program_observer_mode::disabled);
+  const auto sent = shim.send_user_program_observer_snapshot(snapshot, 10'000);
+  ASSERT_FALSE(sent.has_value());
+  EXPECT_EQ(sent.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const auto flushed = shim.flush_user_program_observer(11'000);
+  ASSERT_FALSE(flushed.has_value());
+  EXPECT_EQ(flushed.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C38-10. The protocol admits the snapshot schema, but shim ingress does not
+// dispatch it as a core-to-backend command.
+TEST(HalObserveUserProgram, ProtocolValidInboundObserverSnapshotIsRejectedByShim) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  const auto clock = valid_clock_state(123'456);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  EXPECT_EQ(*shim.latest_clock_state(), clock);
+
+  const auto snapshot = observer_snapshot(::robosim::backend::user_program_observer_mode::teleop);
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary,
+                        schema_id::user_program_observer_snapshot,
+                        bytes_of(snapshot),
+                        150'000));
+
+  const auto polled = shim.poll();
+  ASSERT_FALSE(polled.has_value());
+  EXPECT_EQ(polled.error().kind, shim_error_kind::unsupported_payload_schema);
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  EXPECT_EQ(*shim.latest_clock_state(), clock);
+}
+
+// C38-11. Joystick outputs are not encoded in the observer snapshot.
+TEST(HalObserveUserProgram, JoystickOutputsAreNotIncludedInObserverPublication) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  ASSERT_EQ(HAL_SetJoystickOutputs(0, 0xAA, 0xBBBB, 0xCCCC), kHalSuccess);
+  ASSERT_TRUE(shim.flush_user_program_observer(100'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::none);
+
+  HAL_ObserveUserProgramDisabled();
+  ASSERT_EQ(HAL_SetJoystickOutputs(0, 0xDD, 0xEEEE, 0xFFFF), kHalSuccess);
+  ASSERT_TRUE(shim.flush_user_program_observer(200'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::disabled);
+}
+
+// C38-12. Repeating the same observer sequence produces byte-identical payloads
+// with zeroed reserved pads.
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalOutboundObserverSnapshot) {
+  const auto run = [] {
+    tier1_shared_region region{};
+    tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+    auto shim = make_connected_shim(region, core);
+    shim_global_install_guard guard{shim};
+    HAL_ObserveUserProgramStarting();
+    HAL_ObserveUserProgramTeleop();
+    HAL_ObserveUserProgramDisabled();
+    EXPECT_TRUE(shim.flush_user_program_observer(123'000).has_value());
+    auto msg = core.try_receive();
+    EXPECT_TRUE(msg.has_value());
+    return std::move(msg->payload);
+  };
+
+  const auto first = run();
+  const auto second = run();
+
+  EXPECT_EQ(first, second);
+  ASSERT_EQ(first.size(), sizeof(::robosim::backend::user_program_observer_snapshot));
+  EXPECT_EQ(std::memcmp(first.data(), second.data(), first.size()), 0);
+  const auto snapshot = decode_user_program_observer_snapshot(first);
+  EXPECT_EQ(snapshot.mode, ::robosim::backend::user_program_observer_mode::disabled);
+  EXPECT_TRUE(std::ranges::all_of(snapshot.reserved_pad, [](std::uint8_t b) { return b == 0; }));
+}
+
+// ============================================================================
+// Cycle 39 — Driver Station output pump.
+// ============================================================================
+
+// C39-1. A fresh pump publishes one default DS-output message per call, in
+// observer-then-joystick order.
+TEST(ShimCoreDriverStationOutputPump, FreshPumpPublishesObserverThenJoystickDefaults) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto first_result = shim.flush_next_driver_station_output(100'000);
+  ASSERT_TRUE(first_result.has_value());
+  EXPECT_EQ(*first_result, schema_id::user_program_observer_snapshot);
+  const auto first = receive_from_shim(core);
+  EXPECT_EQ(first.envelope.sequence, 1u);
+  EXPECT_EQ(first.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(first.envelope.sim_time_us, 100'000u);
+  expect_observer_payload_mode(first, ::robosim::backend::user_program_observer_mode::none);
+
+  const auto second_result = shim.flush_next_driver_station_output(200'000);
+  ASSERT_TRUE(second_result.has_value());
+  EXPECT_EQ(*second_result, schema_id::joystick_output_batch);
+  const auto second = receive_from_shim(core);
+  EXPECT_EQ(second.envelope.sequence, 2u);
+  EXPECT_EQ(second.envelope.kind, envelope_kind::tick_boundary);
+  EXPECT_EQ(second.envelope.sim_time_us, 200'000u);
+  EXPECT_EQ(second.envelope.payload_schema, schema_id::joystick_output_batch);
+  const auto batch = decode_joystick_output_batch(second.payload);
+  EXPECT_EQ(batch.count, 0u);
+  EXPECT_TRUE(std::ranges::all_of(batch.reserved_pad, [](std::uint8_t b) { return b == 0; }));
+}
+
+// C39-2. The pump delegates to the latest cycle-37/38 DS-output snapshots.
+TEST(ShimCoreDriverStationOutputPump, PublishesLatestObserverAndJoystickOutputState) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  HAL_ObserveUserProgramTeleop();
+  ASSERT_EQ(HAL_SetJoystickOutputs(2, 0x22, 0x3333, 0x4444), kHalSuccess);
+
+  const auto first_result = shim.flush_next_driver_station_output(110'000);
+  ASSERT_TRUE(first_result.has_value());
+  EXPECT_EQ(*first_result, schema_id::user_program_observer_snapshot);
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::teleop);
+
+  const auto second_result = shim.flush_next_driver_station_output(120'000);
+  ASSERT_TRUE(second_result.has_value());
+  EXPECT_EQ(*second_result, schema_id::joystick_output_batch);
+  const auto second = receive_from_shim(core);
+  const auto batch = decode_joystick_output_batch(second.payload);
+  ASSERT_EQ(batch.count, 1u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 2, 0x22, 0x3333, 0x4444);
+}
+
+// C39-3. The pump wraps back to observer after joystick and does not clear
+// either underlying snapshot.
+TEST(ShimCoreDriverStationOutputPump, RepeatsObserverJoystickCycleWithoutClearingState) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  HAL_ObserveUserProgramDisabled();
+  ASSERT_EQ(HAL_SetJoystickOutputs(4, 0x44, 0x5555, 0x6666), kHalSuccess);
+
+  std::array<tier1::tier1_message, 4> messages{};
+  std::array<schema_id, 4> schemas{};
+  for (std::size_t i = 0; i < messages.size(); ++i) {
+    const auto result = shim.flush_next_driver_station_output(100'000 + i);
+    ASSERT_TRUE(result.has_value());
+    schemas[i] = *result;
+    messages[i] = receive_from_shim(core);
+    EXPECT_EQ(messages[i].envelope.sequence, i + 1);
+  }
+
+  EXPECT_EQ(schemas[0], schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(schemas[1], schema_id::joystick_output_batch);
+  EXPECT_EQ(schemas[2], schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(schemas[3], schema_id::joystick_output_batch);
+  EXPECT_EQ(messages[0].payload, messages[2].payload);
+  EXPECT_EQ(messages[1].payload, messages[3].payload);
+  expect_observer_payload_mode(messages[0],
+                               ::robosim::backend::user_program_observer_mode::disabled);
+  const auto batch = decode_joystick_output_batch(messages[1].payload);
+  ASSERT_EQ(batch.count, 1u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 4, 0x44, 0x5555, 0x6666);
+}
+
+// C39-4. Backpressure on the selected phase does not skip it.
+TEST(ShimCoreDriverStationOutputPump, LaneBusyFailureDoesNotAdvanceSelectedPhase) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto first_result = shim.flush_next_driver_station_output(100'000);
+  ASSERT_TRUE(first_result.has_value());
+  EXPECT_EQ(*first_result, schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+
+  const auto second_result = shim.flush_next_driver_station_output(200'000);
+  ASSERT_FALSE(second_result.has_value());
+  EXPECT_EQ(second_result.error().kind, shim_error_kind::send_failed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+
+  const auto first = receive_from_shim(core);
+  expect_observer_payload_mode(first, ::robosim::backend::user_program_observer_mode::none);
+
+  const auto third_result = shim.flush_next_driver_station_output(300'000);
+  ASSERT_TRUE(third_result.has_value());
+  EXPECT_EQ(*third_result, schema_id::joystick_output_batch);
+  const auto third = receive_from_shim(core);
+  EXPECT_EQ(third.envelope.payload_schema, schema_id::joystick_output_batch);
+  const auto batch = decode_joystick_output_batch(third.payload);
+  EXPECT_EQ(batch.count, 0u);
+}
+
+// C39-5. After protocol shutdown, the pump short-circuits before touching the
+// outbound lane.
+TEST(ShimCoreDriverStationOutputPump, PostShutdownIsRejectedWithoutTouchingLane) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  ASSERT_TRUE(core.send(envelope_kind::shutdown, schema_id::none, {}, 5'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_shutting_down());
+  ASSERT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+
+  const auto result = shim.flush_next_driver_station_output(10'000);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().kind, shim_error_kind::shutdown_already_observed);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C39-6. HAL calls remain storage-only; the pump is the publication boundary.
+TEST(ShimCoreDriverStationOutputPump, HalCallsDoNotPublishUntilPumpRuns) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+  ASSERT_FALSE(core.try_receive().has_value());
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+  HAL_ObserveUserProgramAutonomous();
+  ASSERT_EQ(HAL_SetJoystickOutputs(1, 0x11, 0x2222, 0x3333), kHalSuccess);
+  EXPECT_FALSE(core.try_receive().has_value());
+
+  const auto result = shim.flush_next_driver_station_output(100'000);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, schema_id::user_program_observer_snapshot);
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::autonomous);
+}
+
+// C39-7. Repeating the same pump scenario produces byte-identical schema and
+// payload output.
+TEST(ShimCoreDeterminism, RepeatedRunsProduceByteIdenticalDriverStationOutputPumpSequence) {
+  const auto run = [] {
+    tier1_shared_region region{};
+    tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+    auto shim = make_connected_shim(region, core);
+    shim_global_install_guard guard{shim};
+    HAL_ObserveUserProgramStarting();
+    EXPECT_EQ(HAL_SetJoystickOutputs(4, 0x40, 0x1111, 0x2222), kHalSuccess);
+
+    std::vector<std::pair<schema_id, std::vector<std::uint8_t>>> output;
+    for (int i = 0; i < 2; ++i) {
+      const auto result = shim.flush_next_driver_station_output(123'000);
+      EXPECT_TRUE(result.has_value());
+      auto msg = core.try_receive();
+      EXPECT_TRUE(msg.has_value());
+      if (result.has_value() && msg.has_value()) {
+        output.emplace_back(*result, std::move(msg->payload));
+      }
+    }
+    return output;
+  };
+
+  const auto first = run();
+  const auto second = run();
+
+  ASSERT_EQ(first.size(), 2u);
+  EXPECT_EQ(first, second);
+  EXPECT_EQ(first[0].first, schema_id::user_program_observer_snapshot);
+  EXPECT_EQ(first[1].first, schema_id::joystick_output_batch);
+  const auto observer = decode_user_program_observer_snapshot(first[0].second);
+  EXPECT_EQ(observer.mode, ::robosim::backend::user_program_observer_mode::starting);
+  const auto batch = decode_joystick_output_batch(first[1].second);
+  ASSERT_EQ(batch.count, 1u);
+  expect_wire_joystick_output_eq(batch.outputs[0], 4, 0x40, 0x1111, 0x2222);
+}
+
+// ============================================================================
+// Cycle 40 — HAL_GetRuntimeType.
+// ============================================================================
+
+// C40-1. The HAL runtime type C ABI mirrors WPILib's HALBase surface, not the
+// robosim protocol runtime_type wire enum.
+TEST(HalGetRuntimeType, EnumAndSignatureMirrorWpilib) {
+  static_assert(std::is_same_v<decltype(&HAL_GetRuntimeType), HAL_RuntimeType (*)()>);
+  static_assert(sizeof(HAL_RuntimeType) == sizeof(std::int32_t));
+
+  EXPECT_EQ(static_cast<std::int32_t>(HAL_Runtime_RoboRIO), 0);
+  EXPECT_EQ(static_cast<std::int32_t>(HAL_Runtime_RoboRIO2), 1);
+  EXPECT_EQ(static_cast<std::int32_t>(HAL_Runtime_Simulation), 2);
+  EXPECT_EQ(static_cast<std::uint8_t>(runtime_type::roborio_2), 2u);
+}
+
+// C40-2. Runtime identity is process metadata and does not require a host
+// installed shim.
+TEST(HalGetRuntimeType, WithNoShimInstalledReturnsRoboRio2) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(HAL_GetRuntimeType(), HAL_Runtime_RoboRIO2);
+}
+
+// C40-3. Runtime queries are read-only: they do not publish outbound traffic
+// and do not poll or consume pending inbound traffic.
+TEST(HalGetRuntimeType, WithInstalledShimDoesNotPublishOrPoll) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(100'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 100'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_GetRuntimeType(), HAL_Runtime_RoboRIO2);
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C40-4. Runtime identity remains stable across normal connection, state
+// updates, and HAL_Shutdown detaching the global shim.
+TEST(HalGetRuntimeType, StaysStableAfterBootStateUpdatesAndShutdown) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+
+  const auto clock = valid_clock_state(42'000);
+  ASSERT_TRUE(
+      core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 42'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  const auto power = valid_power_state();
+  ASSERT_TRUE(
+      core.send(envelope_kind::tick_boundary, schema_id::power_state, bytes_of(power), 43'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  const auto ds = valid_ds_state();
+  ASSERT_TRUE(core.send(envelope_kind::tick_boundary, schema_id::ds_state, bytes_of(ds), 44'000));
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.latest_clock_state().has_value());
+  ASSERT_TRUE(shim.latest_power_state().has_value());
+  ASSERT_TRUE(shim.latest_ds_state().has_value());
+  ASSERT_FALSE(core.try_receive().has_value());
+
+  shim_core::install_global(&shim);
+  EXPECT_EQ(HAL_GetRuntimeType(), HAL_Runtime_RoboRIO2);
+  EXPECT_FALSE(core.try_receive().has_value());
+
+  HAL_Shutdown();
+  ASSERT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(HAL_GetRuntimeType(), HAL_Runtime_RoboRIO2);
+  EXPECT_FALSE(core.try_receive().has_value());
+}
+
+// ============================================================================
+// Cycle 41 — HAL_GetTeamNumber.
+// ============================================================================
+
+// C41-1. make() retains the exact valid boot descriptor it publishes.
+TEST(ShimCoreBootDescriptor, RetainsExactBootDescriptorAfterMake) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto desc = valid_boot_descriptor();
+  desc.reserved3 = {0xA1u, 0xB2u, 0xC3u};
+  desc.team_number = 6328;
+  desc.vendor_capabilities = 0xDEAD'BEEFu;
+  desc.wpilib_version.fill('\0');
+  const char version[] = "WPILib-cycle41";
+  std::memcpy(desc.wpilib_version.data(), version, sizeof(version));
+
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+
+  tier1_endpoint core = make_core(region);
+  const auto boot = receive_from_shim(core);
+  EXPECT_EQ(boot.envelope.payload_schema, schema_id::boot_descriptor);
+  ASSERT_EQ(boot.payload.size(), sizeof(boot_descriptor));
+  EXPECT_EQ(std::memcmp(boot.payload.data(), &desc, sizeof(boot_descriptor)), 0);
+  EXPECT_EQ(std::memcmp(&shim_or->boot_descriptor_snapshot(), &desc, sizeof(boot_descriptor)), 0);
+}
+
+// C41-2. The C HAL ABI has no status parameter and defaults to 0 when no
+// shim is installed.
+TEST(HalGetTeamNumber, SignatureAndNoShimDefault) {
+  static_assert(std::is_same_v<decltype(&HAL_GetTeamNumber), std::int32_t (*)()>);
+
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(HAL_GetTeamNumber(), 0);
+}
+
+// C41-3. Boot metadata is available before boot_ack because it is owned by
+// the backend shim from construction time.
+TEST(HalGetTeamNumber, InstalledShimReturnsBootDescriptorTeamNumberBeforeBootAck) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 971;
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_GetTeamNumber(), 971);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C41-4. HAL_GetTeamNumber preserves the descriptor's int32_t value exactly.
+TEST(HalGetTeamNumber, PreservesBoundaryTeamNumberValuesWithoutClamping) {
+  const std::array<std::int32_t, 4> values{
+      0,
+      -1,
+      std::numeric_limits<std::int32_t>::min(),
+      std::numeric_limits<std::int32_t>::max(),
+  };
+
+  for (const std::int32_t value : values) {
+    tier1_shared_region region{};
+    auto endpoint = make_backend(region);
+    auto desc = valid_boot_descriptor();
+    desc.team_number = value;
+    auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+    ASSERT_TRUE(shim_or.has_value());
+    auto& shim = *shim_or;
+    shim_global_install_guard guard{shim};
+    EXPECT_EQ(HAL_GetTeamNumber(), value);
+  }
+}
+
+// C41-5. Team-number queries do not publish outbound traffic and do not poll
+// pending inbound traffic.
+TEST(HalGetTeamNumber, WithInstalledShimDoesNotPublishOrPoll) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 4414;
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(100'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 100'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_GetTeamNumber(), 4414);
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C41-6. HAL_Shutdown clears the global C HAL view without destroying the
+// caller-owned shim's retained boot descriptor.
+TEST(HalGetTeamNumber, FollowsGlobalDetachWhileShimRetainsBootMetadata) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 2056;
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  drain_boot_only(core);
+  ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, kBootSimTime));
+  auto& shim = *shim_or;
+  ASSERT_TRUE(shim.poll().has_value());
+  ASSERT_TRUE(shim.is_connected());
+
+  shim_core::install_global(&shim);
+  EXPECT_EQ(HAL_GetTeamNumber(), 2056);
+
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(HAL_GetTeamNumber(), 0);
+  EXPECT_EQ(shim.boot_descriptor_snapshot().team_number, 2056);
+}
+
+// ============================================================================
+// Cycle 42 — HAL_GetFPGAVersion / HAL_GetFPGARevision.
+// ============================================================================
+
+// C42-1. The two FPGA metadata C ABI functions keep their distinct return
+// widths and status-writing signatures.
+TEST(HalFpgaMetadata, VersionAndRevisionSignatures) {
+  static_assert(std::is_same_v<decltype(&HAL_GetFPGAVersion),
+                               std::int32_t (*)(std::int32_t*)>);
+  static_assert(std::is_same_v<decltype(&HAL_GetFPGARevision),
+                               std::int64_t (*)(std::int32_t*)>);
+}
+
+// C42-2. With no installed shim, status-writing FPGA metadata reads follow
+// the normal handle-error path.
+TEST(HalFpgaMetadata, WithNoShimInstalledWritesHandleErrorAndReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  std::int32_t version_status = 111;
+  std::int32_t revision_status = 222;
+  EXPECT_EQ(HAL_GetFPGAVersion(&version_status), 0);
+  EXPECT_EQ(HAL_GetFPGARevision(&revision_status), 0);
+  EXPECT_EQ(version_status, kHalHandleError);
+  EXPECT_EQ(revision_status, kHalHandleError);
+}
+
+// C42-3. FPGA metadata is available on an installed shim before boot_ack or
+// any inbound cache state.
+TEST(HalFpgaMetadata, InstalledEmptyCacheShimReturnsConstantsWithSuccess) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  std::int32_t version_status = 111;
+  std::int32_t revision_status = 222;
+  EXPECT_EQ(HAL_GetFPGAVersion(&version_status), 2026);
+  EXPECT_EQ(HAL_GetFPGARevision(&revision_status), 0);
+  EXPECT_EQ(version_status, kHalSuccess);
+  EXPECT_EQ(revision_status, kHalSuccess);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+// C42-4. Both functions independently overwrite status on no-shim and
+// installed paths.
+TEST(HalFpgaMetadata, OverwritesStatusOnRepeatedMixedPaths) {
+  shim_core::install_global(nullptr);
+  std::int32_t no_shim_version_status = 111;
+  std::int32_t no_shim_revision_status = 222;
+  EXPECT_EQ(HAL_GetFPGAVersion(&no_shim_version_status), 0);
+  EXPECT_EQ(HAL_GetFPGARevision(&no_shim_revision_status), 0);
+  EXPECT_EQ(no_shim_version_status, kHalHandleError);
+  EXPECT_EQ(no_shim_revision_status, kHalHandleError);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::int32_t installed_version_status = 333;
+  std::int32_t installed_revision_status = 444;
+  EXPECT_EQ(HAL_GetFPGAVersion(&installed_version_status), 2026);
+  EXPECT_EQ(HAL_GetFPGARevision(&installed_revision_status), 0);
+  EXPECT_EQ(installed_version_status, kHalSuccess);
+  EXPECT_EQ(installed_revision_status, kHalSuccess);
+}
+
+// C42-5. FPGA metadata queries do not publish outbound traffic and do not poll
+// pending inbound traffic.
+TEST(HalFpgaMetadata, InstalledQueriesDoNotPublishOrPoll) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(100'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 100'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  std::int32_t version_status = 111;
+  std::int32_t revision_status = 222;
+  EXPECT_EQ(HAL_GetFPGAVersion(&version_status), 2026);
+  EXPECT_EQ(HAL_GetFPGARevision(&revision_status), 0);
+  EXPECT_EQ(version_status, kHalSuccess);
+  EXPECT_EQ(revision_status, kHalSuccess);
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C42-6. After HAL_Shutdown detaches the global shim, status-writing FPGA
+// metadata reads use the no-shim path.
+TEST(HalFpgaMetadata, PostShutdownFollowsDetachedNoShimPath) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_core::install_global(&shim);
+
+  std::int32_t installed_version_status = 111;
+  std::int32_t installed_revision_status = 222;
+  EXPECT_EQ(HAL_GetFPGAVersion(&installed_version_status), 2026);
+  EXPECT_EQ(HAL_GetFPGARevision(&installed_revision_status), 0);
+  EXPECT_EQ(installed_version_status, kHalSuccess);
+  EXPECT_EQ(installed_revision_status, kHalSuccess);
+
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  std::int32_t shutdown_version_status = 333;
+  std::int32_t shutdown_revision_status = 444;
+  EXPECT_EQ(HAL_GetFPGAVersion(&shutdown_version_status), 0);
+  EXPECT_EQ(HAL_GetFPGARevision(&shutdown_revision_status), 0);
+  EXPECT_EQ(shutdown_version_status, kHalHandleError);
+  EXPECT_EQ(shutdown_revision_status, kHalHandleError);
+}
+
+// ============================================================================
+// Cycle 42 — HAL_GetSerialNumber.
+// ============================================================================
+
+namespace {
+
+class serialnum_env_guard {
+ public:
+  explicit serialnum_env_guard(const char* value) {
+    const char* existing = std::getenv("serialnum");
+    if (existing != nullptr) {
+      had_original_ = true;
+      original_ = existing;
+    }
+
+    if (value == nullptr) {
+      unsetenv("serialnum");
+    } else {
+      setenv("serialnum", value, 1);
+    }
+  }
+
+  ~serialnum_env_guard() {
+    if (had_original_) {
+      setenv("serialnum", original_.c_str(), 1);
+    } else {
+      unsetenv("serialnum");
+    }
+  }
+
+  serialnum_env_guard(const serialnum_env_guard&) = delete;
+  serialnum_env_guard& operator=(const serialnum_env_guard&) = delete;
+
+ private:
+  bool had_original_ = false;
+  std::string original_;
+};
+
+}  // namespace
+
+// C42-1. The C HAL ABI matches WPILib's serial-number metadata signature.
+TEST(HalGetSerialNumber, SignatureMatchesWpilib) {
+  static_assert(std::is_same_v<decltype(&HAL_GetSerialNumber), void (*)(WPI_String*)>);
+}
+
+// C42-2. WPILib's roboRIO implementation reads the process `serialnum`
+// environment variable and falls back to an empty WPI_String when absent.
+TEST(HalGetSerialNumber, UnsetEnvironmentReturnsEmptyStringWithoutShim) {
+  serialnum_env_guard env{nullptr};
+  shim_core::install_global(nullptr);
+
+  owned_wpi_string serial;
+  HAL_GetSerialNumber(&serial.value);
+
+  expect_wpi_string_eq(serial.value, "");
+}
+
+// C42-3. Nonempty serial numbers are copied exactly into caller-owned
+// WPI_String storage and do not require an installed shim.
+TEST(HalGetSerialNumber, CopiesEnvironmentSerialNumberWithoutShim) {
+  serialnum_env_guard env{"0306ad71"};
+  shim_core::install_global(nullptr);
+
+  owned_wpi_string serial;
+  HAL_GetSerialNumber(&serial.value);
+
+  expect_wpi_string_eq(serial.value, "0306ad71");
+}
+
+// C42-4. The serial-number query is read-only metadata: it does not publish
+// outbound traffic and does not poll pending inbound traffic.
+TEST(HalGetSerialNumber, WithInstalledShimDoesNotPublishOrPoll) {
+  serialnum_env_guard env{"sim-roborio-2"};
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 9971;
+  auto shim_or = shim_core::make(std::move(endpoint), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(250'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 250'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  owned_wpi_string serial;
+  HAL_GetSerialNumber(&serial.value);
+
+  expect_wpi_string_eq(serial.value, "sim-roborio-2");
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C42-5. The value is process-environment-backed and remains available after
+// HAL_Shutdown detaches the installed shim.
+TEST(HalGetSerialNumber, FollowsEnvironmentAfterShutdownDetach) {
+  serialnum_env_guard env{"before-shutdown"};
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  drain_boot_only(core);
+  ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, kBootSimTime));
+  auto& shim = *shim_or;
+  ASSERT_TRUE(shim.poll().has_value());
+
+  shim_core::install_global(&shim);
+  owned_wpi_string before;
+  HAL_GetSerialNumber(&before.value);
+  expect_wpi_string_eq(before.value, "before-shutdown");
+
+  setenv("serialnum", "after-shutdown", 1);
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  owned_wpi_string after;
+  HAL_GetSerialNumber(&after.value);
+  expect_wpi_string_eq(after.value, "after-shutdown");
+}
+
+// ============================================================================
+// Cycle 44 — HAL_GetLastError / HAL_GetErrorMessage.
+// ============================================================================
+
+// C44-1. The C HAL ABI mirrors WPILib's status-message signatures.
+TEST(HalErrorMessages, SignaturesMatchWpilibAbi) {
+  static_assert(std::is_same_v<decltype(&HAL_GetLastError), const char* (*)(std::int32_t*)>);
+  static_assert(std::is_same_v<decltype(&HAL_GetErrorMessage), const char* (*)(std::int32_t)>);
+}
+
+// C44-2. Known shim status codes map to stable static message strings.
+TEST(HalErrorMessages, MapsKnownStatusCodes) {
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalSuccess)), "HAL: Success");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalHandleError)),
+            "HAL: A handle parameter was passed incorrectly");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanInvalidBuffer)), "CAN: Invalid Buffer");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanMessageNotFound)),
+            "CAN: Message not found");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNoToken)), "CAN: No token");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNotAllowed)), "CAN: Not allowed");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNotInitialized)),
+            "CAN: Not initialized");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanSessionOverrun)),
+            "CAN: Session overrun");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalUseLastError)),
+            "HAL: Use HAL_GetLastError(status) to get last error");
+}
+
+// C44-3. Unknown codes use a deterministic fallback.
+TEST(HalErrorMessages, UnknownStatusCodeReturnsFallbackMessage) {
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(123456789)), "Unknown error status");
+}
+
+// C44-4. Direct HAL_GetLastError(status) returns the message for the caller's
+// status value without rewriting it.
+TEST(HalGetLastError, DirectStatusCodeReturnsMessageWithoutRewritingStatus) {
+  std::int32_t status = kHalCanInvalidBuffer;
+
+  const char* message = HAL_GetLastError(&status);
+
+  EXPECT_EQ(std::string_view(message), "CAN: Invalid Buffer");
+  EXPECT_EQ(status, kHalCanInvalidBuffer);
+}
+
+// C44-5. The HAL_USE_LAST_ERROR sentinel returns the last non-success status
+// written by this thread and overwrites the status out-param with that code.
+TEST(HalGetLastError, UseLastErrorSentinelReturnsLastWrittenFailureStatus) {
+  shim_core::install_global(nullptr);
+  std::int32_t source_status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&source_status), 0u);
+  ASSERT_EQ(source_status, kHalHandleError);
+
+  std::int32_t status = kHalUseLastError;
+  const char* message = HAL_GetLastError(&status);
+
+  EXPECT_EQ(std::string_view(message), "HAL: A handle parameter was passed incorrectly");
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// C44-6. Successful status writes do not erase the prior last-error value.
+TEST(HalGetLastError, SuccessfulStatusWritesDoNotClearLastFailure) {
+  shim_core::install_global(nullptr);
+  std::int32_t failed_status = 111;
+  std::uint32_t session = 777;
+  HAL_CAN_OpenStreamSession(&session, 0, 0x1fffffff, 1, &failed_status);
+  ASSERT_EQ(failed_status, kHalHandleError);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  std::int32_t success_status = 222;
+  EXPECT_EQ(HAL_GetFPGATime(&success_status), 0u);
+  ASSERT_EQ(success_status, kHalSuccess);
+
+  std::int32_t status = kHalUseLastError;
+  const char* message = HAL_GetLastError(&status);
+
+  EXPECT_EQ(std::string_view(message), "HAL: A handle parameter was passed incorrectly");
+  EXPECT_EQ(status, kHalHandleError);
+}
+
+// ============================================================================
+// Cycle 43 — HAL_GetPort / HAL_GetPortWithModule.
+// ============================================================================
+
+namespace {
+
+HAL_PortHandle expected_port_handle(std::int32_t module, std::int32_t channel) {
+  return static_cast<HAL_PortHandle>((2 << 24) | (module << 8) | channel);
+}
+
+}  // namespace
+
+// C43-1. The C HAL ABI mirrors WPILib's port-handle typedef and signatures.
+TEST(HalGetPort, SignaturesMatchWpilibAbi) {
+  static_assert(std::is_same_v<HAL_Handle, std::int32_t>);
+  static_assert(std::is_same_v<HAL_PortHandle, HAL_Handle>);
+  static_assert(std::is_same_v<decltype(&HAL_GetPort), HAL_PortHandle (*)(std::int32_t)>);
+  static_assert(
+      std::is_same_v<decltype(&HAL_GetPortWithModule),
+                     HAL_PortHandle (*)(std::int32_t, std::int32_t)>);
+}
+
+// C43-2. HAL_GetPort is the single-channel convenience form and uses module 1,
+// matching WPILib's roboRIO implementation.
+TEST(HalGetPort, EncodesChannelWithDefaultModuleOne) {
+  EXPECT_EQ(HAL_GetPort(0), expected_port_handle(1, 0));
+  EXPECT_EQ(HAL_GetPort(1), expected_port_handle(1, 1));
+  EXPECT_EQ(HAL_GetPort(42), expected_port_handle(1, 42));
+  EXPECT_EQ(HAL_GetPort(254), expected_port_handle(1, 254));
+}
+
+// C43-3. HAL_GetPortWithModule preserves both 8-bit fields in WPILib's
+// specialized port-handle layout.
+TEST(HalGetPort, WithModuleEncodesModuleAndChannelFields) {
+  EXPECT_EQ(HAL_GetPortWithModule(0, 0), expected_port_handle(0, 0));
+  EXPECT_EQ(HAL_GetPortWithModule(1, 0), expected_port_handle(1, 0));
+  EXPECT_EQ(HAL_GetPortWithModule(7, 3), expected_port_handle(7, 3));
+  EXPECT_EQ(HAL_GetPortWithModule(254, 254), expected_port_handle(254, 254));
+}
+
+// C43-4. WPILib rejects values that cannot fit in the uint8_t channel/module
+// fields and returns HAL_kInvalidHandle (0).
+TEST(HalGetPort, InvalidInputsReturnInvalidHandle) {
+  EXPECT_EQ(HAL_GetPort(-1), 0);
+  EXPECT_EQ(HAL_GetPort(255), 0);
+  EXPECT_EQ(HAL_GetPort(std::numeric_limits<std::int32_t>::min()), 0);
+  EXPECT_EQ(HAL_GetPort(std::numeric_limits<std::int32_t>::max()), 0);
+
+  EXPECT_EQ(HAL_GetPortWithModule(-1, 0), 0);
+  EXPECT_EQ(HAL_GetPortWithModule(255, 0), 0);
+  EXPECT_EQ(HAL_GetPortWithModule(0, -1), 0);
+  EXPECT_EQ(HAL_GetPortWithModule(0, 255), 0);
+  EXPECT_EQ(HAL_GetPortWithModule(std::numeric_limits<std::int32_t>::min(), 1), 0);
+  EXPECT_EQ(HAL_GetPortWithModule(1, std::numeric_limits<std::int32_t>::max()), 0);
+}
+
+// C43-5. Port handles are pure value constructors. They do not need an
+// installed shim, publish outbound traffic, or poll pending inbound traffic.
+TEST(HalGetPort, WithInstalledShimDoesNotPublishOrPoll) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(350'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 350'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_GetPort(9), expected_port_handle(1, 9));
+  EXPECT_EQ(HAL_GetPortWithModule(4, 12), expected_port_handle(4, 12));
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C43-6. Port handle construction remains available after HAL_Shutdown because
+// it is independent of the installed global shim pointer.
+TEST(HalGetPort, StableAfterShutdownDetach) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  drain_boot_only(core);
+  ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, kBootSimTime));
+  auto& shim = *shim_or;
+  ASSERT_TRUE(shim.poll().has_value());
+
+  shim_core::install_global(&shim);
+  EXPECT_EQ(HAL_GetPort(2), expected_port_handle(1, 2));
+
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(HAL_GetPort(2), expected_port_handle(1, 2));
+  EXPECT_EQ(HAL_GetPortWithModule(6, 5), expected_port_handle(6, 5));
+}
+
+// ============================================================================
+// Cycle 45 — HAL_Report.
+// ============================================================================
+
+// C45-1. The C HAL ABI mirrors WPILib's generated usage-reporting surface.
+TEST(HalReport, SignatureMatchesWpilibAbi) {
+  static_assert(std::is_same_v<decltype(&HAL_Report),
+                               std::int64_t (*)(std::int32_t,
+                                                 std::int32_t,
+                                                 std::int32_t,
+                                                 const char*)>);
+}
+
+// C45-2. With no installed shim, usage reporting is a deterministic no-op.
+TEST(HalReport, WithNoShimInstalledReturnsZero) {
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(HAL_Report(29, 3, 0, "PWM"), 0);
+}
+
+// C45-3. Installed shims retain exact report fields in call order and return a
+// deterministic 1-based report index.
+TEST(HalReport, InstalledShimRecordsReportsInCallOrder) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_Report(29, 3, 0, "left drive"), 1);
+  EXPECT_EQ(HAL_Report(79, 42, 7, "vendor feature"), 2);
+
+  const auto reports = shim.usage_reports();
+  ASSERT_EQ(reports.size(), 2u);
+  EXPECT_EQ(reports[0].resource, 29);
+  EXPECT_EQ(reports[0].instance_number, 3);
+  EXPECT_EQ(reports[0].context, 0);
+  EXPECT_EQ(reports[0].feature, "left drive");
+  EXPECT_EQ(reports[1].resource, 79);
+  EXPECT_EQ(reports[1].instance_number, 42);
+  EXPECT_EQ(reports[1].context, 7);
+  EXPECT_EQ(reports[1].feature, "vendor feature");
+}
+
+// C45-4. Null feature pointers are accepted and stored as empty strings,
+// matching WPILib's HAL_Report implementation.
+TEST(HalReport, NullFeatureIsStoredAsEmptyString) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_Report(13, 0, 0, nullptr), 1);
+
+  const auto reports = shim.usage_reports();
+  ASSERT_EQ(reports.size(), 1u);
+  EXPECT_EQ(reports[0].resource, 13);
+  EXPECT_EQ(reports[0].instance_number, 0);
+  EXPECT_EQ(reports[0].context, 0);
+  EXPECT_EQ(reports[0].feature, "");
+}
+
+// C45-5. Raw integer fields and feature bytes are preserved without enum
+// validation, clamping, or borrowing caller storage.
+TEST(HalReport, PreservesRawFieldsAndCopiesFeatureStorage) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  std::string feature = "initial";
+  EXPECT_EQ(HAL_Report(std::numeric_limits<std::int32_t>::min(),
+                       std::numeric_limits<std::int32_t>::max(),
+                       -7,
+                       feature.c_str()),
+            1);
+  feature = "mutated";
+
+  const auto reports = shim.usage_reports();
+  ASSERT_EQ(reports.size(), 1u);
+  EXPECT_EQ(reports[0].resource, std::numeric_limits<std::int32_t>::min());
+  EXPECT_EQ(reports[0].instance_number, std::numeric_limits<std::int32_t>::max());
+  EXPECT_EQ(reports[0].context, -7);
+  EXPECT_EQ(reports[0].feature, "initial");
+}
+
+// C45-6. HAL_Report is storage-only in v0: it does not publish outbound
+// traffic and does not poll pending inbound traffic.
+TEST(HalReport, WithInstalledShimDoesNotPublishOrPoll) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(450'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 450'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(HAL_Report(22, 4, 0, "TimedRobot"), 1);
+
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+  ASSERT_EQ(shim.usage_reports().size(), 1u);
+}
+
+// C45-7. HAL_Shutdown detaches the global view; later reports are no-ops and
+// do not mutate the caller-owned shim's retained report log.
+TEST(HalReport, PostShutdownReturnsZeroWithoutMutatingOldShim) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_core::install_global(&shim);
+
+  EXPECT_EQ(HAL_Report(31, 1, 0, "drive"), 1);
+  ASSERT_EQ(shim.usage_reports().size(), 1u);
+
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(HAL_Report(31, 2, 0, "after shutdown"), 0);
+  ASSERT_EQ(shim.usage_reports().size(), 1u);
+  EXPECT_EQ(shim.usage_reports()[0].feature, "drive");
+}
+
+// ============================================================================
+// Cycle 46 — HAL_GetComments.
+// ============================================================================
+
+namespace {
+
+class comments_machine_info_guard {
+ public:
+  explicit comments_machine_info_guard(std::string_view file_contents) : path_(next_temp_path()) {
+    write_text(path_, file_contents);
+    set_hal_comments_machine_info_path_for_test(path_.string());
+    reset_hal_comments_cache_for_test();
+  }
+
+  comments_machine_info_guard(std::string_view path, bool missing_path) : path_(path) {
+    (void)missing_path;
+    std::filesystem::remove(path_);
+    set_hal_comments_machine_info_path_for_test(path_.string());
+    reset_hal_comments_cache_for_test();
+  }
+
+  ~comments_machine_info_guard() {
+    clear_hal_comments_machine_info_path_for_test();
+    reset_hal_comments_cache_for_test();
+    std::filesystem::remove(path_);
+  }
+
+  comments_machine_info_guard(const comments_machine_info_guard&) = delete;
+  comments_machine_info_guard& operator=(const comments_machine_info_guard&) = delete;
+
+  const std::filesystem::path& path() const noexcept { return path_; }
+
+  static void write_text(const std::filesystem::path& path, std::string_view text) {
+    std::ofstream out{path};
+    ASSERT_TRUE(out.good());
+    out << text;
+  }
+
+ private:
+  static std::filesystem::path next_temp_path() {
+    static std::atomic<unsigned int> counter{0};
+    return std::filesystem::temp_directory_path() /
+           ("robosim_hal_comments_" + std::to_string(counter.fetch_add(1)));
+  }
+
+  std::filesystem::path path_;
+};
+
+}  // namespace
+
+// C46-1. The C HAL ABI matches WPILib's comments metadata signature.
+TEST(HalGetComments, SignatureMatchesWpilib) {
+  static_assert(std::is_same_v<decltype(&HAL_GetComments), void (*)(WPI_String*)>);
+}
+
+// C46-2. Missing machine-info defaults to an empty comments string and does
+// not require an installed shim.
+TEST(HalGetComments, MissingMachineInfoReturnsEmptyWithoutShim) {
+  const auto missing_path =
+      std::filesystem::temp_directory_path() / "robosim_hal_comments_missing";
+  comments_machine_info_guard machine_info{missing_path.string(), true};
+  shim_core::install_global(nullptr);
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "");
+}
+
+// C46-3. Only PRETTY_HOSTNAME is used; other machine-info keys do not become
+// comments.
+TEST(HalGetComments, AbsentPrettyHostnameReturnsEmpty) {
+  comments_machine_info_guard machine_info{
+      "NAME=\"roborio\"\n"
+      "ID=ni-linux-rt\n"};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "");
+}
+
+// C46-4. Malformed unterminated PRETTY_HOSTNAME values return the empty
+// default instead of partial bytes.
+TEST(HalGetComments, MalformedPrettyHostnameReturnsEmpty) {
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"unterminated\n"};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "");
+}
+
+// C46-5. Normal quoted PRETTY_HOSTNAME contents are copied without the quotes.
+TEST(HalGetComments, CopiesQuotedPrettyHostnameExactly) {
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"Practice Robot 7\"\n"};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "Practice Robot 7");
+}
+
+// C46-6. v0 unescapes the common C-style escape subset used by machine-info.
+TEST(HalGetComments, UnescapesSupportedCStringEscapes) {
+  comments_machine_info_guard machine_info{
+      "PRETTY_HOSTNAME=\"Drive \\\"Alpha\\\" \\\\ path\\nline\\tend\\r\"\n"};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "Drive \"Alpha\" \\ path\nline\tend\r");
+}
+
+// C46-7. WPILib stores comments in a fixed 64-byte buffer; the shim caps the
+// returned unescaped byte string the same way.
+TEST(HalGetComments, CapsReturnedCommentsToSixtyFourUnescapedBytes) {
+  const std::string long_value(70, 'x');
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"" + long_value + "\"\n"};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, std::string(64, 'x'));
+}
+
+// C46-8. Comments are initialized once per process cache, matching WPILib's
+// one-time initialization behavior.
+TEST(HalGetComments, FirstCallCachesComments) {
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"initial comments\"\n"};
+
+  owned_wpi_string first;
+  HAL_GetComments(&first.value);
+  expect_wpi_string_eq(first.value, "initial comments");
+
+  comments_machine_info_guard::write_text(machine_info.path(),
+                                          "PRETTY_HOSTNAME=\"changed comments\"\n");
+
+  owned_wpi_string second;
+  HAL_GetComments(&second.value);
+  expect_wpi_string_eq(second.value, "initial comments");
+}
+
+// C46-9. Comments metadata is read-only: it does not publish outbound traffic
+// and does not poll pending inbound traffic.
+TEST(HalGetComments, WithInstalledShimDoesNotPublishOrPoll) {
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"pit robot\"\n"};
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+
+  const auto state = valid_clock_state(500'000);
+  const auto payload_bytes = bytes_of(state);
+  auto injected_env = make_envelope(envelope_kind::tick_boundary,
+                                    schema_id::clock_state,
+                                    static_cast<std::uint32_t>(payload_bytes.size()),
+                                    0,
+                                    direction::core_to_backend);
+  injected_env.sim_time_us = 500'000;
+  manually_fill_lane(region.core_to_backend, injected_env, payload_bytes);
+
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+
+  expect_wpi_string_eq(comments.value, "pit robot");
+  EXPECT_EQ(region.backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+  EXPECT_EQ(region.core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_FALSE(shim.latest_clock_state().has_value());
+  EXPECT_FALSE(shim.latest_power_state().has_value());
+  EXPECT_FALSE(shim.latest_ds_state().has_value());
+}
+
+// C46-10. Comments are process metadata and remain available after
+// HAL_Shutdown detaches the installed shim.
+TEST(HalGetComments, AvailableAfterShutdownDetach) {
+  comments_machine_info_guard machine_info{"PRETTY_HOSTNAME=\"shutdown comments\"\n"};
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_core::install_global(&shim);
+
+  HAL_Shutdown();
+
+  ASSERT_EQ(shim_core::current(), nullptr);
+  owned_wpi_string comments;
+  HAL_GetComments(&comments.value);
+  expect_wpi_string_eq(comments.value, "shutdown comments");
 }
 
 }  // namespace robosim::backend::shim

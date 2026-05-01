@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -76,6 +78,10 @@ static_assert(offsetof(HAL_MatchInfo, gameSpecificMessageSize) ==
               offsetof(robosim::backend::match_info, game_specific_message_size));
 static_assert(offsetof(WPI_String, str) == 0);
 static_assert(offsetof(WPI_String, len) == sizeof(const char*));
+static_assert(sizeof(HAL_RuntimeType) == sizeof(std::int32_t));
+static_assert(static_cast<std::int32_t>(HAL_Runtime_RoboRIO) == 0);
+static_assert(static_cast<std::int32_t>(HAL_Runtime_RoboRIO2) == 1);
+static_assert(static_cast<std::int32_t>(HAL_Runtime_Simulation) == 2);
 
 namespace robosim::backend::shim {
 namespace {
@@ -86,6 +92,130 @@ namespace {
 // static. v0 is single-threaded; the future threading cycle promotes
 // to std::atomic<shim_core*>.
 shim_core* g_installed_shim_ = nullptr;
+
+inline constexpr std::int32_t kFpgaVersion = 2026;
+inline constexpr std::int64_t kFpgaRevision = 0;
+
+thread_local std::int32_t g_last_error_status_ = kHalSuccess;
+
+std::string g_comments_machine_info_path_override_;
+bool g_comments_cache_initialized_ = false;
+std::string g_comments_cache_;
+
+void write_status(std::int32_t* status, std::int32_t value) noexcept {
+  *status = value;
+  if (value != kHalSuccess) {
+    g_last_error_status_ = value;
+  }
+}
+
+const char* error_message_for_status(std::int32_t code) noexcept {
+  switch (code) {
+    case kHalSuccess:
+      return "HAL: Success";
+    case kHalHandleError:
+      return "HAL: A handle parameter was passed incorrectly";
+    case kHalUseLastError:
+      return "HAL: Use HAL_GetLastError(status) to get last error";
+    case kHalCanInvalidBuffer:
+      return "CAN: Invalid Buffer";
+    case kHalCanMessageNotFound:
+      return "CAN: Message not found";
+    case kHalCanNoToken:
+      return "CAN: No token";
+    case kHalCanNotAllowed:
+      return "CAN: Not allowed";
+    case kHalCanNotInitialized:
+      return "CAN: Not initialized";
+    case kHalCanSessionOverrun:
+      return "CAN: Session overrun";
+    default:
+      return "Unknown error status";
+  }
+}
+
+std::string_view comments_machine_info_path() noexcept {
+  if (!g_comments_machine_info_path_override_.empty()) {
+    return g_comments_machine_info_path_override_;
+  }
+  return "/etc/machine-info";
+}
+
+std::string read_all_text(std::string_view path) {
+  std::ifstream in{std::string{path}, std::ios::binary};
+  if (!in.good()) {
+    return {};
+  }
+
+  std::string contents;
+  char ch = '\0';
+  while (in.get(ch)) {
+    contents.push_back(ch);
+  }
+  return contents;
+}
+
+std::string parse_pretty_hostname(std::string_view contents) {
+  constexpr std::string_view kPrefix = "PRETTY_HOSTNAME=\"";
+  constexpr std::size_t kMaxCommentsBytes = 64;
+
+  const std::size_t start = contents.find(kPrefix);
+  if (start == std::string_view::npos) {
+    return {};
+  }
+
+  std::string out;
+  std::size_t i = start + kPrefix.size();
+  while (i < contents.size()) {
+    const char ch = contents[i++];
+    if (ch == '"') {
+      return out;
+    }
+    if (ch != '\\') {
+      if (out.size() < kMaxCommentsBytes) {
+        out.push_back(ch);
+      }
+      continue;
+    }
+
+    if (i >= contents.size()) {
+      return {};
+    }
+    const char escaped = contents[i++];
+    char decoded = escaped;
+    switch (escaped) {
+      case '"':
+      case '\\':
+        decoded = escaped;
+        break;
+      case 'n':
+        decoded = '\n';
+        break;
+      case 't':
+        decoded = '\t';
+        break;
+      case 'r':
+        decoded = '\r';
+        break;
+      default:
+        decoded = escaped;
+        break;
+    }
+    if (out.size() < kMaxCommentsBytes) {
+      out.push_back(decoded);
+    }
+  }
+
+  return {};
+}
+
+void initialize_comments_cache() {
+  if (g_comments_cache_initialized_) {
+    return;
+  }
+  g_comments_cache_ = parse_pretty_hostname(read_all_text(comments_machine_info_path()));
+  g_comments_cache_initialized_ = true;
+}
 
 // Cycle-17 helper: shared dispatch path for HAL_Bool readers on
 // latest_clock_state_ (D-C17-CLOCK-STATE-HAL-BOOL-HELPER). The
@@ -98,10 +228,10 @@ shim_core* g_installed_shim_ = nullptr;
 HAL_Bool clock_state_hal_bool_read(std::int32_t* status, hal_bool clock_state::*field) {
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_clock_state();
   if (!cached.has_value()) {
     return 0;
@@ -119,6 +249,17 @@ bool valid_joystick_index(std::int32_t joystick_num) noexcept {
 
 bool valid_joystick_axis_index(std::int32_t axis) noexcept {
   return axis >= 0 && axis < static_cast<std::int32_t>(kJoystickAxisTypesLen);
+}
+
+bool valid_port_arg(std::int32_t value) noexcept {
+  return value >= 0 && value < 255;
+}
+
+HAL_PortHandle make_port_handle(std::uint8_t channel, std::uint8_t module) noexcept {
+  constexpr std::int32_t kPortHandleType = 2;
+  return static_cast<HAL_PortHandle>((kPortHandleType << 24) |
+                                     (static_cast<std::int32_t>(module) << 8) |
+                                     static_cast<std::int32_t>(channel));
 }
 
 template <typename HalT>
@@ -192,6 +333,19 @@ shim_core* shim_core::current() noexcept {
   return g_installed_shim_;
 }
 
+void set_hal_comments_machine_info_path_for_test(std::string_view path) {
+  g_comments_machine_info_path_override_ = path;
+}
+
+void clear_hal_comments_machine_info_path_for_test() {
+  g_comments_machine_info_path_override_.clear();
+}
+
+void reset_hal_comments_cache_for_test() {
+  g_comments_cache_initialized_ = false;
+  g_comments_cache_.clear();
+}
+
 }  // namespace robosim::backend::shim
 
 // Cycle-17 file-scope using declarations: bridge the cycle-17 helper
@@ -204,6 +358,7 @@ shim_core* shim_core::current() noexcept {
 // internal linkage.
 using robosim::backend::clock_state;
 using robosim::backend::shim::clock_state_hal_bool_read;
+using robosim::backend::shim::write_status;
 
 extern "C" {
 
@@ -232,6 +387,113 @@ void HAL_Shutdown(void) {
   shim_core::install_global(nullptr);
 }
 
+const char* HAL_GetLastError(std::int32_t* status) {
+  using robosim::backend::shim::error_message_for_status;
+  using robosim::backend::shim::g_last_error_status_;
+  using robosim::backend::shim::kHalUseLastError;
+
+  std::int32_t code = *status;
+  if (code == kHalUseLastError) {
+    code = g_last_error_status_;
+    *status = code;
+  }
+  return error_message_for_status(code);
+}
+
+const char* HAL_GetErrorMessage(std::int32_t code) {
+  return robosim::backend::shim::error_message_for_status(code);
+}
+
+HAL_RuntimeType HAL_GetRuntimeType(void) {
+  return HAL_Runtime_RoboRIO2;
+}
+
+std::int32_t HAL_GetTeamNumber(void) {
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return 0;
+  }
+  return shim->boot_descriptor_snapshot().team_number;
+}
+
+std::int32_t HAL_GetFPGAVersion(std::int32_t* status) {
+  using robosim::backend::shim::kFpgaVersion;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    write_status(status, kHalHandleError);
+    return 0;
+  }
+  write_status(status, kHalSuccess);
+  return kFpgaVersion;
+}
+
+std::int64_t HAL_GetFPGARevision(std::int32_t* status) {
+  using robosim::backend::shim::kFpgaRevision;
+  using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    write_status(status, kHalHandleError);
+    return 0;
+  }
+  write_status(status, kHalSuccess);
+  return kFpgaRevision;
+}
+
+void HAL_GetSerialNumber(WPI_String* serialNumber) {
+  using robosim::backend::shim::assign_wpi_string;
+  using robosim::backend::shim::safe_view;
+
+  assign_wpi_string(serialNumber, safe_view(std::getenv("serialnum")));
+}
+
+void HAL_GetComments(WPI_String* comments) {
+  using robosim::backend::shim::assign_wpi_string;
+  using robosim::backend::shim::g_comments_cache_;
+  using robosim::backend::shim::initialize_comments_cache;
+
+  initialize_comments_cache();
+  assign_wpi_string(comments, std::span<const char>{g_comments_cache_.data(),
+                                                    g_comments_cache_.size()});
+}
+
+HAL_PortHandle HAL_GetPort(std::int32_t channel) {
+  return HAL_GetPortWithModule(1, channel);
+}
+
+HAL_PortHandle HAL_GetPortWithModule(std::int32_t module, std::int32_t channel) {
+  using robosim::backend::shim::make_port_handle;
+  using robosim::backend::shim::valid_port_arg;
+
+  if (!valid_port_arg(module) || !valid_port_arg(channel)) {
+    return 0;
+  }
+  return make_port_handle(static_cast<std::uint8_t>(channel),
+                          static_cast<std::uint8_t>(module));
+}
+
+std::int64_t HAL_Report(std::int32_t resource,
+                        std::int32_t instanceNumber,
+                        std::int32_t context,
+                        const char* feature) {
+  using robosim::backend::shim::safe_view;
+  using robosim::backend::shim::shim_core;
+
+  shim_core* shim = shim_core::current();
+  if (shim == nullptr) {
+    return 0;
+  }
+  return shim->record_usage_report(resource, instanceNumber, context, safe_view(feature));
+}
+
 std::uint64_t HAL_GetFPGATime(std::int32_t* status) {
   using robosim::backend::shim::kHalHandleError;
   using robosim::backend::shim::kHalSuccess;
@@ -239,10 +501,10 @@ std::uint64_t HAL_GetFPGATime(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_clock_state();
   if (!cached.has_value()) {
     return 0;
@@ -257,10 +519,10 @@ double HAL_GetVinVoltage(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0.0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_power_state();
   if (!cached.has_value()) {
     return 0.0;
@@ -276,10 +538,10 @@ double HAL_GetVinCurrent(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0.0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_power_state();
   if (!cached.has_value()) {
     return 0.0;
@@ -295,10 +557,10 @@ double HAL_GetBrownoutVoltage(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0.0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_power_state();
   if (!cached.has_value()) {
     return 0.0;
@@ -334,10 +596,10 @@ std::int32_t HAL_GetCommsDisableCount(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   const auto& cached = shim->latest_clock_state();
   if (!cached.has_value()) {
     return 0;
@@ -386,10 +648,10 @@ HAL_AllianceStationID HAL_GetAllianceStation(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return HAL_AllianceStationID_kUnknown;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
 
   const auto& cached = shim->latest_ds_state();
   if (!cached.has_value()) {
@@ -405,10 +667,10 @@ double HAL_GetMatchTime(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0.0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
 
   const auto& cached = shim->latest_ds_state();
   if (!cached.has_value()) {
@@ -773,15 +1035,15 @@ void HAL_CAN_SendMessage(std::uint32_t messageID,
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
   if (dataSize > 8 || (data == nullptr && dataSize > 0) || periodMs < -1) {
-    *status = kHalCanInvalidBuffer;
+    write_status(status, kHalCanInvalidBuffer);
     return;
   }
 
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   if (periodMs == kHalCanSendPeriodStopRepeating) {
     return;
   }
@@ -822,12 +1084,12 @@ void HAL_CAN_ReceiveMessage(std::uint32_t* messageID,
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
     zero_outputs();
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
   if (data == nullptr) {
     zero_scalars();
-    *status = kHalCanInvalidBuffer;
+    write_status(status, kHalCanInvalidBuffer);
     return;
   }
 
@@ -835,7 +1097,7 @@ void HAL_CAN_ReceiveMessage(std::uint32_t* messageID,
   const auto& cached = shim->latest_can_frame_batch();
   if (!cached.has_value()) {
     zero_outputs();
-    *status = kHalCanMessageNotFound;
+    write_status(status, kHalCanMessageNotFound);
     return;
   }
 
@@ -848,12 +1110,12 @@ void HAL_CAN_ReceiveMessage(std::uint32_t* messageID,
     std::memcpy(data, frame.data.data(), frame.data.size());
     *dataSize = frame.data_size;
     *timeStamp = frame.timestamp_us;
-    *status = kHalSuccess;
+    write_status(status, kHalSuccess);
     return;
   }
 
   zero_outputs();
-  *status = kHalCanMessageNotFound;
+  write_status(status, kHalCanMessageNotFound);
 }
 
 void HAL_CAN_OpenStreamSession(std::uint32_t* sessionHandle,
@@ -870,18 +1132,18 @@ void HAL_CAN_OpenStreamSession(std::uint32_t* sessionHandle,
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
     *sessionHandle = 0;
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
   if (maxMessages == 0) {
     *sessionHandle = 0;
-    *status = kHalCanInvalidBuffer;
+    write_status(status, kHalCanInvalidBuffer);
     return;
   }
 
   const std::uint32_t handle = shim->open_can_stream_session(messageID, messageIDMask, maxMessages);
   *sessionHandle = handle;
-  *status = handle == 0 ? kHalCanNotAllowed : kHalSuccess;
+  write_status(status, handle == 0 ? kHalCanNotAllowed : kHalSuccess);
 }
 
 void HAL_CAN_CloseStreamSession(std::uint32_t sessionHandle) {
@@ -907,12 +1169,12 @@ void HAL_CAN_ReadStreamSession(std::uint32_t sessionHandle,
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
     *messagesRead = 0;
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
   if (messages == nullptr && messagesToRead > 0) {
     *messagesRead = 0;
-    *status = kHalCanInvalidBuffer;
+    write_status(status, kHalCanInvalidBuffer);
     return;
   }
 
@@ -928,7 +1190,7 @@ void HAL_CAN_ReadStreamSession(std::uint32_t sessionHandle,
     messages[i].dataSize = frames[i].data_size;
   }
   *messagesRead = read_count;
-  *status = read_status;
+  write_status(status, read_status);
 }
 
 void HAL_CAN_GetCANStatus(float* percentBusUtilization,
@@ -949,10 +1211,10 @@ void HAL_CAN_GetCANStatus(float* percentBusUtilization,
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
 
   const auto& cached = shim->latest_can_status();
   if (!cached.has_value()) {
@@ -973,16 +1235,16 @@ HAL_NotifierHandle HAL_InitializeNotifier(std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
 
   const std::int32_t handle = shim->initialize_notifier();
   if (handle == 0) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   return handle;
 }
 
@@ -995,10 +1257,10 @@ void HAL_SetNotifierName(HAL_NotifierHandle notifierHandle,
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
-  *status = shim->set_notifier_name(notifierHandle, safe_view(name));
+  write_status(status, shim->set_notifier_name(notifierHandle, safe_view(name)));
 }
 
 HAL_Bool HAL_SetNotifierThreadPriority(HAL_Bool realTime,
@@ -1013,10 +1275,10 @@ HAL_Bool HAL_SetNotifierThreadPriority(HAL_Bool realTime,
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  *status = kHalSuccess;
+  write_status(status, kHalSuccess);
   return 1;
 }
 
@@ -1026,10 +1288,10 @@ void HAL_StopNotifier(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
-  *status = shim->stop_notifier(notifierHandle);
+  write_status(status, shim->stop_notifier(notifierHandle));
 }
 
 void HAL_CleanNotifier(HAL_NotifierHandle notifierHandle) {
@@ -1050,10 +1312,10 @@ void HAL_UpdateNotifierAlarm(HAL_NotifierHandle notifierHandle,
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
-  *status = shim->update_notifier_alarm(notifierHandle, triggerTime);
+  write_status(status, shim->update_notifier_alarm(notifierHandle, triggerTime));
 }
 
 void HAL_CancelNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
@@ -1062,22 +1324,26 @@ void HAL_CancelNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* st
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return;
   }
-  *status = shim->cancel_notifier_alarm(notifierHandle);
+  write_status(status, shim->cancel_notifier_alarm(notifierHandle));
 }
 
 std::uint64_t HAL_WaitForNotifierAlarm(HAL_NotifierHandle notifierHandle, std::int32_t* status) {
   using robosim::backend::shim::kHalHandleError;
+  using robosim::backend::shim::kHalSuccess;
   using robosim::backend::shim::shim_core;
 
   shim_core* shim = shim_core::current();
   if (shim == nullptr) {
-    *status = kHalHandleError;
+    write_status(status, kHalHandleError);
     return 0;
   }
-  return shim->wait_for_notifier_alarm(notifierHandle, *status);
+  std::int32_t result_status = kHalSuccess;
+  const std::uint64_t result = shim->wait_for_notifier_alarm(notifierHandle, result_status);
+  write_status(status, result_status);
+  return result;
 }
 
 }  // extern "C"

@@ -43,8 +43,9 @@ struct shim_core::notifier_wait_state {
   bool shutdown_wake = false;
 };
 
-shim_core::shim_core(tier1::tier1_endpoint endpoint)
+shim_core::shim_core(tier1::tier1_endpoint endpoint, const boot_descriptor& desc)
     : endpoint_(std::move(endpoint)),
+      boot_descriptor_(desc),
       notifier_wait_state_(std::make_shared<notifier_wait_state>()) {}
 
 std::expected<shim_core, shim_error> shim_core::make(tier1::tier1_endpoint endpoint,
@@ -57,7 +58,7 @@ std::expected<shim_core, shim_error> shim_core::make(tier1::tier1_endpoint endpo
   if (!sent.has_value()) {
     return std::unexpected(wrap_send_error(std::move(sent.error())));
   }
-  return shim_core{std::move(endpoint)};
+  return shim_core{std::move(endpoint), desc};
 }
 
 std::expected<void, shim_error> shim_core::poll() {
@@ -238,6 +239,19 @@ void shim_core::observe_user_program(enum user_program_observer_state state) noe
   user_program_observer_state_ = state;
 }
 
+std::int64_t shim_core::record_usage_report(std::int32_t resource,
+                                            std::int32_t instance_number,
+                                            std::int32_t context,
+                                            std::string_view feature) {
+  usage_reports_.push_back(usage_report_record{
+      resource,
+      instance_number,
+      context,
+      std::string{feature},
+  });
+  return static_cast<std::int64_t>(usage_reports_.size());
+}
+
 std::int32_t shim_core::set_joystick_outputs(std::int32_t joystick_num,
                                              std::int64_t outputs,
                                              std::int32_t left_rumble,
@@ -288,6 +302,44 @@ std::expected<void, shim_error> shim_core::send_error_message_batch(
   auto sent = endpoint_.send(envelope_kind::tick_boundary,
                              schema_id::error_message_batch,
                              active_prefix_bytes(batch),
+                             sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(wrap_send_error(std::move(sent.error())));
+  }
+  return {};
+}
+
+std::expected<void, shim_error> shim_core::send_joystick_output_batch(
+    const joystick_output_batch& batch, std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  auto sent = endpoint_.send(envelope_kind::tick_boundary,
+                             schema_id::joystick_output_batch,
+                             active_prefix_bytes(batch),
+                             sim_time_us);
+  if (!sent.has_value()) {
+    return std::unexpected(wrap_send_error(std::move(sent.error())));
+  }
+  return {};
+}
+
+std::expected<void, shim_error> shim_core::send_user_program_observer_snapshot(
+    const ::robosim::backend::user_program_observer_snapshot& snapshot,
+    std::uint64_t sim_time_us) {
+  if (shutdown_observed_) {
+    return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
+                                      std::nullopt,
+                                      "kind",
+                                      "shim already observed shutdown; refusing further outbound"});
+  }
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(&snapshot);
+  auto sent = endpoint_.send(envelope_kind::tick_boundary,
+                             schema_id::user_program_observer_snapshot,
+                             std::span<const std::uint8_t>{bytes, sizeof(snapshot)},
                              sim_time_us);
   if (!sent.has_value()) {
     return std::unexpected(wrap_send_error(std::move(sent.error())));
@@ -600,6 +652,85 @@ std::expected<void, shim_error> shim_core::flush_notifier_state(std::uint64_t si
   return send_notifier_state(current_notifier_state(), sim_time_us);
 }
 
+joystick_output_batch shim_core::current_joystick_output_batch() const noexcept {
+  joystick_output_batch batch{};
+  for (std::size_t joystick = 0; joystick < joystick_outputs_.size(); ++joystick) {
+    const auto& stored = joystick_outputs_[joystick];
+    if (!stored.has_value()) {
+      continue;
+    }
+    auto& out = batch.outputs[batch.count];
+    out.joystick_num = static_cast<std::int32_t>(joystick);
+    out.outputs = stored->outputs;
+    out.left_rumble = stored->left_rumble;
+    out.right_rumble = stored->right_rumble;
+    ++batch.count;
+  }
+  return batch;
+}
+
+std::expected<void, shim_error> shim_core::flush_joystick_outputs(std::uint64_t sim_time_us) {
+  return send_joystick_output_batch(current_joystick_output_batch(), sim_time_us);
+}
+
+::robosim::backend::user_program_observer_snapshot
+shim_core::current_user_program_observer_snapshot() const noexcept {
+  ::robosim::backend::user_program_observer_snapshot snapshot{};
+  switch (user_program_observer_state_) {
+    case user_program_observer_state::none:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::none;
+      break;
+    case user_program_observer_state::starting:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::starting;
+      break;
+    case user_program_observer_state::disabled:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::disabled;
+      break;
+    case user_program_observer_state::autonomous:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::autonomous;
+      break;
+    case user_program_observer_state::teleop:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::teleop;
+      break;
+    case user_program_observer_state::test:
+      snapshot.mode = ::robosim::backend::user_program_observer_mode::test;
+      break;
+  }
+  return snapshot;
+}
+
+std::expected<void, shim_error> shim_core::flush_user_program_observer(
+    std::uint64_t sim_time_us) {
+  return send_user_program_observer_snapshot(current_user_program_observer_snapshot(), sim_time_us);
+}
+
+std::expected<schema_id, shim_error> shim_core::flush_next_driver_station_output(
+    std::uint64_t sim_time_us) {
+  switch (driver_station_output_flush_phase_) {
+    case driver_station_output_flush_phase::user_program_observer: {
+      auto flushed = flush_user_program_observer(sim_time_us);
+      if (!flushed.has_value()) {
+        return std::unexpected(flushed.error());
+      }
+      driver_station_output_flush_phase_ = driver_station_output_flush_phase::joystick_outputs;
+      return schema_id::user_program_observer_snapshot;
+    }
+    case driver_station_output_flush_phase::joystick_outputs: {
+      auto flushed = flush_joystick_outputs(sim_time_us);
+      if (!flushed.has_value()) {
+        return std::unexpected(flushed.error());
+      }
+      driver_station_output_flush_phase_ =
+          driver_station_output_flush_phase::user_program_observer;
+      return schema_id::joystick_output_batch;
+    }
+  }
+  return std::unexpected(shim_error{shim_error_kind::unsupported_payload_schema,
+                                    std::nullopt,
+                                    "driver_station_output_flush_phase",
+                                    "unknown Driver Station output flush phase"});
+}
+
 std::uint64_t shim_core::wait_for_notifier_alarm(std::int32_t handle, std::int32_t& status) {
   std::unique_lock lock{notifier_wait_state_->mutex};
 
@@ -733,12 +864,20 @@ user_program_observer_state shim_core::user_program_observer_state() const noexc
   return user_program_observer_state_;
 }
 
+std::span<const usage_report_record> shim_core::usage_reports() const noexcept {
+  return usage_reports_;
+}
+
 std::optional<joystick_output_state> shim_core::joystick_outputs(
     std::int32_t joystick_num) const noexcept {
   if (joystick_num < 0 || joystick_num >= static_cast<std::int32_t>(kMaxJoysticks)) {
     return std::nullopt;
   }
   return joystick_outputs_[static_cast<std::size_t>(joystick_num)];
+}
+
+const boot_descriptor& shim_core::boot_descriptor_snapshot() const noexcept {
+  return boot_descriptor_;
 }
 
 }  // namespace robosim::backend::shim

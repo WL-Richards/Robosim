@@ -5,6 +5,7 @@
 
 namespace robosim::backend {
 
+/** Stateless protocol validation failure categories. */
 enum class validate_error_kind {
   magic_mismatch,
   version_mismatch,
@@ -18,6 +19,7 @@ enum class validate_error_kind {
   unsupported_runtime,
 };
 
+/** Detailed validation failure with a stable field name for test assertions. */
 struct validate_error {
   validate_error_kind kind;
   std::string offending_field_name;

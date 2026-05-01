@@ -8,18 +8,20 @@
 
 namespace robosim::backend {
 
-// 32-byte fixed envelope that prefixes every HAL ↔ Sim Core exchange.
-// Wire-contract layout (TEST_PLAN section C1):
-//   magic            at  0  (4 bytes)
-//   protocol_version at  4  (2 bytes)
-//   kind             at  6  (2 bytes)
-//   sequence         at  8  (8 bytes)
-//   sim_time_us      at 16  (8 bytes)
-//   payload_bytes    at 24  (4 bytes)
-//   payload_schema   at 28  (1 byte)
-//   sender           at 29  (1 byte)
-//   reserved         at 30  (2 bytes; sender writes zero, validator
-//                            ignores per decision #24)
+/**
+ * Fixed-size envelope that prefixes every HAL <-> Sim Core exchange.
+ *
+ * Wire-contract layout (TEST_PLAN section C1):
+ *   magic            at  0  (4 bytes)
+ *   protocol_version at  4  (2 bytes)
+ *   kind             at  6  (2 bytes)
+ *   sequence         at  8  (8 bytes)
+ *   sim_time_us      at 16  (8 bytes)
+ *   payload_bytes    at 24  (4 bytes)
+ *   payload_schema   at 28  (1 byte)
+ *   sender           at 29  (1 byte)
+ *   reserved         at 30  (2 bytes; sender writes zero, validator ignores)
+ */
 struct sync_envelope {
   std::array<char, 4> magic;
   std::uint16_t protocol_version;

@@ -11,57 +11,55 @@
 
 namespace robosim::backend {
 
-// Closed envelope_kind → allowed-payload_schema mapping. Exposed so
-// tests and the future transport-layer session can both read the same
-// table. Adding a kind/schema combination is a kProtocolVersion bump
-// (decision #15).
-//
-// Each row of this table corresponds to one envelope_kind; the bool[N]
-// indexed by schema_id underlying value indicates allowance.
+/**
+ * One row in the closed envelope_kind -> payload_schema allowance table.
+ *
+ * The bool array is indexed by the underlying schema_id value. Adding a new
+ * allowed kind/schema combination changes the protocol contract and requires a
+ * kProtocolVersion bump.
+ */
 struct kind_schema_allowance {
   envelope_kind kind;
-  std::array<bool, 10> allowed_by_schema_id;  // index = schema_id value
+  std::array<bool, 12> allowed_by_schema_id;  // index = schema_id value
 };
 
+/** Shared current-protocol kind/schema allowance table used by tests, sessions, and transports. */
 inline constexpr std::array<kind_schema_allowance, 6> kPerKindAllowedSchemas{{
     // boot → {boot_descriptor}
     {envelope_kind::boot,
-     {false, false, false, false, false, false, false, false, false, true}},
+     {false, false, false, false, false, false, false, false, false, true, false, false}},
     // boot_ack → {none} (with payload_bytes == 0)
     {envelope_kind::boot_ack,
-     {true, false, false, false, false, false, false, false, false, false}},
+     {true, false, false, false, false, false, false, false, false, false, false, false}},
     // tick_boundary → all per-tick-published schemas (closed; no
     //                 boot_descriptor, no none)
     {envelope_kind::tick_boundary,
-     {false, true, true, true, true, true, true, true, true, false}},
+     {false, true, true, true, true, true, true, true, true, false, true, true}},
     // on_demand_request → request set; error_message_batch excluded
     //                     (errors are pushed, not requested)
     {envelope_kind::on_demand_request,
-     {false, true, true, true, true, true, true, true, false, false}},
+     {false, true, true, true, true, true, true, true, false, false, false, false}},
     // on_demand_reply → reply set including error_message_batch (a
     //                   reply may carry a synchronous error result)
     {envelope_kind::on_demand_reply,
-     {false, true, true, true, true, true, true, true, true, false}},
+     {false, true, true, true, true, true, true, true, true, false, false, false}},
     // shutdown → {none}
     {envelope_kind::shutdown,
-     {true, false, false, false, false, false, false, false, false, false}},
+     {true, false, false, false, false, false, false, false, false, false, false, false}},
 }};
 
-// Pure stateless envelope validator. Caller provides the expected
-// sender direction and the expected sequence number for that direction.
-// Sequence-counter ownership lives in the future transport-cycle
-// protocol_session (decision #19 / fork F4).
-//
-// Fixed-size schemas have known payload_bytes; the validator looks
-// these up in a table built from sizeof(<struct>) at compile time.
-//
-// For variable-size batch schemas (can_frame_batch,
-// notifier_alarm_batch, error_message_batch, notifier_state), the
-// validator decodes the batch HEADER (the count field) from the
-// payload prefix and checks payload_bytes consistency. It does NOT
-// decode any element body — that remains the receiver's job once
-// framing is validated. Crossing this line would silently take on
-// transport-cycle scope (TEST_PLAN D17 boundary comment).
+/**
+ * Validates a sync envelope without mutating any session state.
+ *
+ * @param env Envelope to check.
+ * @param expected_sender Direction required for env.sender.
+ * @param expected_sequence Exact sequence number required for env.sequence.
+ * @param payload Payload bytes, required for variable-size schema checks.
+ *
+ * Fixed-size schemas are checked against sizeof(schema struct). Variable-size
+ * batches decode only their count header and expected active-prefix length;
+ * element bodies remain the receiver's responsibility after framing is valid.
+ */
 [[nodiscard]] std::expected<void, validate_error>
 validate_envelope(const sync_envelope& env,
                   direction expected_sender,

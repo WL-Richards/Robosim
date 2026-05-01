@@ -24,6 +24,7 @@ namespace robosim::backend::shim {
  */
 inline constexpr std::int32_t kHalSuccess = 0;
 inline constexpr std::int32_t kHalHandleError = -1;
+inline constexpr std::int32_t kHalUseLastError = -1156;
 inline constexpr std::int32_t kHalCanInvalidBuffer = -44086;
 inline constexpr std::int32_t kHalCanMessageNotFound = -44087;
 inline constexpr std::int32_t kHalCanNoToken = 44087;
@@ -50,8 +51,39 @@ typedef unsigned int WPI_Handle;
 /** Mirrors WPILib WPI_EventHandle from wpi/Synchronization.h. */
 typedef WPI_Handle WPI_EventHandle;
 
+/** Mirrors WPILib HAL_Handle from hal/include/hal/Types.h. */
+typedef std::int32_t HAL_Handle;
+
+/** Mirrors WPILib HAL_PortHandle from hal/include/hal/Types.h. */
+typedef HAL_Handle HAL_PortHandle;
+
 /** Mirrors WPILib HAL_NotifierHandle from hal/include/hal/Types.h. */
 typedef std::int32_t HAL_NotifierHandle;
+
+/** Mirrors WPILib HAL_RuntimeType from hal/include/hal/HALBase.h. */
+enum HAL_RuntimeType : std::int32_t {
+  HAL_Runtime_RoboRIO = 0,
+  HAL_Runtime_RoboRIO2 = 1,
+  HAL_Runtime_Simulation = 2,
+};
+
+/**
+ * Mirrors WPILib HAL_GetLastError from hal/include/hal/HALBase.h.
+ *
+ * If `*status == kHalUseLastError`, returns the last non-success status
+ * written by this thread and overwrites `*status` with that code. Otherwise,
+ * returns the message for the caller-provided status code. `status` must not
+ * be null.
+ */
+const char* HAL_GetLastError(std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_GetErrorMessage from hal/include/hal/HALBase.h.
+ *
+ * Returns static storage for known shim status codes and a stable fallback for
+ * unknown codes. The returned pointer must not be freed.
+ */
+const char* HAL_GetErrorMessage(std::int32_t code);
 
 /**
  * Mirrors WPILib HAL_ControlWord from hal/include/hal/DriverStationTypes.h.
@@ -167,6 +199,73 @@ HAL_Bool HAL_Initialize(std::int32_t timeout, std::int32_t mode);
  * caller-owned shim object is not destroyed.
  */
 void HAL_Shutdown(void);
+
+/** Mirrors WPILib HAL_GetRuntimeType from hal/include/hal/HALBase.h. */
+HAL_RuntimeType HAL_GetRuntimeType(void);
+
+/** Mirrors WPILib HAL_GetTeamNumber from hal/include/hal/HALBase.h. */
+std::int32_t HAL_GetTeamNumber(void);
+
+/**
+ * Mirrors WPILib HAL_GetFPGAVersion from hal/include/hal/HALBase.h.
+ *
+ * v0 reports the modeled roboRIO FPGA compatibility year. No installed shim
+ * writes kHalHandleError and returns 0; an installed shim writes kHalSuccess.
+ */
+std::int32_t HAL_GetFPGAVersion(std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_GetFPGARevision from hal/include/hal/HALBase.h.
+ *
+ * v0 reports 0 until hardware profile metadata exists. No installed shim
+ * writes kHalHandleError and returns 0; an installed shim writes kHalSuccess.
+ */
+std::int64_t HAL_GetFPGARevision(std::int32_t* status);
+
+/**
+ * Mirrors WPILib HAL_GetSerialNumber from hal/include/hal/HALBase.h.
+ *
+ * Copies the current `serialnum` environment variable into a heap-owned
+ * WPI_String. If unset or empty, returns {nullptr, 0}. Nonempty strings must be
+ * freed by the caller with the same allocator family as WPI_FreeString/std::free.
+ */
+void HAL_GetSerialNumber(WPI_String* serialNumber);
+
+/**
+ * Mirrors WPILib HAL_GetComments from hal/include/hal/HALBase.h.
+ *
+ * Copies the cached roboRIO comments metadata into a heap-owned WPI_String.
+ * v0 reads `/etc/machine-info` PRETTY_HOSTNAME and returns an empty string
+ * when comments are unavailable.
+ */
+void HAL_GetComments(WPI_String* comments);
+
+/**
+ * Mirrors WPILib HAL_GetPort from hal/include/hal/HALBase.h.
+ *
+ * Returns a port handle with WPILib's port-handle bit layout, using module 1.
+ * Invalid channels (<0 or >=255) return HAL_kInvalidHandle (0).
+ */
+HAL_PortHandle HAL_GetPort(std::int32_t channel);
+
+/**
+ * Mirrors WPILib HAL_GetPortWithModule from hal/include/hal/HALBase.h.
+ *
+ * Returns a port handle with WPILib's port-handle bit layout. Invalid channels
+ * or modules (<0 or >=255) return HAL_kInvalidHandle (0).
+ */
+HAL_PortHandle HAL_GetPortWithModule(std::int32_t module, std::int32_t channel);
+
+/**
+ * Mirrors WPILib HAL_Report from hal/include/hal/FRCUsageReporting.h.
+ *
+ * v0 records reports on the installed shim for host-side inspection and
+ * returns a deterministic 1-based report index. No installed shim returns 0.
+ */
+std::int64_t HAL_Report(std::int32_t resource,
+                        std::int32_t instanceNumber,
+                        std::int32_t context,
+                        const char* feature);
 
 /**
  * Mirrors WPILib HAL_GetFPGATime from hal/include/hal/HALBase.h.

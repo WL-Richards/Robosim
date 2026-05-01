@@ -6,8 +6,10 @@
 #include "clock_state.h"
 #include "ds_state.h"
 #include "error_message.h"
+#include "joystick_output.h"
 #include "notifier_state.h"
 #include "power_state.h"
+#include "user_program_observer.h"
 
 #include <cstring>
 #include <format>
@@ -36,11 +38,14 @@ constexpr std::uint32_t fixed_payload_size(schema_id s) {
     case schema_id::ds_state:             return sizeof(ds_state);
     case schema_id::can_status:           return sizeof(can_status);
     case schema_id::boot_descriptor:      return sizeof(boot_descriptor);
+    case schema_id::user_program_observer_snapshot:
+      return sizeof(user_program_observer_snapshot);
     // variable-size:
     case schema_id::can_frame_batch:
     case schema_id::notifier_state:
     case schema_id::notifier_alarm_batch:
     case schema_id::error_message_batch:
+    case schema_id::joystick_output_batch:
       return 0;
   }
   return 0;
@@ -50,7 +55,8 @@ constexpr bool is_variable_size(schema_id s) {
   return s == schema_id::can_frame_batch
       || s == schema_id::notifier_state
       || s == schema_id::notifier_alarm_batch
-      || s == schema_id::error_message_batch;
+      || s == schema_id::error_message_batch
+      || s == schema_id::joystick_output_batch;
 }
 
 // For variable-size schemas: read the count from the start of the
@@ -98,6 +104,12 @@ expected_variable_payload_size(schema_id s,
           offsetof(error_message_batch, messages));
       element_size = sizeof(error_message);
       capacity = static_cast<std::uint32_t>(kMaxErrorsPerBatch);
+      break;
+    case schema_id::joystick_output_batch:
+      header_size = static_cast<std::uint32_t>(
+          offsetof(joystick_output_batch, outputs));
+      element_size = sizeof(joystick_output_state);
+      capacity = static_cast<std::uint32_t>(kMaxJoysticks);
       break;
     default:
       return 0u;  // not variable

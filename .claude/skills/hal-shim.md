@@ -1,6 +1,6 @@
 ---
 name: hal-shim
-description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 36: boot handshake, all eight inbound per-tick cache slots, shutdown terminal receive path, outbound `send_can_frame_batch`, `send_notifier_state`, and `send_error_message_batch` publishers, and C HAL ABI surfaces through the clock/power reads, error/CAN write surfaces, CAN one-shot/stream RX/status, DS scalar/joystick/match/descriptor reads, `HAL_RefreshDSData`, DS new-data event handles, `HAL_GetOutputsEnabled`, user-program observer calls, and `HAL_SetJoystickOutputs`, plus Notifier lifecycle/priority/wait and HALBase lifecycle (`HAL_Initialize` / `HAL_Shutdown`). Cycle 36 added `HAL_SetJoystickOutputs`: no-shim and invalid joystick indices return `kHalHandleError`; valid slots `0..5` record per-shim latest `joystick_output_state { outputs, left_rumble, right_rumble }` exposed through documented host-facing `shim_core::joystick_outputs()`, fresh/invalid accessor reads return `std::nullopt`, repeated writes are latest-wins per slot, raw signed C ABI values are preserved without clamp/narrowing, calls do not publish to existing outbound schemas, and post-`HAL_Shutdown` calls fail because the global shim is detached. Cycle 35 added `HAL_ObserveUserProgramStarting` / `Disabled` / `Autonomous` / `Teleop` / `Test`: no-shim calls are no-ops; installed shims record a per-shim latest `user_program_observer_state` (`none`, `starting`, `disabled`, `autonomous`, `teleop`, `test`) exposed through documented host-facing `shim_core::user_program_observer_state()`; calls are latest-wins, do not publish to existing outbound schemas, and post-`HAL_Shutdown` calls are no-ops because the global shim is detached. Cycle 34 added `HAL_GetOutputsEnabled`: no shim or empty DS cache returns false; cached DS state returns true only when both `kControlEnabled` and `kControlDsAttached` are set, matching WPILib sim's `enabled && dsAttached` expression with no extra e-stop gating. Cycle 33 added `HAL_ProvideNewDataEventHandle` / `HAL_RemoveNewDataEventHandle`: `WPI_Handle` and `WPI_EventHandle` mirror WPILib as unsigned int with invalid handle 0, registrations are unique and per shim object, no-shim/zero/remove-unknown are no-ops, and accepted `ds_state` packets wake registered handles through weak `WPI_SetEvent` from the shared dispatch path used by both `poll()` and `HAL_RefreshDSData`; valid non-DS packets and post-shutdown paths do not wake. Cycle 32 added `HAL_RefreshDSData`: no shim returns false; an installed shim performs one inbound receive/dispatch step, returns true only for accepted `ds_state`, returns false for no message, valid non-DS messages, errors, and shutdown, and preserves getter-visible DS values across no-message/non-DS/shutdown paths. Cycle 31 added `HAL_CAN_ReceiveMessage` against the older WPILib `hal/CAN.h` signature: `messageID` is in/out, masked matching reuses cycle-21 equality, the source is only the current `latest_can_frame_batch_` active prefix, first matching active frame wins, no-shim is `kHalHandleError`, null data with an installed shim is `kHalCanInvalidBuffer`, and empty/no-match is `kHalCanMessageNotFound` rather than stream no-token. Cycle 30 added `HAL_GetAllJoystickData` as the all-six-slots aggregate axes/POV/button read. Cycle 29 added `HAL_GetMatchInfo`, `HAL_GetJoystickDescriptor`, `HAL_GetJoystickIsXbox`, `HAL_GetJoystickType`, `HAL_GetJoystickName`, and `HAL_GetJoystickAxisType`: status-returning metadata reads zero/default on no-shim or empty cache, valid slots copy byte-for-byte, invalid joystick/axis scalar helpers return zero, descriptor invalid indices succeed with zero/default output, and `HAL_GetJoystickName` returns heap-owned `WPI_String` bytes or `{nullptr, 0}`. Cycle 28 keeps shim ownership with the host: `HAL_Initialize` succeeds only when a shim is already installed, ignores timeout/mode in v0, and is idempotent/reentrant for concurrent read-only calls; `HAL_Shutdown` wakes pending HAL waits, clears the process-global shim pointer, and leaves the caller-owned shim object intact. Cycle 27 added `HAL_WaitForNotifierAlarm` as a real synchronized wait path over inbound `notifier_alarm_batch` events: matching alarm events drain FIFO by handle, stop wakes waiters with `0/kHalSuccess`, clean and shutdown wake with `0/kHalHandleError`, cancel does not wake, invalid handles report `kHalHandleError`, and the latest-wins alarm-batch observer cache stays separate from the wait queue. CAN streams use nonzero handles, masked-ID filtering, per-session FIFO queues, no pre-open backfill, independent multi-stream copies, newest-kept overflow with one-shot `HAL_ERR_CANSessionMux_SessionOverrun`, `HAL_WARN_CANSessionMux_NoToken` for valid empty reads, and `HAL_ERR_CANSessionMux_NotAllowed` for invalid/closed handles. Driver Station reads come from `latest_ds_state_` with zero/default no-shim or empty-cache behavior as pinned by cycles 23-36. Notifier handles are nonzero, monotonic, not reused in v0, compacted into `notifier_state` by allocation order, and invalid/cleaned handles report `kHalHandleError`; names are zero-filled with null as empty and 63-byte truncation; empty notifier flush publishes a header-only snapshot; `HAL_SetNotifierThreadPriority` is a v0 no-op/status surface. Does not yet cover protocol publication for DS output/observer state, on-demand request/reply, shim-initiated protocol shutdown, broader threading, or reset/reconnect.
+description: Use when working on the in-process HAL shim (`src/backend/shim/`) — the orchestrator the user's robot binary loads to talk to the Sim Core. Through cycle 46: boot handshake, retained boot descriptor metadata, all eight inbound per-tick cache slots, shutdown terminal receive path, outbound `send_can_frame_batch`, `send_notifier_state`, `send_error_message_batch`, `send_joystick_output_batch`, and `send_user_program_observer_snapshot` publishers, plus the `flush_next_driver_station_output` pump, and C HAL ABI surfaces through the clock/power reads, HALBase metadata/support (`HAL_GetRuntimeType`, `HAL_GetTeamNumber`, `HAL_GetFPGAVersion`, `HAL_GetFPGARevision`, `HAL_GetSerialNumber`, `HAL_GetPort`, `HAL_GetPortWithModule`, `HAL_GetLastError`, `HAL_GetErrorMessage`, `HAL_Report`, `HAL_GetComments`), error/CAN write surfaces, CAN one-shot/stream RX/status, DS scalar/joystick/match/descriptor reads, `HAL_RefreshDSData`, DS new-data event handles, `HAL_GetOutputsEnabled`, user-program observer calls, and `HAL_SetJoystickOutputs`, plus Notifier lifecycle/priority/wait and HALBase lifecycle (`HAL_Initialize` / `HAL_Shutdown`). Cycle 46 added `HAL_GetComments`: it reads and caches `/etc/machine-info` `PRETTY_HOSTNAME`, returns empty for unavailable/absent/malformed values, unescapes common C-style escapes, caps to WPILib's 64-byte comments buffer, does not require a shim, does not publish or poll, and remains available after shutdown detach. Cycle 45 added `HAL_Report`: no shim returns 0; installed shims append copied usage reports and return deterministic 1-based indices without publish/poll. Cycle 44 added `HAL_GetLastError` / `HAL_GetErrorMessage`: known shim status codes map to static strings, unknown codes return a stable fallback, and `kHalUseLastError` returns the thread-local last non-success status. Cycle 43 added `HAL_GetPort` / `HAL_GetPortWithModule`: pure local WPILib port-handle value constructors. Cycle 42 added paired FPGA metadata queries: `HAL_GetFPGAVersion` returns `2026` and `HAL_GetFPGARevision` returns `0` with `kHalSuccess` only when a shim is installed; no installed shim returns 0 with `kHalHandleError`; calls do not publish, poll, or require inbound cache state, and post-`HAL_Shutdown` follows the detached no-shim path. Cycle 41 retained the exact successfully published `boot_descriptor` in `shim_core::boot_descriptor_snapshot()` and added `HAL_GetTeamNumber`: no installed shim returns 0, installed shims return retained `boot_descriptor.team_number` before or after boot_ack without clamping, calls do not publish or poll, and `HAL_Shutdown` detaches the global view without clearing caller-owned boot metadata. Driver Station reads come from `latest_ds_state_` with zero/default no-shim or empty-cache behavior as pinned by cycles 23-36. Notifier handles are nonzero, monotonic, not reused in v0, compacted into `notifier_state` by allocation order, and invalid/cleaned handles report `kHalHandleError`; names are zero-filled with null as empty and 63-byte truncation; empty notifier flush publishes a header-only snapshot; `HAL_SetNotifierThreadPriority` is a v0 no-op/status surface. Does not yet cover combined DS-output host-state messages, on-demand request/reply, shim-initiated protocol shutdown, broader threading, device-family HAL surfaces, or reset/reconnect.
 ---
 
 # HAL shim core
@@ -96,12 +96,13 @@ model); shim+populated cache → `kHalSuccess`, return cached
 sim_time_us. Status is written unconditionally (D-C12-STATUS-
 WRITE-UNCONDITIONAL); NULL `status` is UB matching WPILib.
 Future cycles cover on-demand request/reply, shim-initiated
-`shutdown`, protocol publication for DS output/observer state, broader threading, and reset/
+`shutdown`, protocol publication for user-program observer state,
+combined DS-output host-state messages, broader threading, and reset/
 reconnect.
 
 ## Scope
 
-**In (cycles 1–23):**
+**In (cycles 1–42):**
 - `shim_core::make(endpoint, desc, sim_time_us)` — moves the caller-
   owned `tier1_endpoint` into the shim and immediately publishes one
   `boot` envelope carrying `desc` via `endpoint.send`.
@@ -134,6 +135,22 @@ reconnect.
   shutdown short-circuit and `wrap_send_error` semantics. Calls the
   production `backend::active_prefix_bytes(batch)` helper in
   `error_message.h`.
+- `shim_core::send_joystick_output_batch(batch, sim_time_us)` (cycle 37)
+  — publishes protocol v2 `joystick_output_batch` as a `tick_boundary`
+  envelope into the shim's outbound `backend_to_core` lane. Sends exactly
+  the active prefix (`offsetof(joystick_output_batch, outputs) +
+  batch.count * sizeof(joystick_output_state)`). Same shutdown short-
+  circuit and `wrap_send_error` semantics as the earlier typed publishers.
+  Protocol-valid inbound joystick-output batches remain unsupported by
+  shim dispatch because they are host-output traffic, not sim-authoritative
+  input state.
+- `shim_core::send_user_program_observer_snapshot(snapshot, sim_time_us)`
+  (cycle 38) — publishes protocol v3 `user_program_observer_snapshot` as a
+  fixed-size `tick_boundary` payload into the shim's outbound
+  `backend_to_core` lane. Same shutdown short-circuit and `wrap_send_error`
+  semantics as the earlier typed publishers. Protocol-valid inbound observer
+  snapshots remain unsupported by shim dispatch because they are host-output
+  traffic, not sim-authoritative input state.
 - `shim_core::enqueue_error(msg)` / `pending_error_messages()` /
   `flush_pending_errors(sim_time_us)` (cycle 19) — per-shim pending
   buffer for synchronous `HAL_SendError` calls. The buffer is
@@ -176,16 +193,42 @@ reconnect.
   table compacts active slots by allocation order into `notifier_state`.
   `flush_notifier_state` publishes the snapshot via `send_notifier_state`,
   including empty header-only snapshots.
+- `shim_core::current_joystick_output_batch()` /
+  `flush_joystick_outputs(sim_time_us)` (cycle 37) — per-shim Driver
+  Station output snapshot built from valid slots written by
+  `HAL_SetJoystickOutputs`. The snapshot is compacted in increasing
+  joystick-number order, preserves raw signed output/rumble values, and
+  uses zero-initialized named reserved bytes. Empty snapshots publish a
+  header-only `joystick_output_batch`; flushing does not clear storage, so
+  repeated flushes republish latest state with normal outbound sequence
+  advancement.
+- `shim_core::current_user_program_observer_snapshot()` /
+  `flush_user_program_observer(sim_time_us)` (cycle 38) — per-shim Driver
+  Station observer snapshot built from the latest cycle-35 observer call.
+  Fresh shims publish `mode == none`; starting/disabled/autonomous/teleop/test
+  map one-to-one to the protocol enum. Flushing does not clear storage, so
+  repeated flushes republish latest state with normal outbound sequence
+  advancement.
+- `shim_core::flush_next_driver_station_output(sim_time_us)` (cycle 39) —
+  host-facing one-message pump over the two Driver Station output-side
+  snapshots. It publishes `user_program_observer_snapshot` first, then
+  `joystick_output_batch`, then repeats. It returns the schema that was
+  successfully published and advances phase only after a successful send, so
+  lane-busy backpressure retries the same phase rather than dropping a
+  snapshot. The pump does not add a combined wire schema and does not clear the
+  underlying observer or joystick-output state.
 - `backend::active_prefix_bytes(const can_frame_batch&)`,
-  `backend::active_prefix_bytes(const notifier_state&)`, and
-  `backend::active_prefix_bytes(const error_message_batch&)` —
+  `backend::active_prefix_bytes(const notifier_state&)`,
+  `backend::active_prefix_bytes(const error_message_batch&)`, and
+  `backend::active_prefix_bytes(const joystick_output_batch&)` —
   production helpers in `src/backend/common/can_frame.h`,
-  `notifier_state.h`, and `error_message.h` respectively (extracted
-  at cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX, with the third
-  overload added at cycle 11). Each returns a span over the schema's
+  `notifier_state.h`, `error_message.h`, and `joystick_output.h`
+  respectively (extracted at cycle 10 per D-C10-EXTRACT-ACTIVE-PREFIX,
+  with later overloads added as each new outbound variable-size schema
+  landed). Each returns a span over the schema's
   active-prefix bytes. Tests resolve to these via ADL; the test-side
-  overloads in `tests/backend/tier1/test_helpers.h` for these three
-  schemas were deleted as each cycle landed. The only remaining
+  overloads in `tests/backend/tier1/test_helpers.h` for these schemas
+  were deleted as each cycle landed. The only remaining
   test-side overload is `notifier_alarm_batch` (sim-authoritative;
   no production caller because it is never published outbound by
   the shim).
@@ -290,15 +333,14 @@ reconnect.
   authoritative and have no outbound API by design
   (D-C9-TYPED-OUTBOUND makes wrong-direction publishing impossible
   at the API boundary). With cycle 11, the three semantically-
-  meaningful outbound schemas (`can_frame_batch`, `notifier_state`,
-  `error_message_batch`) are all wired; the v0 outbound surface is
-  closed.
+  meaningful v0 outbound schemas (`can_frame_batch`, `notifier_state`,
+  `error_message_batch`) are all wired; cycle 37 adds the v2
+  `joystick_output_batch` DS-output publisher.
 - `on_demand_request` / `on_demand_reply` envelopes (in either
   direction). Future cycle drives the `protocol_session`'s
   single-flight pairing surface.
 - Shim-initiated `shutdown` envelope. Future cycle.
-- Remaining exported C HAL ABI (DS event-handle/observer/output calls,
-  CANAPI read surfaces, etc.). Future cycles add
+- Remaining exported C HAL ABI beyond the surfaces listed above. Future cycles add
   these as separate surface-files that read from the shim's cache or
   write into the shim's outbound API.
 - Outbound oversize-count validation for typed `send_*` methods
@@ -1152,7 +1194,23 @@ Structural feature; no physical source data applies.
   cycle 35 ships the five `HAL_ObserveUserProgram*` hooks as per-shim
   latest observer state exposed through `shim_core::user_program_observer_state()`;
   cycle 36 ships `HAL_SetJoystickOutputs` as per-shim latest
-  `joystick_output_state` exposed through `shim_core::joystick_outputs()`.
+  `joystick_output_state` exposed through `shim_core::joystick_outputs()`;
+  cycles 37–39 ship explicit DS-output snapshot publication and the
+  one-message DS-output pump; cycle 40 ships `HAL_GetRuntimeType` as a
+  read-only HALBase metadata query returning `HAL_Runtime_RoboRIO2`
+  without requiring, polling, or publishing through an installed shim;
+  cycle 41 retains the successful boot descriptor and ships
+  `HAL_GetTeamNumber` from that metadata, defaulting to 0 with no installed
+  shim; cycle 42 ships `HAL_GetFPGAVersion` and `HAL_GetFPGARevision` as
+  status-writing read-only FPGA metadata calls returning deterministic v0
+  constants (`2026` and `0`) with an installed shim, no publish/poll, and
+  no-shim/shutdown-detached handle-error status; cycle 43 ships pure
+  `HAL_GetPort` / `HAL_GetPortWithModule` handle construction; cycle 44 ships
+  `HAL_GetLastError` / `HAL_GetErrorMessage` static status-message support;
+  cycle 45 ships `HAL_Report` per-shim usage-report recording; cycle 46 ships
+  `HAL_GetComments` as cached `/etc/machine-info` PRETTY_HOSTNAME metadata
+  with empty/malformed defaults, common C-escape decoding, a 64-byte cap, no
+  shim requirement, and no publish/poll behavior.
   The accessor's storage (a
   non-atomic TU-static in `hal_c.cpp`) is still not safe for concurrent
   install/clear; the broader threading cycle promotes this ownership seam.

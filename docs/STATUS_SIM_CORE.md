@@ -7,14 +7,20 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
 
 ## Headline
 
-- Full project baseline through cycle 36: **ctest 645/645 green** under
-  `build`. Cycle 36 focused shim suite: **330/330 green**.
-- HAL shim through **cycle 36** (power_state read surface closed +
+- Full project baseline through cycle 46: **ctest 729/729 green** under
+  `build`. Cycle 46 focused common suite: **131/131 green**. Cycle 46
+  focused shim suite: **405/405 green**.
+- HAL shim through **cycle 46** (power_state read surface closed +
   clock_state read surface fully closed — all 7 fields wired; first
   two C HAL write surfaces landed; CAN stream RX and CAN status read
   landed; Driver Station scalar and joystick reads landed; Notifier
-  control-plane C HAL surface started): v0 outbound surface closed for the
-  three semantically-meaningful outbound schemas; the eight inbound
+  control-plane C HAL surface started; Driver Station joystick outputs
+  publish through explicit protocol v2 snapshots; user-program observer
+  state publishes through explicit protocol v3 snapshots; Driver Station
+  output-side snapshots have a one-message pump boundary): v0 outbound
+  surface closed for the three semantically-meaningful outbound schemas;
+  cycle 37 adds `joystick_output_batch`; cycle 38 adds
+  `user_program_observer_snapshot`; the eight inbound
   per-tick payload schemas are all wired with latest-wins replacement;
   C HAL ABI surfaces wired so far: **`HAL_GetFPGATime`** (cycle 12),
   **`HAL_GetVinVoltage`** (cycle 13), **`HAL_GetVinCurrent`** (cycle
@@ -52,7 +58,18 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
   **`HAL_ObserveUserProgramAutonomous`** /
   **`HAL_ObserveUserProgramTeleop`** /
   **`HAL_ObserveUserProgramTest`** (cycle 35), plus
-  **`HAL_SetJoystickOutputs`** (cycle 36). The three
+  **`HAL_SetJoystickOutputs`** (cycle 36), plus explicit
+  **`joystick_output_batch` publication** (cycle 37), plus explicit
+  **`user_program_observer_snapshot` publication** (cycle 38), plus the
+  **Driver Station output pump** (cycle 39), plus
+  **`HAL_GetRuntimeType`** (cycle 40), plus
+  **`HAL_GetTeamNumber`** and retained boot metadata (cycle 41), plus
+  **`HAL_GetFPGAVersion`** / **`HAL_GetFPGARevision`** (cycle 42), plus
+  **`HAL_GetSerialNumber`**, **`HAL_GetPort`** /
+  **`HAL_GetPortWithModule`**, **`HAL_GetLastError`** /
+  **`HAL_GetErrorMessage`**, **`HAL_Report`**, and
+  **`HAL_GetComments`** (cycles 42–46 dirty-worktree metadata/support
+  follow-ons). The three
   power_state float readers widen float→double via
   D-C13-FLOAT-TO-DOUBLE-CAST. With cycle 16 the **power_state read
   surface is closed** — all three float fields wired.
@@ -81,9 +98,11 @@ transform). See `.claude/skills/robot-description-loader.md`.
 ## Layer 2 — HAL ↔ Sim Core protocol
 
 ### Protocol schema (foundation)
-32-byte sync envelope, 9 closed payload schemas, stateless validator,
+32-byte sync envelope, 11 closed payload schemas, stateless validator,
 truncation helpers, WPILib byte-parity baselined at v2026.2.2.
-**+106 tests** (suite total). See `tests/backend/common/TEST_PLAN.md`
+Cycle 37 bumped `kProtocolVersion` to 2 for `joystick_output_batch`;
+cycle 38 bumped it to 3 for `user_program_observer_snapshot`.
+**131 tests** (suite total). See `tests/backend/common/TEST_PLAN.md`
 and `.claude/skills/protocol-schema.md`.
 
 ### Protocol session (stateful wrapper)
@@ -832,18 +851,181 @@ process-global shim.
 `not-ready` for missing invalid-accessor behavior and missing ABI signature
 coverage; the revised plan reached `ready-to-implement`.
 
+### Cycle 37 — joystick output protocol publication
+
+Protocol v2 adds `src/backend/common/joystick_output.h` with
+`joystick_output_state` and variable-size `joystick_output_batch`.
+The new schema id is allowed only under `tick_boundary`; the validator
+accepts exact active-prefix sizes for counts `0..6` and rejects
+overflow, oversized, and undersized payloads.
+
+The shim now exposes `send_joystick_output_batch`,
+`current_joystick_output_batch`, and `flush_joystick_outputs`. The snapshot
+is compacted in increasing joystick-number order, preserves the raw signed
+values recorded by `HAL_SetJoystickOutputs`, publishes even a header-only
+empty snapshot, and is not cleared by flush. `HAL_SetJoystickOutputs` remains
+storage-only; publication happens only through explicit host flush/send
+calls. Protocol-valid inbound joystick-output batches are rejected by shim
+dispatch, and user-program observer state is not encoded in this schema.
+
+**+21 common protocol tests** and **+9 shim tests**. The first test-reviewer
+pass was `not-ready` for missing oversized active-prefix rejection coverage
+and overbroad direction/shutdown wording; the revised plan reached
+`ready-to-implement`.
+
+### Cycle 38 — user-program observer protocol publication
+
+Protocol v3 adds `src/backend/common/user_program_observer.h` with
+`user_program_observer_mode` and fixed-size
+`user_program_observer_snapshot`. The new schema id is allowed only under
+`tick_boundary`; the validator accepts exactly `sizeof(snapshot)` payloads and
+rejects truncated or oversized payloads.
+
+The shim now exposes `send_user_program_observer_snapshot`,
+`current_user_program_observer_snapshot`, and
+`flush_user_program_observer`. The snapshot maps the latest cycle-35
+per-shim observer state to the protocol enum and zero-initializes the named
+reserved bytes. Fresh shims publish `mode == none`; flushing does not clear
+storage, so repeated flushes republish latest state. Observer HAL calls remain
+storage-only; publication happens only through explicit host flush/send calls.
+Protocol-valid inbound observer snapshots are rejected by shim dispatch, and
+joystick output state is not encoded in this schema.
+
+**+4 net common protocol tests** and **+9 shim tests**. The test-reviewer pass
+reached `ready-to-implement` before tests/code were written.
+
+### Cycle 39 — Driver Station output pump
+
+`shim_core::flush_next_driver_station_output(sim_time_us)` now provides a
+host-facing one-message pump for DS output-side state. It coordinates the
+existing cycle 38 observer snapshot and cycle 37 joystick-output snapshot
+without adding a combined protocol schema or bumping `kProtocolVersion`.
+
+The pump publishes at most one message per call because the Tier 1 outbound
+lane carries one message at a time. The order is observer snapshot first,
+joystick-output batch second, then repeat. It returns the schema that was
+successfully published and advances phase only after a successful send; a
+lane-busy or shutdown failure leaves the selected phase unchanged. Fresh shims
+publish observer `none` followed by an empty joystick-output header, and the
+underlying observer/joystick snapshots are not cleared by the pump.
+
+**+7 shim tests**. The test-reviewer pass reached `ready-to-implement` with no
+required changes.
+
+### Cycle 40 — HAL runtime type
+
+`HAL_GetRuntimeType()` now mirrors the WPILib HALBase C ABI and returns
+`HAL_Runtime_RoboRIO2`. This is intentionally a C HAL metadata surface only:
+it does not add or change protocol schemas, boot descriptors, or shim_core
+state.
+
+The C enum values are pinned separately from the robosim wire enum:
+`HAL_Runtime_RoboRIO == 0`, `HAL_Runtime_RoboRIO2 == 1`, and
+`HAL_Runtime_Simulation == 2`, while protocol `runtime_type::roborio_2`
+remains its existing wire value. The call requires no installed shim, remains
+stable after `HAL_Shutdown`, and does not publish outbound messages or poll
+pending inbound messages.
+
+**+4 shim tests**. The first test-reviewer pass required adding an inbound
+message to prove no-poll behavior; the revised plan was implemented.
+
+### Cycle 41 — HAL team number
+
+`shim_core::make` now retains an exact copy of the successfully published
+`boot_descriptor`, exposed through `boot_descriptor_snapshot()`. This gives
+HALBase metadata calls a stable source of truth without reparsing the outbound
+boot lane or changing any protocol schema.
+
+`HAL_GetTeamNumber()` now mirrors the WPILib HALBase C ABI. With no installed
+shim it returns `0`; with an installed shim it returns the retained
+`boot_descriptor.team_number` before or after boot_ack, preserving the raw
+`int32_t` value without clamping. The call does not publish, does not poll
+pending inbound messages, and after `HAL_Shutdown` follows the detached
+global-shim path while the caller-owned shim still retains boot metadata.
+
+**+6 shim tests**. The test-reviewer pass reached `ready-to-implement` with no
+required changes.
+
+### Cycle 42 — HAL FPGA version/revision metadata
+
+`HAL_GetFPGAVersion()` and `HAL_GetFPGARevision()` now mirror the WPILib
+HALBase C ABI as a paired startup metadata slice. They do not add protocol
+schemas, do not read per-tick inbound cache state, and do not change the boot
+descriptor layout.
+
+v0 returns deterministic shim constants with an installed shim:
+`HAL_GetFPGAVersion()` returns `2026`, matching WPILib's documented FPGA
+version competition-year convention, and `HAL_GetFPGARevision()` returns `0`
+as explicit unknown/unmodeled revision metadata until a hardware profile source
+exists. Both functions write `kHalSuccess` with an installed shim, including
+before boot_ack or any inbound state, and write `kHalHandleError` plus return
+0 with no installed shim. They do not publish, do not poll pending inbound
+messages, and after `HAL_Shutdown` follow the detached no-shim path.
+
+**+6 shim tests**. The test-reviewer pass reached `ready-to-implement` with no
+required changes.
+
+### Cycle 43 — HAL port handles
+
+`HAL_GetPort()` and `HAL_GetPortWithModule()` mirror WPILib's HALBase port
+handle value constructors. They are pure local handle encoders: no installed
+shim is required, invalid module/channel values outside `0..254` return
+`HAL_kInvalidHandle` (`0`), and installed-shim calls do not publish or poll.
+
+### Cycle 44 — HAL status messages
+
+`HAL_GetErrorMessage()` maps known shim status codes to stable static strings
+and returns `"Unknown error status"` for unknown codes. `HAL_GetLastError()`
+supports the `kHalUseLastError` sentinel by returning the last non-success
+status written on the current thread. Successful status writes do not clear the
+last-error value.
+
+### Cycle 45 — HAL usage reporting
+
+`HAL_Report()` mirrors the generated FRC usage-reporting ABI. With no installed
+shim it returns `0`. With an installed shim it appends copied usage report
+records to per-shim storage and returns a deterministic 1-based report index.
+The function preserves raw signed fields, treats null feature strings as empty,
+does not publish or poll, and follows the no-shim path after `HAL_Shutdown`.
+
+### Cycle 46 — HAL comments metadata
+
+`HAL_GetComments()` mirrors the WPILib HALBase comments metadata ABI. v0 reads
+`PRETTY_HOSTNAME="..."` from `/etc/machine-info`, unescapes the common C-style
+forms used by machine-info, caps the cached result to WPILib's 64-byte comments
+buffer, and copies it into a heap-owned `WPI_String`.
+
+The result is cached on first use, matching WPILib's one-time initialization
+behavior. Missing files, absent keys, empty values, and malformed unterminated
+quoted values return the empty string. Comments metadata does not require an
+installed shim, does not publish, does not poll, and remains available after
+`HAL_Shutdown` detaches the global shim pointer. Tests use a C++-namespace-only
+path/cache override so they never read or mutate the host's real `/etc`.
+
+**+10 shim tests**. The test-reviewer first requested the 64-byte cap,
+deterministic test-hook lifecycle, and malformed-value coverage; the revised
+plan reached `ready-to-implement`.
+
 ## What's next
 
 The C HAL ABI is the **largest remaining shim chunk** and is now in
-progress — cycles 12–36 wired the first read surfaces, the global shim
+progress — cycles 12–46 wired the first read surfaces, the global shim
 accessor, the first two write surfaces (`HAL_SendError` and
 `HAL_CAN_SendMessage`), CAN one-shot/stream RX, CAN status reads, and DS
 scalar and joystick/match/descriptor reads plus DS refresh/new-data
 events, outputs-enabled, user-program observers, joystick outputs/rumble,
-plus the Notifier
+joystick output publication, user-program observer publication, DS-output
+pump publication, `HAL_GetRuntimeType`, `HAL_GetTeamNumber`,
+`HAL_GetFPGAVersion`, `HAL_GetFPGARevision`, `HAL_GetSerialNumber`,
+`HAL_GetPort`, `HAL_GetPortWithModule`, `HAL_GetLastError`,
+`HAL_GetErrorMessage`, `HAL_Report`, `HAL_GetComments`, plus the Notifier
 control-plane/wait and lifecycle slices. Each
 remaining surface is its own TDD cycle:
-- Protocol publication for DS output/observer host state.
+- Remaining device-family HAL surfaces such as DIO, PWM, relay, analog,
+  compressor/pneumatics, power distribution, interrupts/counters/encoders, and
+  serial/SPI/I2C as demanded by robot programs.
+- Combined DS-output host-state message, if a host-facing aggregate becomes
+  necessary.
 
 Other shim concerns:
 - Shim-initiated `shutdown`.

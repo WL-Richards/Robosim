@@ -4,6 +4,7 @@
 
 namespace robosim::backend {
 
+/** Per-tick FPGA power snapshot consumed by HAL_GetVin* readers. */
 struct power_state {
   float vin_v;
   float vin_a;

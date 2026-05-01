@@ -7,11 +7,13 @@
 
 namespace robosim::backend {
 
-// Per-tick clock + system state. Session-invariants (team_number,
-// runtime_type) live in boot_descriptor — fork F1.
-//
-// Field order chosen for zero interior pad: 8-byte field first, then
-// 4-byte fields. Sum = 8 + 6*4 = 32; sizeof = 32; no pad.
+/**
+ * Per-tick FPGA clock and system-state snapshot.
+ *
+ * Session invariants such as team number and runtime type live in
+ * boot_descriptor. Field order keeps the payload padding-free: the 8-byte
+ * timestamp comes first, followed by 4-byte HAL/WPILib fields.
+ */
 struct clock_state {
   std::uint64_t sim_time_us;
   hal_bool system_active;

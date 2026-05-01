@@ -5,7 +5,7 @@
 
 namespace robosim::backend {
 
-// Field order matches HAL_CAN_GetCANStatus parameter order.
+/** Snapshot returned by HAL_CAN_GetCANStatus, in HAL parameter order. */
 struct can_status {
   float percent_bus_utilization;
   std::uint32_t bus_off_count;
