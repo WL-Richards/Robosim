@@ -119,6 +119,23 @@ std::expected<std::string, load_error> require_string(const json& obj,
   return (*present)->get<std::string>();
 }
 
+std::expected<bool, load_error> require_bool(const json& obj,
+                                             std::string_view key,
+                                             const fs::path& path,
+                                             std::string_view parent_ptr) {
+  auto present = require_present(obj, key, path, parent_ptr);
+  if (!present) {
+    return std::unexpected(present.error());
+  }
+  if (!(*present)->is_boolean()) {
+    return std::unexpected(mkerr(load_error_kind::schema_error,
+                                 path,
+                                 ptr_join(parent_ptr, key),
+                                 "field " + std::string(key) + " must be a bool"));
+  }
+  return (*present)->get<bool>();
+}
+
 std::expected<std::array<double, 3>, load_error> require_axis(const json& obj,
                                                               std::string_view key,
                                                               const fs::path& path,
@@ -259,13 +276,24 @@ constexpr std::array<std::string_view, 9> k_joint_keys_v2 = {"name",
                                                               "viscous_friction_nm_per_rad_per_s",
                                                               "origin"};
 
-constexpr std::array<std::string_view, 7> k_motor_keys = {"name",
-                                                          "motor_model",
-                                                          "controller",
-                                                          "controller_can_id",
-                                                          "controller_firmware_version",
-                                                          "joint",
-                                                          "gear_ratio"};
+constexpr std::array<std::string_view, 7> k_motor_keys_v1 = {"name",
+                                                             "motor_model",
+                                                             "controller",
+                                                             "controller_can_id",
+                                                             "controller_firmware_version",
+                                                             "joint",
+                                                             "gear_ratio"};
+
+constexpr std::array<std::string_view, 10> k_motor_keys_v2 = {"name",
+                                                              "motor_model",
+                                                              "controller",
+                                                              "connection_type",
+                                                              "controller_can_id",
+                                                              "controller_firmware_version",
+                                                              "joint",
+                                                              "gear_ratio",
+                                                              "visual_origin",
+                                                              "show_direction_arrow"};
 
 constexpr std::array<std::string_view, 5> k_sensor_keys = {
     "name", "sensor_model", "controller_can_id", "controller_firmware_version", "joint"};
@@ -537,7 +565,8 @@ std::expected<joint, load_error> load_joint(const json& obj,
 
 std::expected<motor, load_error> load_motor(const json& obj,
                                             std::size_t index,
-                                            const fs::path& path) {
+                                            const fs::path& path,
+                                            int schema_version) {
   const std::string ptr = ptr_index("/motors", index);
   motor out;
   if (auto r = require_string(obj, "name", path, ptr); r) {
@@ -554,6 +583,15 @@ std::expected<motor, load_error> load_motor(const json& obj,
     out.controller = std::move(*r);
   } else {
     return std::unexpected(r.error());
+  }
+  if (schema_version >= 2) {
+    if (auto it = obj.find("connection_type"); it != obj.end()) {
+      if (auto r = require_string(obj, "connection_type", path, ptr); r) {
+        out.connection_type = std::move(*r);
+      } else {
+        return std::unexpected(r.error());
+      }
+    }
   }
   if (auto r = require_integer(obj, "controller_can_id", path, ptr); r) {
     out.controller_can_id = *r;
@@ -575,8 +613,20 @@ std::expected<motor, load_error> load_motor(const json& obj,
   } else {
     return std::unexpected(r.error());
   }
-  if (auto r = check_no_unknown_keys(obj, k_motor_keys, path, ptr); !r) {
-    return std::unexpected(r.error());
+  if (schema_version >= 2) {
+    if (auto r = check_no_unknown_keys(obj, k_motor_keys_v2, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
+  } else {
+    if (auto r = check_no_unknown_keys(obj, k_motor_keys_v1, path, ptr); !r) {
+      return std::unexpected(r.error());
+    }
+  }
+  if (out.connection_type != "CAN") {
+    return std::unexpected(mkerr(load_error_kind::schema_error,
+                                 path,
+                                 ptr_join(ptr, "connection_type"),
+                                 "unsupported connection_type: " + out.connection_type));
   }
   if (auto r = check_can_id(
           out.controller_can_id, "controller_can_id", path, ptr_join(ptr, "controller_can_id"));
@@ -586,6 +636,21 @@ std::expected<motor, load_error> load_motor(const json& obj,
   if (auto r = check_positive(out.gear_ratio, "gear_ratio", path, ptr_join(ptr, "gear_ratio"));
       !r) {
     return std::unexpected(r.error());
+  }
+  if (schema_version >= 2) {
+    if (auto it = obj.find("visual_origin"); it != obj.end()) {
+      const std::string vo_ptr = ptr_join(ptr, "visual_origin");
+      auto val = parse_origin(*it, "visual_origin", path, vo_ptr);
+      if (!val) return std::unexpected(val.error());
+      out.visual_origin = *val;
+    }
+    if (auto it = obj.find("show_direction_arrow"); it != obj.end()) {
+      if (auto r = require_bool(obj, "show_direction_arrow", path, ptr); r) {
+        out.show_direction_arrow = *r;
+      } else {
+        return std::unexpected(r.error());
+      }
+    }
   }
   return out;
 }
@@ -897,7 +962,11 @@ std::expected<robot_description, load_error> validate_and_build(const json& root
   if (auto r = check_joint_references(out.joints, out.links, path); !r) {
     return std::unexpected(r.error());
   }
-  if (auto r = load_array<motor>(*basics->motors_arr, "/motors", path, load_motor); r) {
+  if (auto r = load_array<motor>(*basics->motors_arr, "/motors", path,
+                                 [ver](const json& obj, std::size_t i, const fs::path& p) {
+                                   return load_motor(obj, i, p, ver);
+                                 });
+      r) {
     out.motors = std::move(*r);
   } else {
     return std::unexpected(r.error());

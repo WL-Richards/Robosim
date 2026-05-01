@@ -59,6 +59,9 @@ struct motor {
   std::string controller_firmware_version;
   std::string joint_name;
   double gear_ratio;
+  std::string connection_type = "CAN";
+  origin_pose visual_origin{};
+  bool show_direction_arrow = true;
 
   bool operator==(const motor&) const = default;
 };

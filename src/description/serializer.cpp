@@ -79,10 +79,19 @@ ordered_json serialize_motor(const motor& m) {
   j["name"] = m.name;
   j["motor_model"] = m.motor_model;
   j["controller"] = m.controller;
+  if (m.connection_type != "CAN") {
+    j["connection_type"] = m.connection_type;
+  }
   j["controller_can_id"] = m.controller_can_id;
   j["controller_firmware_version"] = m.controller_firmware_version;
   j["joint"] = m.joint_name;
   j["gear_ratio"] = m.gear_ratio;
+  if (!origin_is_identity(m.visual_origin)) {
+    j["visual_origin"] = serialize_origin(m.visual_origin);
+  }
+  if (!m.show_direction_arrow) {
+    j["show_direction_arrow"] = false;
+  }
   return j;
 }
 
