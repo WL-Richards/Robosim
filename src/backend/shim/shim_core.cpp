@@ -75,6 +75,7 @@ bool shim_core::refresh_ds_data() {
 }
 
 std::expected<shim_core::inbound_dispatch_result, shim_error> shim_core::poll_one() {
+  std::lock_guard cache_lock{*cache_mutex_};
   if (shutdown_observed_) {
     return std::unexpected(shim_error{shim_error_kind::shutdown_already_observed,
                                       std::nullopt,
@@ -732,48 +733,49 @@ std::expected<schema_id, shim_error> shim_core::flush_next_driver_station_output
 }
 
 std::uint64_t shim_core::wait_for_notifier_alarm(std::int32_t handle, std::int32_t& status) {
-  std::unique_lock lock{notifier_wait_state_->mutex};
+  auto wait_state = notifier_wait_state_;
+  std::unique_lock lock{wait_state->mutex};
 
-  const auto remove_first_matching_event = [this, handle]() -> std::optional<std::uint64_t> {
+  const auto remove_first_matching_event = [wait_state, handle]() -> std::optional<std::uint64_t> {
     auto found = std::ranges::find_if(
-        notifier_wait_state_->pending_alarm_events,
+        wait_state->pending_alarm_events,
         [handle](const notifier_alarm_event& event) { return event.handle == handle; });
-    if (found == notifier_wait_state_->pending_alarm_events.end()) {
+    if (found == wait_state->pending_alarm_events.end()) {
       return std::nullopt;
     }
     const std::uint64_t fired_at_us = found->fired_at_us;
-    notifier_wait_state_->pending_alarm_events.erase(found);
+    wait_state->pending_alarm_events.erase(found);
     return fired_at_us;
   };
 
   const std::int32_t initial_index = find_notifier_slot(handle);
-  if (initial_index < 0 || notifier_wait_state_->shutdown_wake) {
+  if (initial_index < 0 || wait_state->shutdown_wake) {
     status = kHalHandleError;
     return 0;
   }
 
-  ++notifier_wait_state_->total_waiters;
-  ++notifier_wait_state_->waiters_by_handle[handle];
-  const auto unregister_waiter = [this, handle]() {
-    --notifier_wait_state_->total_waiters;
-    auto waiter_count = notifier_wait_state_->waiters_by_handle.find(handle);
-    if (waiter_count != notifier_wait_state_->waiters_by_handle.end()) {
+  ++wait_state->total_waiters;
+  ++wait_state->waiters_by_handle[handle];
+  const auto unregister_waiter = [wait_state, handle]() {
+    --wait_state->total_waiters;
+    auto waiter_count = wait_state->waiters_by_handle.find(handle);
+    if (waiter_count != wait_state->waiters_by_handle.end()) {
       --waiter_count->second;
       if (waiter_count->second == 0) {
-        notifier_wait_state_->waiters_by_handle.erase(waiter_count);
+        wait_state->waiters_by_handle.erase(waiter_count);
       }
     }
   };
 
   while (true) {
-    const std::int32_t index = find_notifier_slot(handle);
-    if (index < 0) {
+    if (wait_state->shutdown_wake) {
       unregister_waiter();
       status = kHalHandleError;
       return 0;
     }
 
-    if (notifier_wait_state_->shutdown_wake) {
+    const std::int32_t index = find_notifier_slot(handle);
+    if (index < 0) {
       unregister_waiter();
       status = kHalHandleError;
       return 0;
@@ -792,7 +794,7 @@ std::uint64_t shim_core::wait_for_notifier_alarm(std::int32_t handle, std::int32
       return *fired_at_us;
     }
 
-    notifier_wait_state_->cv.wait(lock);
+    wait_state->cv.wait(lock);
   }
 }
 
@@ -821,6 +823,7 @@ std::uint32_t shim_core::pending_notifier_wait_count(std::int32_t handle) const 
 }
 
 bool shim_core::is_connected() const {
+  std::lock_guard cache_lock{*cache_mutex_};
   return connected_;
 }
 
@@ -829,6 +832,11 @@ bool shim_core::is_shutting_down() const {
 }
 
 const std::optional<clock_state>& shim_core::latest_clock_state() const {
+  return latest_clock_state_;
+}
+
+std::optional<clock_state> shim_core::latest_clock_state_snapshot() const {
+  std::lock_guard cache_lock{*cache_mutex_};
   return latest_clock_state_;
 }
 

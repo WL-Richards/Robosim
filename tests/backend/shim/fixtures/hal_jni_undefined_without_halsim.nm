@@ -1,0 +1,6 @@
+                 U HAL_Initialize
+                 U HAL_Shutdown
+                 U HAL_GetRuntimeType
+                 U HAL_RefreshDSData
+                 U __cxa_finalize
+                 U _ZNSt8ios_base4InitC1Ev

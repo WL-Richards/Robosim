@@ -6,6 +6,10 @@ add_library(robosim_backend_tier1 STATIC
   shared_memory_transport.cpp
 )
 
+set_target_properties(robosim_backend_tier1 PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
+
 target_include_directories(robosim_backend_tier1 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )

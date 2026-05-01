@@ -7,33 +7,47 @@
 #include "ds_state.h"
 #include "error_message.h"
 #include "hal_c.h"
+#include "jni_minimal.h"
 #include "joystick_output.h"
 #include "notifier_state.h"
 #include "power_state.h"
 #include "protocol_session.h"
 #include "protocol_version.h"
 #include "shared_memory_transport.h"
+#include "shim_host_driver.h"
+#include "timed_robot_smoke_host.h"
 #include "test_helpers.h"
 #include "user_program_observer.h"
 
 #include <gtest/gtest.h>
 
+#include <sys/mman.h>
+#include <sys/wait.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <csignal>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <future>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <fcntl.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -49,11 +63,106 @@ extern "C" void WPI_SetEvent(unsigned int handle) {
   wpi_set_event_call_log().push_back(handle);
 }
 
+extern "C" {
+
+using JNIEnv = robosim::backend::shim::jni::JNIEnv;
+using jclass = robosim::backend::shim::jni::jclass;
+using jstring = robosim::backend::shim::jni::jstring;
+using jboolean = robosim::backend::shim::jni::jboolean;
+using jbyte = robosim::backend::shim::jni::jbyte;
+using jint = robosim::backend::shim::jni::jint;
+using jlong = robosim::backend::shim::jni::jlong;
+using jfloatArray = robosim::backend::shim::jni::jfloatArray;
+using jintArray = robosim::backend::shim::jni::jintArray;
+using jshortArray = robosim::backend::shim::jni::jshortArray;
+using jobject = robosim::backend::shim::jni::jobject;
+
+jboolean Java_edu_wpi_first_hal_HAL_initialize(JNIEnv*, jclass, jint timeout, jint mode);
+void Java_edu_wpi_first_hal_HAL_shutdown(JNIEnv*, jclass);
+jboolean Java_edu_wpi_first_hal_HAL_hasMain(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_HAL_runMain(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_HAL_exitMain(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_HAL_terminate(JNIEnv*, jclass);
+jboolean Java_edu_wpi_first_hal_DriverStationJNI_refreshDSData(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramStarting(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramDisabled(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramAutonomous(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTeleop(JNIEnv*, jclass);
+void Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTest(JNIEnv*, jclass);
+jint Java_edu_wpi_first_hal_DriverStationJNI_sendError(JNIEnv*,
+                                                       jclass,
+                                                       jboolean is_error,
+                                                       jint error_code,
+                                                       jboolean is_lv_code,
+                                                       jstring details,
+                                                       jstring location,
+                                                       jstring call_stack,
+                                                       jboolean print_msg);
+jint Java_edu_wpi_first_hal_DriverStationJNI_nativeGetControlWord(JNIEnv*, jclass);
+jint Java_edu_wpi_first_hal_DriverStationJNI_nativeGetAllianceStation(JNIEnv*, jclass);
+jint Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(JNIEnv*, jclass, jobject info);
+jint Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxes(JNIEnv*,
+                                                             jclass,
+                                                             jbyte joystick_num,
+                                                             jfloatArray axes);
+jint Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxesRaw(JNIEnv*,
+                                                                jclass,
+                                                                jbyte joystick_num,
+                                                                jintArray raw_axes);
+jint Java_edu_wpi_first_hal_DriverStationJNI_getJoystickPOVs(JNIEnv*,
+                                                             jclass,
+                                                             jbyte joystick_num,
+                                                             jshortArray povs);
+jint Java_edu_wpi_first_hal_DriverStationJNI_getJoystickButtons(JNIEnv*,
+                                                                jclass,
+                                                                jbyte joystick_num,
+                                                                jobject count);
+jint Java_edu_wpi_first_hal_DriverStationJNI_report(
+    JNIEnv*, jclass, jint resource, jint instance_number, jint context, jstring feature);
+jint Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(JNIEnv*, jclass);
+jboolean Java_edu_wpi_first_hal_NotifierJNI_setHALThreadPriority(JNIEnv*,
+                                                                 jclass,
+                                                                 jboolean real_time,
+                                                                 jint priority);
+void Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(JNIEnv*,
+                                                        jclass,
+                                                        jint notifier_handle,
+                                                        jstring name);
+void Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(JNIEnv*, jclass, jint notifier_handle);
+void Java_edu_wpi_first_hal_NotifierJNI_cleanNotifier(JNIEnv*, jclass, jint notifier_handle);
+void Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(JNIEnv*,
+                                                            jclass,
+                                                            jint notifier_handle,
+                                                            jlong trigger_time);
+void Java_edu_wpi_first_hal_NotifierJNI_cancelNotifierAlarm(JNIEnv*, jclass, jint notifier_handle);
+jlong Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(JNIEnv*,
+                                                              jclass,
+                                                              jint notifier_handle);
+jint Java_edu_wpi_first_hal_HALUtil_getHALRuntimeType(JNIEnv*, jclass);
+jlong Java_edu_wpi_first_hal_HALUtil_getFPGATime(JNIEnv*, jclass);
+}
+
 namespace robosim::backend::shim {
 
 void set_hal_comments_machine_info_path_for_test(std::string_view path);
 void clear_hal_comments_machine_info_path_for_test();
 void reset_hal_comments_cache_for_test();
+void reset_hal_jni_launch_state_for_test();
+const char* hal_jni_tier1_fd_env_var_for_test();
+bool hal_jni_launch_state_has_fallback_for_test();
+bool hal_jni_launch_state_has_attached_mapping_for_test();
+shim_core* hal_jni_launch_state_shim_for_test();
+tier1::tier1_shared_region* hal_jni_launch_state_region_for_test();
+tier1::tier1_endpoint* hal_jni_launch_state_core_endpoint_for_test();
+bool hal_jni_attached_poll_loop_active_for_test();
+std::uint64_t hal_jni_attached_poll_count_for_test();
+void set_hal_jni_attached_poll_idle_for_test(void (*idle)());
+bool hal_jni_attached_poll_idle_hook_is_default_for_test();
+bool pump_jni_fallback_notifier_alarm(std::int32_t notifier_handle);
+bool pump_jni_fallback_clock_state(std::uint64_t sim_time_us);
+void set_hal_jni_fallback_sleep_for_test(void (*sleep_for)(std::uint64_t delay_us));
+bool hal_jni_fallback_sleep_hook_is_default_for_test();
+std::optional<std::uint64_t> hal_jni_fallback_last_paced_sim_time_for_test();
 
 namespace {
 
@@ -9133,14 +9242,12 @@ TEST(HalRefreshDSData, WithNoInboundMessageReturnsFalseAndPreservesExistingDsGet
                                     /*match_time_seconds=*/98.25);
   send_ds_state_for_refresh(core, state, 50'000);
   ASSERT_EQ(HAL_RefreshDSData(), 1);
-  expect_ds_scalar_getters(kControlEnabled | kControlDsAttached,
-                           HAL_AllianceStationID_kRed2,
-                           98.25);
+  expect_ds_scalar_getters(
+      kControlEnabled | kControlDsAttached, HAL_AllianceStationID_kRed2, 98.25);
 
   EXPECT_EQ(HAL_RefreshDSData(), 0);
-  expect_ds_scalar_getters(kControlEnabled | kControlDsAttached,
-                           HAL_AllianceStationID_kRed2,
-                           98.25);
+  expect_ds_scalar_getters(
+      kControlEnabled | kControlDsAttached, HAL_AllianceStationID_kRed2, 98.25);
 }
 
 // C32-3. A DS packet returns true and updates the existing DS getter surface.
@@ -9160,9 +9267,8 @@ TEST(HalRefreshDSData, WithDsPacketReturnsTrueAndUpdatesExistingDsGetters) {
   send_ds_state_for_refresh(core, state, 60'000);
 
   EXPECT_EQ(HAL_RefreshDSData(), 1);
-  expect_ds_scalar_getters(kControlAutonomous | kControlFmsAttached,
-                           HAL_AllianceStationID_kBlue1,
-                           12.5);
+  expect_ds_scalar_getters(
+      kControlAutonomous | kControlFmsAttached, HAL_AllianceStationID_kBlue1, 12.5);
 }
 
 // C32-4. A non-DS packet dispatches, returns false, and preserves DS getters.
@@ -9190,9 +9296,7 @@ TEST(HalRefreshDSData, WithNonDsPacketDispatchesReturnsFalseAndPreservesDsGetter
   std::int32_t clock_status = 999;
   EXPECT_EQ(HAL_GetFPGATime(&clock_status), 123'000u);
   EXPECT_EQ(clock_status, kHalSuccess);
-  expect_ds_scalar_getters(kControlTest | kControlDsAttached,
-                           HAL_AllianceStationID_kBlue3,
-                           44.75);
+  expect_ds_scalar_getters(kControlTest | kControlDsAttached, HAL_AllianceStationID_kBlue3, 44.75);
 }
 
 // C32-5. Repeated DS refreshes replace the latest getter-visible snapshot.
@@ -9223,9 +9327,8 @@ TEST(HalRefreshDSData, RepeatedDsPacketsUseLatestWinsCacheSemantics) {
                      /*match_time_seconds=*/42.75);
   send_ds_state_for_refresh(core, second, 90'000);
   EXPECT_EQ(HAL_RefreshDSData(), 1);
-  expect_ds_scalar_getters(kControlAutonomous | kControlTest | kControlDsAttached,
-                           HAL_AllianceStationID_kBlue2,
-                           42.75);
+  expect_ds_scalar_getters(
+      kControlAutonomous | kControlTest | kControlDsAttached, HAL_AllianceStationID_kBlue2, 42.75);
 }
 
 // C32-6. Shutdown returns false and prevents later DS updates from surfacing.
@@ -9875,11 +9978,10 @@ TEST(HalSetJoystickOutputs, ShutdownMakesLaterCallsFailWithoutMutatingOldShim) {
 
 namespace {
 
-::robosim::backend::joystick_output_state valid_wire_joystick_output(
-    std::int32_t joystick_num,
-    std::int64_t outputs,
-    std::int32_t left_rumble,
-    std::int32_t right_rumble) {
+::robosim::backend::joystick_output_state valid_wire_joystick_output(std::int32_t joystick_num,
+                                                                     std::int64_t outputs,
+                                                                     std::int32_t left_rumble,
+                                                                     std::int32_t right_rumble) {
   ::robosim::backend::joystick_output_state state{};
   state.joystick_num = joystick_num;
   state.outputs = outputs;
@@ -9905,12 +10007,11 @@ namespace {
   return batch;
 }
 
-void expect_wire_joystick_output_eq(
-    const ::robosim::backend::joystick_output_state& actual,
-    std::int32_t joystick_num,
-    std::int64_t outputs,
-    std::int32_t left_rumble,
-    std::int32_t right_rumble) {
+void expect_wire_joystick_output_eq(const ::robosim::backend::joystick_output_state& actual,
+                                    std::int32_t joystick_num,
+                                    std::int64_t outputs,
+                                    std::int32_t left_rumble,
+                                    std::int32_t right_rumble) {
   EXPECT_EQ(actual.joystick_num, joystick_num);
   EXPECT_EQ(actual.outputs, outputs);
   EXPECT_EQ(actual.left_rumble, left_rumble);
@@ -10068,7 +10169,8 @@ TEST(HalSetJoystickOutputs, ProtocolValidInboundJoystickOutputBatchIsRejectedByS
   auto shim = make_connected_shim(region, core);
 
   const auto clock = valid_clock_state(140'000);
-  ASSERT_TRUE(core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
+  ASSERT_TRUE(
+      core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
   ASSERT_TRUE(shim.poll().has_value());
   ASSERT_TRUE(shim.latest_clock_state().has_value());
   EXPECT_EQ(*shim.latest_clock_state(), clock);
@@ -10172,8 +10274,7 @@ namespace {
 void expect_observer_payload_mode(const tier1::tier1_message& msg,
                                   ::robosim::backend::user_program_observer_mode mode) {
   EXPECT_EQ(msg.envelope.payload_schema, schema_id::user_program_observer_snapshot);
-  EXPECT_EQ(msg.envelope.payload_bytes,
-            sizeof(::robosim::backend::user_program_observer_snapshot));
+  EXPECT_EQ(msg.envelope.payload_bytes, sizeof(::robosim::backend::user_program_observer_snapshot));
   ASSERT_EQ(msg.payload.size(), sizeof(::robosim::backend::user_program_observer_snapshot));
   const auto snapshot = decode_user_program_observer_snapshot(msg.payload);
   EXPECT_EQ(snapshot.mode, mode);
@@ -10326,7 +10427,8 @@ TEST(HalObserveUserProgram, ProtocolValidInboundObserverSnapshotIsRejectedByShim
   tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
   auto shim = make_connected_shim(region, core);
   const auto clock = valid_clock_state(123'456);
-  ASSERT_TRUE(core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
+  ASSERT_TRUE(
+      core.send(envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(clock), 140'000));
   ASSERT_TRUE(shim.poll().has_value());
   ASSERT_TRUE(shim.latest_clock_state().has_value());
   EXPECT_EQ(*shim.latest_clock_state(), clock);
@@ -10834,10 +10936,8 @@ TEST(HalGetTeamNumber, FollowsGlobalDetachWhileShimRetainsBootMetadata) {
 // C42-1. The two FPGA metadata C ABI functions keep their distinct return
 // widths and status-writing signatures.
 TEST(HalFpgaMetadata, VersionAndRevisionSignatures) {
-  static_assert(std::is_same_v<decltype(&HAL_GetFPGAVersion),
-                               std::int32_t (*)(std::int32_t*)>);
-  static_assert(std::is_same_v<decltype(&HAL_GetFPGARevision),
-                               std::int64_t (*)(std::int32_t*)>);
+  static_assert(std::is_same_v<decltype(&HAL_GetFPGAVersion), std::int32_t (*)(std::int32_t*)>);
+  static_assert(std::is_same_v<decltype(&HAL_GetFPGARevision), std::int64_t (*)(std::int32_t*)>);
 }
 
 // C42-2. With no installed shim, status-writing FPGA metadata reads follow
@@ -11121,10 +11221,8 @@ TEST(HalErrorMessages, MapsKnownStatusCodes) {
             "CAN: Message not found");
   EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNoToken)), "CAN: No token");
   EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNotAllowed)), "CAN: Not allowed");
-  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNotInitialized)),
-            "CAN: Not initialized");
-  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanSessionOverrun)),
-            "CAN: Session overrun");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanNotInitialized)), "CAN: Not initialized");
+  EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalCanSessionOverrun)), "CAN: Session overrun");
   EXPECT_EQ(std::string_view(HAL_GetErrorMessage(kHalUseLastError)),
             "HAL: Use HAL_GetLastError(status) to get last error");
 }
@@ -11200,9 +11298,8 @@ TEST(HalGetPort, SignaturesMatchWpilibAbi) {
   static_assert(std::is_same_v<HAL_Handle, std::int32_t>);
   static_assert(std::is_same_v<HAL_PortHandle, HAL_Handle>);
   static_assert(std::is_same_v<decltype(&HAL_GetPort), HAL_PortHandle (*)(std::int32_t)>);
-  static_assert(
-      std::is_same_v<decltype(&HAL_GetPortWithModule),
-                     HAL_PortHandle (*)(std::int32_t, std::int32_t)>);
+  static_assert(std::is_same_v<decltype(&HAL_GetPortWithModule),
+                               HAL_PortHandle (*)(std::int32_t, std::int32_t)>);
 }
 
 // C43-2. HAL_GetPort is the single-channel convenience form and uses module 1,
@@ -11303,11 +11400,9 @@ TEST(HalGetPort, StableAfterShutdownDetach) {
 
 // C45-1. The C HAL ABI mirrors WPILib's generated usage-reporting surface.
 TEST(HalReport, SignatureMatchesWpilibAbi) {
-  static_assert(std::is_same_v<decltype(&HAL_Report),
-                               std::int64_t (*)(std::int32_t,
-                                                 std::int32_t,
-                                                 std::int32_t,
-                                                 const char*)>);
+  static_assert(
+      std::is_same_v<decltype(&HAL_Report),
+                     std::int64_t (*)(std::int32_t, std::int32_t, std::int32_t, const char*)>);
 }
 
 // C45-2. With no installed shim, usage reporting is a deterministic no-op.
@@ -11495,8 +11590,7 @@ TEST(HalGetComments, SignatureMatchesWpilib) {
 // C46-2. Missing machine-info defaults to an empty comments string and does
 // not require an installed shim.
 TEST(HalGetComments, MissingMachineInfoReturnsEmptyWithoutShim) {
-  const auto missing_path =
-      std::filesystem::temp_directory_path() / "robosim_hal_comments_missing";
+  const auto missing_path = std::filesystem::temp_directory_path() / "robosim_hal_comments_missing";
   comments_machine_info_guard machine_info{missing_path.string(), true};
   shim_core::install_global(nullptr);
 
@@ -11632,6 +11726,3060 @@ TEST(HalGetComments, AvailableAfterShutdownDetach) {
   owned_wpi_string comments;
   HAL_GetComments(&comments.value);
   expect_wpi_string_eq(comments.value, "shutdown comments");
+}
+
+// ============================================================================
+// Cycle 50 — non-HALSIM HAL JNI startup artifact.
+// ============================================================================
+
+TEST(HalJniStartup, ExposesPinnedV0AdapterSemantics) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_hasMain(nullptr, nullptr), 0);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getHALRuntimeType(nullptr, nullptr),
+            static_cast<jint>(HAL_Runtime_RoboRIO2));
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0);
+  EXPECT_EQ(Java_edu_wpi_first_hal_NotifierJNI_setHALThreadPriority(nullptr, nullptr, 1, 40), 0);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  const jint report_index =
+      Java_edu_wpi_first_hal_DriverStationJNI_report(nullptr, nullptr, 29, 3, 7, nullptr);
+  EXPECT_EQ(report_index, 1);
+  const auto reports = shim.usage_reports();
+  ASSERT_EQ(reports.size(), 1u);
+  EXPECT_EQ(reports[0].resource, 29);
+  EXPECT_EQ(reports[0].instance_number, 3);
+  EXPECT_EQ(reports[0].context, 7);
+  EXPECT_TRUE(reports[0].feature.empty());
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_EQ(shim_core::current(), nullptr);
+}
+
+// ============================================================================
+// Cycle 51 — JNI startup fallback shim installation.
+// ============================================================================
+
+TEST(HalJniStartup, InitializeWithNoInstalledShimCreatesRealFallbackShim) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  auto* region = hal_jni_launch_state_region_for_test();
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_NE(region, nullptr);
+  EXPECT_TRUE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_EQ(shim_core::current(), fallback);
+  EXPECT_FALSE(fallback->is_connected());
+
+  const auto& desc = fallback->boot_descriptor_snapshot();
+  EXPECT_EQ(desc.runtime, runtime_type::roborio_2);
+  EXPECT_EQ(desc.team_number, 0);
+  EXPECT_EQ(desc.vendor_capabilities, 0u);
+  EXPECT_EQ(std::string(desc.wpilib_version.data()), "2026.2.1");
+
+  EXPECT_EQ(region->backend_to_core.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::full));
+  EXPECT_EQ(region->backend_to_core.envelope.kind, envelope_kind::boot);
+  EXPECT_EQ(region->backend_to_core.envelope.payload_schema, schema_id::boot_descriptor);
+  ASSERT_EQ(region->backend_to_core.payload_bytes, sizeof(boot_descriptor));
+  EXPECT_EQ(std::memcmp(region->backend_to_core.payload.data(), &desc, sizeof(boot_descriptor)), 0);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalInitialize, NoShimBehaviorRemainsFailureWhenJniFallbackStateIsReset) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(HAL_Initialize(500, 0), 0);
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(HalJniStartup, InitializeDoesNotReplacePreinstalledHostShim) {
+  reset_hal_jni_launch_state_for_test();
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 2056;
+  auto shim_or = shim_core::make(
+      tier1_endpoint::make(region, direction::backend_to_core).value(), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  drain_boot_only(core);
+  ASSERT_TRUE(core.send(envelope_kind::boot_ack, schema_id::none, {}, kBootSimTime));
+  ASSERT_TRUE(shim_or->poll().has_value());
+  auto& host_shim = *shim_or;
+  shim_global_install_guard guard{host_shim};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  EXPECT_EQ(shim_core::current(), &host_shim);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+  EXPECT_EQ(host_shim.boot_descriptor_snapshot().team_number, 2056);
+  EXPECT_EQ(std::memcmp(&host_shim.boot_descriptor_snapshot(), &desc, sizeof(boot_descriptor)), 0);
+}
+
+TEST(HalJniStartup, ShutdownDestroysOnlyJniOwnedFallbackState) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_FALSE(fallback->is_connected());
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+  EXPECT_NE(shim_core::current(), fallback);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto desc = valid_boot_descriptor();
+  desc.team_number = 4096;
+  auto shim_or = shim_core::make(
+      tier1_endpoint::make(region, direction::backend_to_core).value(), desc, kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  drain_boot_only(core);
+  auto& host_shim = *shim_or;
+  shim_core::install_global(&host_shim);
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_EQ(host_shim.boot_descriptor_snapshot().team_number, 4096);
+  EXPECT_EQ(std::memcmp(&host_shim.boot_descriptor_snapshot(), &desc, sizeof(boot_descriptor)), 0);
+}
+
+// ============================================================================
+// Cycle 52 — DriverStation joystick refresh JNI adapters.
+// ============================================================================
+
+namespace {
+
+void fake_set_short_array_region(
+    JNIEnv*, jshortArray array, jni::jsize start, jni::jsize len, const jni::jshort* buf) {
+  auto* dest = reinterpret_cast<jni::jshort*>(array);
+  std::copy(buf, buf + len, dest + start);
+}
+
+void fake_set_int_array_region(
+    JNIEnv*, jintArray array, jni::jsize start, jni::jsize len, const jint* buf) {
+  auto* dest = reinterpret_cast<jint*>(array);
+  std::copy(buf, buf + len, dest + start);
+}
+
+void fake_set_float_array_region(
+    JNIEnv*, jfloatArray array, jni::jsize start, jni::jsize len, const jni::jfloat* buf) {
+  auto* dest = reinterpret_cast<jni::jfloat*>(array);
+  std::copy(buf, buf + len, dest + start);
+}
+
+void* fake_get_direct_buffer_address(JNIEnv*, jobject buffer) {
+  return buffer;
+}
+
+class fake_jni_env;
+
+fake_jni_env*& active_fake_jni_env() {
+  static fake_jni_env* env = nullptr;
+  return env;
+}
+
+class fake_jni_env {
+ public:
+  struct match_info_call {
+    std::string method_name;
+    std::string method_signature;
+    std::string event_name;
+    std::string game_specific_message;
+    jint match_number = -1;
+    jint replay_number = -1;
+    jint match_type = -1;
+  };
+
+  struct utf_acquire {
+    jstring string = nullptr;
+    const char* chars = nullptr;
+  };
+
+  struct utf_release {
+    jstring string = nullptr;
+    const char* chars = nullptr;
+  };
+
+  enum class missing_function {
+    none,
+    get_object_class,
+    get_method_id,
+    new_string_utf,
+    get_string_utf_chars,
+    call_void_method,
+  };
+
+  explicit fake_jni_env(missing_function missing = missing_function::none) {
+    table_.GetObjectClass =
+        missing == missing_function::get_object_class ? nullptr : fake_get_object_class;
+    table_.GetMethodID = missing == missing_function::get_method_id ? nullptr : fake_get_method_id;
+    table_.CallVoidMethod =
+        missing == missing_function::call_void_method ? nullptr : fake_call_void_method;
+    table_.NewStringUTF =
+        missing == missing_function::new_string_utf ? nullptr : fake_new_string_utf;
+    table_.GetStringUTFChars =
+        missing == missing_function::get_string_utf_chars ? nullptr : fake_get_string_utf_chars;
+    table_.ReleaseStringUTFChars = fake_release_string_utf_chars;
+    table_.SetShortArrayRegion = fake_set_short_array_region;
+    table_.SetIntArrayRegion = fake_set_int_array_region;
+    table_.SetFloatArrayRegion = fake_set_float_array_region;
+    table_.GetDirectBufferAddress = fake_get_direct_buffer_address;
+    env_.functions = &table_;
+    active_fake_jni_env() = this;
+  }
+
+  ~fake_jni_env() {
+    if (active_fake_jni_env() == this) {
+      active_fake_jni_env() = nullptr;
+    }
+  }
+
+  fake_jni_env(const fake_jni_env&) = delete;
+  fake_jni_env& operator=(const fake_jni_env&) = delete;
+
+  JNIEnv* get() { return &env_; }
+  jobject object() { return reinterpret_cast<jobject>(&object_); }
+  jstring string(const char* text) {
+    auto value = std::make_unique<fake_string>(text);
+    auto* ptr = value.get();
+    strings_.push_back(std::move(value));
+    return ptr;
+  }
+
+  const std::vector<match_info_call>& match_info_calls() const { return match_info_calls_; }
+  const std::vector<utf_acquire>& utf_acquires() const { return utf_acquires_; }
+  const std::vector<utf_release>& utf_releases() const { return utf_releases_; }
+
+ private:
+  struct fake_string : jni::_jstring {
+    explicit fake_string(const char* text) : value(text == nullptr ? "" : text) {}
+    std::string value;
+  };
+
+  static jclass fake_get_object_class(JNIEnv*, jobject object) {
+    return reinterpret_cast<jclass>(object);
+  }
+
+  static jni::jmethodID fake_get_method_id(JNIEnv*,
+                                           jclass,
+                                           const char* name,
+                                           const char* signature) {
+    if (active_fake_jni_env() != nullptr) {
+      active_fake_jni_env()->last_method_name_ = name == nullptr ? "" : name;
+      active_fake_jni_env()->last_method_signature_ = signature == nullptr ? "" : signature;
+    }
+    static jni::_jmethodID method;
+    return &method;
+  }
+
+  static jstring fake_new_string_utf(JNIEnv*, const char* text) {
+    if (active_fake_jni_env() == nullptr) {
+      return nullptr;
+    }
+    auto value = std::make_unique<fake_string>(text);
+    auto* ptr = value.get();
+    active_fake_jni_env()->strings_.push_back(std::move(value));
+    return ptr;
+  }
+
+  static const char* fake_get_string_utf_chars(JNIEnv*, jstring string, jboolean* is_copy) {
+    if (active_fake_jni_env() == nullptr || string == nullptr) {
+      return nullptr;
+    }
+    if (is_copy != nullptr) {
+      *is_copy = 1;
+    }
+    auto* fake = static_cast<fake_string*>(string);
+    const char* chars = fake->value.c_str();
+    active_fake_jni_env()->utf_acquires_.push_back(utf_acquire{.string = string, .chars = chars});
+    return chars;
+  }
+
+  static void fake_release_string_utf_chars(JNIEnv*, jstring string, const char* chars) {
+    if (active_fake_jni_env() == nullptr) {
+      return;
+    }
+    active_fake_jni_env()->utf_releases_.push_back(utf_release{.string = string, .chars = chars});
+  }
+
+  static void fake_call_void_method(JNIEnv*, jobject, jni::jmethodID method, ...) {
+    if (active_fake_jni_env() == nullptr) {
+      return;
+    }
+
+    va_list args;
+    va_start(args, method);
+    auto* event = static_cast<fake_string*>(va_arg(args, jstring));
+    auto* game = static_cast<fake_string*>(va_arg(args, jstring));
+    const jint match_number = va_arg(args, jint);
+    const jint replay_number = va_arg(args, jint);
+    const jint match_type = va_arg(args, jint);
+    va_end(args);
+
+    active_fake_jni_env()->match_info_calls_.push_back(match_info_call{
+        .method_name = active_fake_jni_env()->last_method_name_,
+        .method_signature = active_fake_jni_env()->last_method_signature_,
+        .event_name = event == nullptr ? "" : event->value,
+        .game_specific_message = game == nullptr ? "" : game->value,
+        .match_number = match_number,
+        .replay_number = replay_number,
+        .match_type = match_type,
+    });
+  }
+
+  jni::JNINativeInterface table_{};
+  JNIEnv env_{};
+  jni::_jobject object_{};
+  std::string last_method_name_;
+  std::string last_method_signature_;
+  std::vector<std::unique_ptr<fake_string>> strings_;
+  std::vector<match_info_call> match_info_calls_;
+  std::vector<utf_acquire> utf_acquires_;
+  std::vector<utf_release> utf_releases_;
+};
+
+template <typename T, std::size_t N>
+auto jni_array(std::array<T, N>& values) {
+  return reinterpret_cast<
+      std::conditional_t<std::is_same_v<T, float>,
+                         jfloatArray,
+                         std::conditional_t<std::is_same_v<T, jint>, jintArray, jshortArray>>>(
+      values.data());
+}
+
+auto jni_direct_buffer(std::uint8_t* byte) {
+  return reinterpret_cast<jobject>(byte);
+}
+
+void install_cached_ds_state(tier1_shared_region& region,
+                             tier1_endpoint& core,
+                             std::optional<shim_core>& shim,
+                             const ds_state& state) {
+  shim = make_connected_shim(region, core);
+  shim_core::install_global(&*shim);
+  inject_ds_state(core, *shim, state);
+}
+
+}  // namespace
+
+TEST(HalJniDriverStationJoystickRefresh, GetJoystickAxesCopiesActiveFloatsAndReturnsCount) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.joystick_axes_[2] = make_axes(3, -0.75f, 10);
+  state.joystick_axes_[2].axes[3] = 4.5f;
+  install_cached_ds_state(region, core, shim, state);
+
+  std::array<float, 5> axes{};
+  axes.fill(99.0f);
+
+  const jint count = Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxes(
+      env.get(), nullptr, static_cast<jbyte>(2), jni_array(axes));
+
+  EXPECT_EQ(count, 3);
+  EXPECT_EQ(axes[0], state.joystick_axes_[2].axes[0]);
+  EXPECT_EQ(axes[1], state.joystick_axes_[2].axes[1]);
+  EXPECT_EQ(axes[2], state.joystick_axes_[2].axes[2]);
+  EXPECT_EQ(axes[3], 99.0f);
+}
+
+TEST(HalJniDriverStationJoystickRefresh, GetJoystickAxesRawWidensActiveRawBytes) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.joystick_axes_[1] = make_axes(4, 0.0f, 0);
+  state.joystick_axes_[1].raw[0] = 0;
+  state.joystick_axes_[1].raw[1] = 1;
+  state.joystick_axes_[1].raw[2] = 128;
+  state.joystick_axes_[1].raw[3] = 255;
+  install_cached_ds_state(region, core, shim, state);
+
+  std::array<jint, 6> raw{};
+  raw.fill(-123);
+
+  const jint count = Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxesRaw(
+      env.get(), nullptr, static_cast<jbyte>(1), jni_array(raw));
+
+  EXPECT_EQ(count, 4);
+  EXPECT_EQ(raw[0], 0);
+  EXPECT_EQ(raw[1], 1);
+  EXPECT_EQ(raw[2], 128);
+  EXPECT_EQ(raw[3], 255);
+  EXPECT_EQ(raw[4], -123);
+}
+
+TEST(HalJniDriverStationJoystickRefresh, GetJoystickPOVsCopiesActiveValuesAndReturnsCount) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.joystick_povs_[5] = make_povs(2, 90);
+  state.joystick_povs_[5].povs[1] = -1;
+  state.joystick_povs_[5].povs[2] = 270;
+  install_cached_ds_state(region, core, shim, state);
+
+  std::array<jni::jshort, 4> povs{};
+  povs.fill(-321);
+
+  const jint count = Java_edu_wpi_first_hal_DriverStationJNI_getJoystickPOVs(
+      env.get(), nullptr, static_cast<jbyte>(5), jni_array(povs));
+
+  EXPECT_EQ(count, 2);
+  EXPECT_EQ(povs[0], 90);
+  EXPECT_EQ(povs[1], -1);
+  EXPECT_EQ(povs[2], -321);
+}
+
+TEST(HalJniDriverStationJoystickRefresh, GetJoystickButtonsWritesCountAndReturnsBitmask) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.joystick_buttons_[4] = make_buttons(0xA5A5'0005u, 9);
+  install_cached_ds_state(region, core, shim, state);
+
+  std::uint8_t count_byte = 0xA5;
+
+  const jint buttons = Java_edu_wpi_first_hal_DriverStationJNI_getJoystickButtons(
+      env.get(), nullptr, static_cast<jbyte>(4), jni_direct_buffer(&count_byte));
+
+  EXPECT_EQ(static_cast<std::uint32_t>(buttons), 0xA5A5'0005u);
+  EXPECT_EQ(count_byte, 9u);
+}
+
+TEST(HalJniDriverStationJoystickRefresh,
+     NoShimDefaultAndInvalidIndexPathsInheritZeroDefaultBehavior) {
+  fake_jni_env env;
+
+  auto expect_zero_defaults = [&](jbyte joystick) {
+    std::array<float, 1> axes{42.0f};
+    std::array<jint, 1> raw{42};
+    std::array<jni::jshort, 1> povs{42};
+    std::uint8_t count_byte = 0xA5;
+
+    EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxes(
+                  env.get(), nullptr, joystick, jni_array(axes)),
+              0);
+    EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxesRaw(
+                  env.get(), nullptr, joystick, jni_array(raw)),
+              0);
+    EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickPOVs(
+                  env.get(), nullptr, joystick, jni_array(povs)),
+              0);
+    EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickButtons(
+                  env.get(), nullptr, joystick, jni_direct_buffer(&count_byte)),
+              0);
+    EXPECT_EQ(axes[0], 42.0f);
+    EXPECT_EQ(raw[0], 42);
+    EXPECT_EQ(povs[0], 42);
+    EXPECT_EQ(count_byte, 0u);
+  };
+
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  expect_zero_defaults(static_cast<jbyte>(0));
+
+  {
+    tier1_shared_region empty_region{};
+    tier1_endpoint empty_core{
+        tier1_endpoint::make(empty_region, direction::core_to_backend).value()};
+    auto empty_shim = make_connected_shim(empty_region, empty_core);
+    shim_global_install_guard empty_guard{empty_shim};
+    expect_zero_defaults(static_cast<jbyte>(0));
+  }
+
+  {
+    tier1_shared_region cached_region{};
+    tier1_endpoint cached_core{
+        tier1_endpoint::make(cached_region, direction::core_to_backend).value()};
+    std::optional<shim_core> cached_shim;
+    auto state = valid_ds_state();
+    state.joystick_axes_[0] = make_axes(3, 0.25f, 10);
+    state.joystick_povs_[0] = make_povs(2, 90);
+    state.joystick_buttons_[0] = make_buttons(0xFFFFu, 16);
+    install_cached_ds_state(cached_region, cached_core, cached_shim, state);
+    expect_zero_defaults(static_cast<jbyte>(-1));
+    expect_zero_defaults(static_cast<jbyte>(6));
+  }
+}
+
+TEST(HalJniDriverStationJoystickRefresh, NullDestinationsReturnValuesWithoutCopying) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.joystick_axes_[3] = make_axes(5, 0.5f, 0);
+  state.joystick_povs_[3] = make_povs(4, 0);
+  state.joystick_buttons_[3] = make_buttons(0x0000'00A5u, 8);
+  install_cached_ds_state(region, core, shim, state);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxes(
+                nullptr, nullptr, static_cast<jbyte>(3), nullptr),
+            5);
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickAxesRaw(
+                nullptr, nullptr, static_cast<jbyte>(3), nullptr),
+            5);
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickPOVs(
+                nullptr, nullptr, static_cast<jbyte>(3), nullptr),
+            4);
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getJoystickButtons(
+                nullptr, nullptr, static_cast<jbyte>(3), nullptr),
+            0x0000'00A5);
+}
+
+// ============================================================================
+// Cycle 53 — DriverStation match-info and control-word JNI adapters.
+// ============================================================================
+
+TEST(HalJniDriverStationMatchInfo, CallsSetDataWithCachedMatchFields) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.match = make_match_info("PNW District", match_type::elimination, 73, 2, "ABC");
+  install_cached_ds_state(region, core, shim, state);
+
+  const jint status =
+      Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(env.get(), nullptr, env.object());
+
+  EXPECT_EQ(status, kHalSuccess);
+  ASSERT_EQ(env.match_info_calls().size(), 1u);
+  const auto& call = env.match_info_calls()[0];
+  EXPECT_EQ(call.method_name, "setData");
+  EXPECT_EQ(call.method_signature, "(Ljava/lang/String;Ljava/lang/String;III)V");
+  EXPECT_EQ(call.event_name, "PNW District");
+  EXPECT_EQ(call.game_specific_message, "ABC");
+  EXPECT_EQ(call.match_number, 73);
+  EXPECT_EQ(call.replay_number, 2);
+  EXPECT_EQ(call.match_type, static_cast<jint>(HAL_kMatchType_elimination));
+}
+
+TEST(HalJniDriverStationMatchInfo, UsesNulTerminatedV0JavaStrings) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.match = make_match_info("", match_type::practice, 3, 0, "");
+  const std::array<char, 13> event_bytes{
+      'E', 'v', 'e', 'n', 't', '\0', 'i', 'g', 'n', 'o', 'r', 'e', 'd'};
+  std::copy(event_bytes.begin(), event_bytes.end(), state.match.event_name.begin());
+  const std::array<std::uint8_t, 8> game_bytes{'A', 'B', 'C', '\0', 'D', 'E', 'F', 'G'};
+  std::copy(game_bytes.begin(), game_bytes.end(), state.match.game_specific_message.begin());
+  state.match.game_specific_message_size = static_cast<std::uint16_t>(game_bytes.size());
+  install_cached_ds_state(region, core, shim, state);
+
+  ASSERT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(env.get(), nullptr, env.object()),
+            kHalSuccess);
+  ASSERT_EQ(env.match_info_calls().size(), 1u);
+  EXPECT_EQ(env.match_info_calls()[0].event_name, "Event");
+  EXPECT_EQ(env.match_info_calls()[0].game_specific_message, "ABC");
+
+  fake_jni_env size_env;
+  tier1_shared_region size_region{};
+  tier1_endpoint size_core{tier1_endpoint::make(size_region, direction::core_to_backend).value()};
+  std::optional<shim_core> size_shim;
+  auto sized_state = valid_ds_state();
+  sized_state.match = make_match_info("", match_type::qualification, 4, 0, "");
+  for (std::size_t i = 0; i < sized_state.match.game_specific_message.size(); ++i) {
+    sized_state.match.game_specific_message[i] = static_cast<std::uint8_t>('a' + (i % 26));
+  }
+  sized_state.match.game_specific_message_size = 3;
+  install_cached_ds_state(size_region, size_core, size_shim, sized_state);
+
+  ASSERT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(
+                size_env.get(), nullptr, size_env.object()),
+            kHalSuccess);
+  ASSERT_EQ(size_env.match_info_calls().size(), 1u);
+  EXPECT_EQ(size_env.match_info_calls()[0].game_specific_message, "abc");
+}
+
+TEST(HalJniDriverStationMatchInfo, NoShimAndEmptyCacheCallSetDataWithDefaults) {
+  auto expect_default_call = [](fake_jni_env& env, jint expected_status) {
+    const jint status =
+        Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(env.get(), nullptr, env.object());
+
+    EXPECT_EQ(status, expected_status);
+    ASSERT_EQ(env.match_info_calls().size(), 1u);
+    const auto& call = env.match_info_calls()[0];
+    EXPECT_EQ(call.event_name, "");
+    EXPECT_EQ(call.game_specific_message, "");
+    EXPECT_EQ(call.match_number, 0);
+    EXPECT_EQ(call.replay_number, 0);
+    EXPECT_EQ(call.match_type, static_cast<jint>(HAL_kMatchType_none));
+  };
+
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  fake_jni_env no_shim_env;
+  expect_default_call(no_shim_env, kHalHandleError);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  fake_jni_env empty_env;
+  expect_default_call(empty_env, kHalSuccess);
+}
+
+TEST(HalJniDriverStationMatchInfo, NullDestinationsReturnStatusWithoutMutation) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.match = make_match_info("Event", match_type::qualification, 12, 1, "MSG");
+  install_cached_ds_state(region, core, shim, state);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(nullptr, nullptr, nullptr),
+            kHalSuccess);
+
+  fake_jni_env null_object_env;
+  EXPECT_EQ(
+      Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(null_object_env.get(), nullptr, nullptr),
+      kHalSuccess);
+  EXPECT_TRUE(null_object_env.match_info_calls().empty());
+
+  fake_jni_env missing_method_env{fake_jni_env::missing_function::get_method_id};
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_getMatchInfo(
+                missing_method_env.get(), nullptr, missing_method_env.object()),
+            kHalSuccess);
+  EXPECT_TRUE(missing_method_env.match_info_calls().empty());
+}
+
+TEST(HalJniDriverStationControlWord, NativeGetControlWordReturnsPackedCachedBits) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.control.bits = kControlEnabled | kControlAutonomous | kControlDsAttached;
+  install_cached_ds_state(region, core, shim, state);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetControlWord(nullptr, nullptr),
+            0b100011);
+}
+
+TEST(HalJniDriverStationControlWord, NativeGetControlWordDefaultPathsReturnZero) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetControlWord(nullptr, nullptr), 0);
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetControlWord(nullptr, nullptr), 0);
+}
+
+// ============================================================================
+// Cycle 54 — DriverStation alliance-station JNI adapter.
+// ============================================================================
+
+TEST(HalJniDriverStationAllianceStation, NativeGetAllianceStationReturnsCachedStation) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  std::optional<shim_core> shim;
+  auto state = valid_ds_state();
+  state.station = alliance_station::blue_3;
+  install_cached_ds_state(region, core, shim, state);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetAllianceStation(nullptr, nullptr),
+            static_cast<jint>(HAL_AllianceStationID_kBlue3));
+}
+
+TEST(HalJniDriverStationAllianceStation, NativeGetAllianceStationPreservesAllEnumMappings) {
+  struct case_ {
+    alliance_station backend;
+    HAL_AllianceStationID expected;
+  };
+  constexpr std::array<case_, 7> cases{{
+      {alliance_station::unknown, HAL_AllianceStationID_kUnknown},
+      {alliance_station::red_1, HAL_AllianceStationID_kRed1},
+      {alliance_station::red_2, HAL_AllianceStationID_kRed2},
+      {alliance_station::red_3, HAL_AllianceStationID_kRed3},
+      {alliance_station::blue_1, HAL_AllianceStationID_kBlue1},
+      {alliance_station::blue_2, HAL_AllianceStationID_kBlue2},
+      {alliance_station::blue_3, HAL_AllianceStationID_kBlue3},
+  }};
+
+  for (const auto& test_case : cases) {
+    tier1_shared_region region{};
+    tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+    std::optional<shim_core> shim;
+    auto state = valid_ds_state();
+    state.station = test_case.backend;
+    install_cached_ds_state(region, core, shim, state);
+
+    EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetAllianceStation(nullptr, nullptr),
+              static_cast<jint>(test_case.expected));
+  }
+}
+
+TEST(HalJniDriverStationAllianceStation, NativeGetAllianceStationDefaultPathsReturnUnknown) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetAllianceStation(nullptr, nullptr),
+            static_cast<jint>(HAL_AllianceStationID_kUnknown));
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_nativeGetAllianceStation(nullptr, nullptr),
+            static_cast<jint>(HAL_AllianceStationID_kUnknown));
+}
+
+// ============================================================================
+// Cycle 55 — DriverStation sendError JNI adapter.
+// ============================================================================
+
+TEST(HalJniDriverStationSendError, ConvertsJavaStringsAndEnqueuesErrorMessage) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint result = Java_edu_wpi_first_hal_DriverStationJNI_sendError(env.get(),
+                                                                        nullptr,
+                                                                        static_cast<jboolean>(1),
+                                                                        static_cast<jint>(1234),
+                                                                        static_cast<jboolean>(0),
+                                                                        env.string("detail text"),
+                                                                        env.string("location text"),
+                                                                        env.string("stack text"),
+                                                                        static_cast<jboolean>(1));
+
+  EXPECT_EQ(result, 0);
+  ASSERT_EQ(shim.pending_error_messages().size(), 1u);
+  EXPECT_EQ(shim.pending_error_messages()[0],
+            valid_error_message(/*error_code=*/1234,
+                                /*severity=*/1,
+                                /*is_lv_code=*/0,
+                                /*print_msg=*/1,
+                                /*truncation_flags=*/0,
+                                "detail text",
+                                "location text",
+                                "stack text"));
+}
+
+TEST(HalJniDriverStationSendError, ReleasesEachAcquiredJavaString) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  jstring details = env.string("details");
+  jstring location = env.string("location");
+  jstring call_stack = env.string("call stack");
+
+  ASSERT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_sendError(
+                env.get(), nullptr, 1, 77, 0, details, location, call_stack, 1),
+            0);
+
+  ASSERT_EQ(env.utf_acquires().size(), 3u);
+  ASSERT_EQ(env.utf_releases().size(), 3u);
+  EXPECT_EQ(env.utf_acquires()[0].string, details);
+  EXPECT_EQ(env.utf_acquires()[1].string, location);
+  EXPECT_EQ(env.utf_acquires()[2].string, call_stack);
+  for (const auto& acquire : env.utf_acquires()) {
+    const auto matching_release =
+        std::ranges::count_if(env.utf_releases(), [&](const fake_jni_env::utf_release& release) {
+          return release.string == acquire.string && release.chars == acquire.chars;
+        });
+    EXPECT_EQ(matching_release, 1);
+  }
+}
+
+TEST(HalJniDriverStationSendError, NullOrMinimalStringPathsEnqueueEmptyFields) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_sendError(
+                nullptr, nullptr, 0, -7, 1, nullptr, nullptr, nullptr, 0),
+            0);
+
+  fake_jni_env missing_get_env{fake_jni_env::missing_function::get_string_utf_chars};
+  EXPECT_EQ(
+      Java_edu_wpi_first_hal_DriverStationJNI_sendError(missing_get_env.get(),
+                                                        nullptr,
+                                                        0,
+                                                        -7,
+                                                        1,
+                                                        missing_get_env.string("ignored details"),
+                                                        missing_get_env.string("ignored location"),
+                                                        missing_get_env.string("ignored stack"),
+                                                        0),
+      0);
+
+  ASSERT_EQ(shim.pending_error_messages().size(), 2u);
+  const auto expected = valid_error_message(/*error_code=*/-7,
+                                            /*severity=*/0,
+                                            /*is_lv_code=*/1,
+                                            /*print_msg=*/0,
+                                            /*truncation_flags=*/0,
+                                            "",
+                                            "",
+                                            "");
+  EXPECT_EQ(shim.pending_error_messages()[0], expected);
+  EXPECT_EQ(shim.pending_error_messages()[1], expected);
+}
+
+TEST(HalJniDriverStationSendError, NoShimReturnsHandleErrorWithoutCreatingFallbackState) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_DriverStationJNI_sendError(
+                nullptr, nullptr, 1, 9, 0, nullptr, nullptr, nullptr, 1),
+            kHalHandleError);
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+// ============================================================================
+// Cycle 56 — NotifierJNI lifecycle adapters.
+// ============================================================================
+
+TEST(HalJniNotifierLifecycle, InitializeNotifierReturnsCNotifierHandle) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+
+  EXPECT_NE(handle, 0);
+  const auto snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  EXPECT_EQ(snapshot.slots[0].handle, handle);
+  EXPECT_EQ(snapshot.slots[0].trigger_time_us, 0u);
+  EXPECT_EQ(snapshot.slots[0].alarm_active, 0);
+  EXPECT_EQ(snapshot.slots[0].canceled, 0);
+  expect_all_name_bytes_zero(snapshot.slots[0]);
+}
+
+TEST(HalJniNotifierLifecycle, InitializeNotifierNoShimReturnsZeroWithoutFallbackState) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr), 0);
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(HalJniNotifierLifecycle, SetNotifierNameConvertsAndReleasesJavaString) {
+  fake_jni_env env;
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  jstring name = env.string("TimedRobot");
+
+  Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(env.get(), nullptr, handle, name);
+
+  const auto snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  expect_name_bytes_eq(snapshot.slots[0], "TimedRobot");
+  ASSERT_EQ(env.utf_acquires().size(), 1u);
+  ASSERT_EQ(env.utf_releases().size(), 1u);
+  EXPECT_EQ(env.utf_acquires()[0].string, name);
+  EXPECT_EQ(env.utf_releases()[0].string, env.utf_acquires()[0].string);
+  EXPECT_EQ(env.utf_releases()[0].chars, env.utf_acquires()[0].chars);
+}
+
+TEST(HalJniNotifierLifecycle, SetNotifierNameNullAndMinimalPathsClearToEmptyName) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  fake_jni_env env;
+  Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(
+      env.get(), nullptr, handle, env.string("previous"));
+  auto snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  expect_name_bytes_eq(snapshot.slots[0], "previous");
+
+  Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(nullptr, nullptr, handle, nullptr);
+
+  snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  expect_all_name_bytes_zero(snapshot.slots[0]);
+
+  Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(
+      env.get(), nullptr, handle, env.string("again"));
+  snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  expect_name_bytes_eq(snapshot.slots[0], "again");
+
+  fake_jni_env missing_get_env{fake_jni_env::missing_function::get_string_utf_chars};
+  Java_edu_wpi_first_hal_NotifierJNI_setNotifierName(
+      missing_get_env.get(), nullptr, handle, missing_get_env.string("ignored"));
+
+  snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  expect_all_name_bytes_zero(snapshot.slots[0]);
+}
+
+TEST(HalJniNotifierLifecycle, AlarmControlMethodsDelegateToCNotifierState) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(
+      nullptr, nullptr, handle, 1'234'567'890'123ll);
+
+  auto snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  EXPECT_EQ(snapshot.slots[0].handle, handle);
+  EXPECT_EQ(snapshot.slots[0].trigger_time_us, 1'234'567'890'123ull);
+  EXPECT_EQ(snapshot.slots[0].alarm_active, 1);
+  EXPECT_EQ(snapshot.slots[0].canceled, 0);
+
+  Java_edu_wpi_first_hal_NotifierJNI_cancelNotifierAlarm(nullptr, nullptr, handle);
+
+  snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  EXPECT_EQ(snapshot.slots[0].alarm_active, 0);
+  EXPECT_EQ(snapshot.slots[0].canceled, 1);
+
+  Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(nullptr, nullptr, handle);
+
+  snapshot = shim.current_notifier_state();
+  ASSERT_EQ(snapshot.count, 1u);
+  EXPECT_EQ(snapshot.slots[0].alarm_active, 0);
+  EXPECT_EQ(snapshot.slots[0].canceled, 1);
+
+  Java_edu_wpi_first_hal_NotifierJNI_cleanNotifier(nullptr, nullptr, handle);
+
+  EXPECT_EQ(shim.current_notifier_state().count, 0u);
+}
+
+TEST(HalJniNotifierLifecycle, WaitForNotifierAlarmReturnsQueuedMatchingAlarm) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  const std::array<notifier_alarm_event, 1> events{
+      valid_notifier_alarm_event(9'876'543'210ull, handle),
+  };
+  send_notifier_alarm_batch(core, events, 250'000);
+  ASSERT_TRUE(shim.poll().has_value());
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle),
+            9'876'543'210ll);
+}
+
+TEST(HalJniNotifierLifecycle, WaitForNotifierAlarmStopWakeReturnsZero) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(nullptr, nullptr, handle);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle), 0);
+}
+
+TEST(HalJniNotifierLifecycle, ShutdownFallbackStateWhileNotifierWaitIsPendingIsSafe) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+
+  std::promise<void> start_wait;
+  auto start_future = start_wait.get_future();
+  auto waiter = std::async(std::launch::async, [handle, start = std::move(start_future)]() mutable {
+    start.wait();
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  start_wait.set_value();
+
+  while (fallback->pending_notifier_wait_count(handle) != 1u) {
+    std::this_thread::yield();
+  }
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+  EXPECT_EQ(waiter.get(), 0);
+}
+
+// ============================================================================
+// Cycle 58 — JNI fallback notifier alarm pump.
+// ============================================================================
+
+TEST(HalJniFallbackNotifierPump, EnqueuesActiveAlarmThroughProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+
+  std::int32_t status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &status), 20'000u);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_TRUE(fallback->is_connected());
+  ASSERT_TRUE(fallback->latest_notifier_alarm_batch().has_value());
+  EXPECT_EQ(fallback->latest_notifier_alarm_batch()->count, 1u);
+  EXPECT_EQ(fallback->latest_notifier_alarm_batch()->events[0].handle, handle);
+  EXPECT_EQ(fallback->latest_notifier_alarm_batch()->events[0].fired_at_us, 20'000u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackNotifierPump, IsInactiveWithoutFallbackOwnership) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(1));
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto host_shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{host_shim};
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 30'000);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(handle));
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(host_shim.latest_notifier_alarm_batch().has_value());
+}
+
+TEST(HalJniFallbackNotifierPump, InactiveCanceledStoppedAndCleanedAlarmsDoNotPump) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+
+  const jint inactive = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(inactive, 0);
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(inactive));
+  EXPECT_FALSE(fallback->latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(fallback->is_connected());
+
+  const jint canceled = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(canceled, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, canceled, 40'000);
+  Java_edu_wpi_first_hal_NotifierJNI_cancelNotifierAlarm(nullptr, nullptr, canceled);
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(canceled));
+  EXPECT_FALSE(fallback->latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(fallback->is_connected());
+
+  const jint stopped = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(stopped, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, stopped, 50'000);
+  Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(nullptr, nullptr, stopped);
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(stopped));
+  EXPECT_FALSE(fallback->latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(fallback->is_connected());
+
+  const jint cleaned = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(cleaned, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, cleaned, 60'000);
+  Java_edu_wpi_first_hal_NotifierJNI_cleanNotifier(nullptr, nullptr, cleaned);
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(cleaned));
+  EXPECT_FALSE(fallback->latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(fallback->is_connected());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackNotifierPump, RepeatedUpdatesPumpLatestTriggerOncePerCall) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+
+  std::int32_t first_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &first_status),
+            20'000u);
+  EXPECT_EQ(first_status, kHalSuccess);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+
+  std::int32_t second_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &second_status),
+            40'000u);
+  EXPECT_EQ(second_status, kHalSuccess);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackNotifierPump, JniWaitPumpsBeforeDelegatingToCWait) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 60'000);
+
+  auto waiter = std::async(std::launch::async, [handle]() {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+
+  using namespace std::chrono_literals;
+  while (waiter.wait_for(0s) != std::future_status::ready &&
+         fallback->pending_notifier_wait_count(handle) == 0u) {
+    std::this_thread::yield();
+  }
+
+  if (fallback->pending_notifier_wait_count(handle) != 0u) {
+    Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(nullptr, nullptr, handle);
+    EXPECT_EQ(waiter.get(), 0);
+    FAIL() << "NotifierJNI.waitForNotifierAlarm delegated before pumping fallback alarm";
+  }
+
+  EXPECT_EQ(waiter.get(), 60'000ll);
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackNotifierPump, BusyFallbackInboundLaneIsPolledOnceAndRetried) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  auto* region = hal_jni_launch_state_region_for_test();
+  auto* core = hal_jni_launch_state_core_endpoint_for_test();
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_NE(region, nullptr);
+  ASSERT_NE(core, nullptr);
+
+  auto boot = core->try_receive();
+  ASSERT_TRUE(boot.has_value());
+  ASSERT_EQ(boot->envelope.kind, envelope_kind::boot);
+  ASSERT_TRUE(core->send(envelope_kind::boot_ack, schema_id::none, {}, 65'000));
+  ASSERT_TRUE(fallback->poll().has_value());
+  ASSERT_TRUE(fallback->is_connected());
+
+  const auto ds = valid_ds_state();
+  ASSERT_TRUE(core->send(envelope_kind::tick_boundary, schema_id::ds_state, bytes_of(ds), 65'000));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 70'000);
+
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  ASSERT_TRUE(fallback->latest_ds_state().has_value());
+  EXPECT_EQ(*fallback->latest_ds_state(), ds);
+
+  std::int32_t status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &status), 70'000u);
+  EXPECT_EQ(status, kHalSuccess);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackNotifierPump, ShutdownClearsFallbackPumpEligibility) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 80'000);
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(handle));
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+// ============================================================================
+// Cycle 59 — JNI fallback clock pump for TimedRobot.
+// ============================================================================
+
+TEST(HalJniFallbackClockPump, HalUtilGetFPGATimeSeedsClockThroughProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_FALSE(fallback->is_connected());
+  ASSERT_FALSE(fallback->latest_clock_state().has_value());
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+
+  ASSERT_TRUE(fallback->is_connected());
+  ASSERT_TRUE(fallback->latest_clock_state().has_value());
+  const auto expected = valid_clock_state(20'000);
+  EXPECT_EQ(*fallback->latest_clock_state(), expected);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackClockPump, NoShimAndHostInstalledHalUtilGetFPGATimeDoNotPumpFallbackClock) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto host_shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{host_shim};
+  ASSERT_FALSE(host_shim.latest_clock_state().has_value());
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(host_shim.latest_clock_state().has_value());
+}
+
+TEST(HalJniFallbackClockPump, HalUtilGetFPGATimeDoesNotOverrideCachedFallbackClock) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  auto* core = hal_jni_launch_state_core_endpoint_for_test();
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_NE(core, nullptr);
+
+  auto boot = core->try_receive();
+  ASSERT_TRUE(boot.has_value());
+  ASSERT_EQ(boot->envelope.kind, envelope_kind::boot);
+  ASSERT_TRUE(core->send(envelope_kind::boot_ack, schema_id::none, {}, 120'000));
+  ASSERT_TRUE(fallback->poll().has_value());
+  ASSERT_TRUE(fallback->is_connected());
+
+  const auto provided = valid_clock_state(123'456);
+  ASSERT_TRUE(core->send(
+      envelope_kind::tick_boundary, schema_id::clock_state, bytes_of(provided), 123'456));
+  ASSERT_TRUE(fallback->poll().has_value());
+  ASSERT_TRUE(fallback->latest_clock_state().has_value());
+  ASSERT_EQ(*fallback->latest_clock_state(), provided);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 123'456ll);
+  ASSERT_TRUE(fallback->latest_clock_state().has_value());
+  EXPECT_EQ(*fallback->latest_clock_state(), provided);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackClockPump, NotifierPumpAdvancesClockBeforeQueuingAlarm) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+
+  std::int32_t clock_status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&clock_status), 40'000u);
+  EXPECT_EQ(clock_status, kHalSuccess);
+
+  std::int32_t wait_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &wait_status),
+            40'000u);
+  EXPECT_EQ(wait_status, kHalSuccess);
+  EXPECT_TRUE(fallback->latest_clock_state().has_value());
+  EXPECT_TRUE(fallback->latest_notifier_alarm_batch().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackClockPump, HostInstalledNotifierPumpDoesNotPublishClockOrAlarm) {
+  reset_hal_jni_launch_state_for_test();
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto host_shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{host_shim};
+  ASSERT_FALSE(host_shim.latest_clock_state().has_value());
+  ASSERT_FALSE(host_shim.latest_notifier_alarm_batch().has_value());
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(handle));
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(host_shim.latest_clock_state().has_value());
+  EXPECT_FALSE(host_shim.latest_notifier_alarm_batch().has_value());
+}
+
+TEST(HalJniFallbackClockPump, RepeatedNotifierPumpsAdvanceClockToEachTrigger) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t first_clock_status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&first_clock_status), 20'000u);
+  EXPECT_EQ(first_clock_status, kHalSuccess);
+  std::int32_t first_wait_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &first_wait_status),
+            20'000u);
+  EXPECT_EQ(first_wait_status, kHalSuccess);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t second_clock_status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&second_clock_status), 40'000u);
+  EXPECT_EQ(second_clock_status, kHalSuccess);
+  std::int32_t second_wait_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &second_wait_status),
+            40'000u);
+  EXPECT_EQ(second_wait_status, kHalSuccess);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+// ============================================================================
+// Cycle 60 — JNI fallback real-time pacing driver.
+// ============================================================================
+
+std::vector<std::uint64_t>& fallback_sleep_log() {
+  static std::vector<std::uint64_t> log;
+  return log;
+}
+
+void record_fallback_sleep(std::uint64_t delay_us) {
+  fallback_sleep_log().push_back(delay_us);
+}
+
+shim_core*& fallback_sleep_inspected_shim() {
+  static shim_core* shim = nullptr;
+  return shim;
+}
+
+void record_fallback_sleep_and_expect_pre_publish(std::uint64_t delay_us) {
+  fallback_sleep_log().push_back(delay_us);
+  auto* shim = fallback_sleep_inspected_shim();
+  ASSERT_NE(shim, nullptr);
+  ASSERT_TRUE(shim->latest_clock_state().has_value());
+  EXPECT_EQ(shim->latest_clock_state()->sim_time_us, 20'000u);
+  EXPECT_FALSE(shim->latest_notifier_alarm_batch().has_value());
+}
+
+TEST(HalJniFallbackRealtimePacing, InitialClockSeedEstablishesOriginWithoutSleeping) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  ASSERT_TRUE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+  EXPECT_EQ(*hal_jni_fallback_last_paced_sim_time_for_test(), 20'000u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackRealtimePacing, NotifierPumpSleepsForDeltaBeforePublishingAlarm) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  fallback_sleep_inspected_shim() = nullptr;
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep_and_expect_pre_publish);
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+  fallback_sleep_inspected_shim() = fallback;
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+
+  EXPECT_EQ(fallback_sleep_log(), std::vector<std::uint64_t>{20'000});
+  std::int32_t wait_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &wait_status),
+            40'000u);
+  EXPECT_EQ(wait_status, kHalSuccess);
+  ASSERT_TRUE(fallback->latest_clock_state().has_value());
+  EXPECT_EQ(fallback->latest_clock_state()->sim_time_us, 40'000u);
+
+  fallback_sleep_inspected_shim() = nullptr;
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackRealtimePacing, RepeatedNotifierPumpsSleepForPerCycleDeltas) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t first_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &first_status),
+            40'000u);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 60'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t second_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &second_status),
+            60'000u);
+
+  EXPECT_EQ(fallback_sleep_log(), (std::vector<std::uint64_t>{20'000, 20'000}));
+  EXPECT_EQ(*hal_jni_fallback_last_paced_sim_time_for_test(), 60'000u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackRealtimePacing, NonmonotonicAlarmDoesNotRequestNegativeSleep) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t first_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &first_status),
+            40'000u);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 35'000);
+  ASSERT_TRUE(pump_jni_fallback_notifier_alarm(handle));
+  std::int32_t second_status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(static_cast<HAL_NotifierHandle>(handle), &second_status),
+            35'000u);
+
+  EXPECT_EQ(fallback_sleep_log(), std::vector<std::uint64_t>{20'000});
+  EXPECT_EQ(*hal_jni_fallback_last_paced_sim_time_for_test(), 35'000u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniFallbackRealtimePacing, NoShimAndHostInstalledNotifierPumpRemainUnpaced) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  shim_core::install_global(nullptr);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(1));
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto host_shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{host_shim};
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(handle));
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(host_shim.latest_clock_state().has_value());
+  EXPECT_FALSE(host_shim.latest_notifier_alarm_batch().has_value());
+}
+
+TEST(HalJniFallbackRealtimePacing, ResetClearsSleepHookAndLastPacedTime) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  EXPECT_FALSE(hal_jni_fallback_sleep_hook_is_default_for_test());
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+  ASSERT_TRUE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+
+  EXPECT_TRUE(hal_jni_fallback_sleep_hook_is_default_for_test());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 20'000ll);
+  ASSERT_TRUE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+  EXPECT_EQ(*hal_jni_fallback_last_paced_sim_time_for_test(), 20'000u);
+  EXPECT_TRUE(fallback_sleep_log().empty());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+// ============================================================================
+// Cycle 57 — DriverStation observer JNI adapters.
+// ============================================================================
+
+TEST(HalJniDriverStationObserver, ObserveStartingRecordsStartingState) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramStarting(nullptr, nullptr);
+
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::starting);
+}
+
+TEST(HalJniDriverStationObserver, ModeObserversRecordDistinctStates) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramDisabled(nullptr, nullptr);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::disabled);
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramAutonomous(nullptr, nullptr);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::autonomous);
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTeleop(nullptr, nullptr);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::teleop);
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTest(nullptr, nullptr);
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::test);
+}
+
+TEST(HalJniDriverStationObserver, LatestObserverCallWins) {
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramStarting(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramDisabled(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramAutonomous(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTeleop(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTest(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramDisabled(nullptr, nullptr);
+
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::disabled);
+}
+
+TEST(HalJniDriverStationObserver, NoShimCallsAreNoOpsWithoutFallbackState) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  ASSERT_EQ(shim_core::current(), nullptr);
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramStarting(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramDisabled(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramAutonomous(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTeleop(nullptr, nullptr);
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTest(nullptr, nullptr);
+
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  tier1_shared_region region{};
+  tier1_endpoint core{tier1_endpoint::make(region, direction::core_to_backend).value()};
+  auto shim = make_connected_shim(region, core);
+  shim_global_install_guard guard{shim};
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::none);
+}
+
+TEST(HalJniDriverStationObserver, CallsDoNotPublishUntilExplicitFlush) {
+  tier1_shared_region region{};
+  auto endpoint = make_backend(region);
+  auto shim_or = shim_core::make(std::move(endpoint), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  tier1_endpoint core = make_core(region);
+  drain_boot_only(core);
+  ASSERT_FALSE(core.try_receive().has_value());
+  auto& shim = *shim_or;
+  shim_global_install_guard guard{shim};
+
+  Java_edu_wpi_first_hal_DriverStationJNI_observeUserProgramTeleop(nullptr, nullptr);
+
+  EXPECT_EQ(shim.user_program_observer_state(), user_program_observer_state::teleop);
+  EXPECT_FALSE(core.try_receive().has_value());
+
+  ASSERT_TRUE(shim.flush_user_program_observer(500'000).has_value());
+  expect_observer_payload_mode(receive_from_shim(core),
+                               ::robosim::backend::user_program_observer_mode::teleop);
+}
+
+// ============================================================================
+// Cycle 61 — host-side shim driver.
+// ============================================================================
+
+struct host_driver_fixture {
+  std::unique_ptr<tier1_shared_region> region;
+  boot_descriptor descriptor{};
+  shim_core shim;
+  shim_host_driver host;
+};
+
+host_driver_fixture make_host_driver_fixture() {
+  auto region = std::make_unique<tier1_shared_region>();
+  auto backend = make_backend(*region);
+  auto descriptor = valid_boot_descriptor();
+  descriptor.team_number = 254;
+  descriptor.vendor_capabilities = 0xC061'0001u;
+  auto shim_or = shim_core::make(std::move(backend), descriptor, kBootSimTime);
+  EXPECT_TRUE(shim_or.has_value());
+
+  auto host_or = shim_host_driver::make(*region);
+  EXPECT_TRUE(host_or.has_value());
+  return host_driver_fixture{
+      std::move(region),
+      descriptor,
+      std::move(*shim_or),
+      std::move(*host_or),
+  };
+}
+
+TEST(ShimHostDriver, AcceptsBootAndSendsBootAck) {
+  auto fixture = make_host_driver_fixture();
+
+  const auto boot = fixture.host.accept_boot_and_send_ack(123'000);
+
+  ASSERT_TRUE(boot.has_value());
+  EXPECT_EQ(*boot, fixture.descriptor);
+  EXPECT_FALSE(fixture.shim.is_connected());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  EXPECT_TRUE(fixture.shim.is_connected());
+}
+
+TEST(ShimHostDriver, PublishesClockOnlyAfterExplicitShimPoll) {
+  auto fixture = make_host_driver_fixture();
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  shim_global_install_guard guard{fixture.shim};
+
+  const auto clock = valid_clock_state(42'000);
+  ASSERT_TRUE(fixture.host.publish_clock_state(clock, 42'000).has_value());
+
+  std::int32_t status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&status), 0u);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(fixture.shim.latest_clock_state().has_value());
+
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&status), 42'000u);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+TEST(ShimHostDriver, PublishesOneNotifierAlarmThroughProtocol) {
+  auto fixture = make_host_driver_fixture();
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  shim_global_install_guard guard{fixture.shim};
+
+  std::int32_t status = 999;
+  const auto handle = HAL_InitializeNotifier(&status);
+  ASSERT_NE(handle, 0);
+  ASSERT_EQ(status, kHalSuccess);
+
+  ASSERT_TRUE(fixture.host.publish_notifier_alarm(handle, 75'000, 75'000).has_value());
+  EXPECT_FALSE(fixture.shim.latest_notifier_alarm_batch().has_value());
+
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->count, 1u);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].handle, handle);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].fired_at_us, 75'000u);
+
+  status = 999;
+  EXPECT_EQ(HAL_WaitForNotifierAlarm(handle, &status), 75'000u);
+  EXPECT_EQ(status, kHalSuccess);
+}
+
+TEST(ShimHostDriver, ZeroCountAlarmBatchUsesActivePrefixBytes) {
+  auto fixture = make_host_driver_fixture();
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+
+  notifier_alarm_batch poisoned{};
+  poisoned.count = 0;
+  poisoned.events[0] = valid_notifier_alarm_event(99'000, 99);
+  ASSERT_TRUE(fixture.host.publish_notifier_alarm_batch(poisoned, 99'000).has_value());
+
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  const notifier_alarm_batch expected{};
+  EXPECT_EQ(*fixture.shim.latest_notifier_alarm_batch(), expected);
+  EXPECT_EQ(std::memcmp(&*fixture.shim.latest_notifier_alarm_batch(),
+                        &expected,
+                        sizeof(notifier_alarm_batch)),
+            0);
+}
+
+TEST(ShimHostDriver, PublishBeforeBootAckIsRejectedBySessionOrdering) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_host_driver_fixture();
+
+  const auto result = fixture.host.publish_clock_state(valid_clock_state(42'000), 42'000);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().kind, tier1_transport_error_kind::session_rejected_envelope);
+  ASSERT_TRUE(result.error().session_failure.has_value());
+  EXPECT_EQ(result.error().session_failure->kind, session_error_kind::expected_boot_first);
+  EXPECT_FALSE(fixture.shim.is_connected());
+  EXPECT_FALSE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_FALSE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_TRUE(fixture.shim.poll().has_value());
+  EXPECT_FALSE(fixture.shim.is_connected());
+  EXPECT_FALSE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(ShimHostDriver, LaneBusyIsSurfacedWithoutShortcutRetry) {
+  auto fixture = make_host_driver_fixture();
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+
+  const auto first = valid_clock_state(42'000);
+  const auto second = valid_clock_state(84'000);
+  ASSERT_TRUE(fixture.host.publish_clock_state(first, 42'000).has_value());
+  const auto second_result = fixture.host.publish_clock_state(second, 84'000);
+
+  ASSERT_FALSE(second_result.has_value());
+  EXPECT_EQ(second_result.error().kind, tier1_transport_error_kind::lane_busy);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_EQ(*fixture.shim.latest_clock_state(), first);
+}
+
+TEST(ShimHostDriver, DoesNotCreateOrUseJniFallbackState) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_host_driver_fixture();
+  ASSERT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  ASSERT_TRUE(fixture.host.publish_clock_state(valid_clock_state(123'000), 123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+
+  ASSERT_TRUE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_EQ(fixture.shim.latest_clock_state()->sim_time_us, 123'000u);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+// ============================================================================
+// Cycle 62 — JNI attach to host-provided Tier 1 mapping.
+// ============================================================================
+
+class scoped_env_var {
+ public:
+  scoped_env_var(const char* name, std::string_view value) : name_(name) {
+    if (const char* old = std::getenv(name_); old != nullptr) {
+      had_old_value_ = true;
+      old_value_ = old;
+    }
+    EXPECT_EQ(::setenv(name_, std::string{value}.c_str(), 1), 0);
+  }
+
+  explicit scoped_env_var(const char* name) : name_(name) {
+    if (const char* old = std::getenv(name_); old != nullptr) {
+      had_old_value_ = true;
+      old_value_ = old;
+    }
+    EXPECT_EQ(::unsetenv(name_), 0);
+  }
+
+  ~scoped_env_var() {
+    if (had_old_value_) {
+      EXPECT_EQ(::setenv(name_, old_value_.c_str(), 1), 0);
+    } else {
+      EXPECT_EQ(::unsetenv(name_), 0);
+    }
+  }
+
+  scoped_env_var(const scoped_env_var&) = delete;
+  scoped_env_var& operator=(const scoped_env_var&) = delete;
+
+ private:
+  const char* name_;
+  bool had_old_value_ = false;
+  std::string old_value_;
+};
+
+tier1::unique_fd make_wrong_size_tier1_fd() {
+  const int fd = ::memfd_create("robosim-cycle62-wrong-size", MFD_CLOEXEC);
+  EXPECT_GE(fd, 0);
+  EXPECT_EQ(::ftruncate(fd, static_cast<off_t>(sizeof(tier1_shared_region) - 1)), 0);
+  return tier1::unique_fd{fd};
+}
+
+TEST(HalJniHostMappingAttach, InitializeAttachesToHostMappingAndPublishesBoot) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  auto host_mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(host_mapping.has_value());
+  auto handoff_fd = host_mapping->duplicate_fd();
+  ASSERT_TRUE(handoff_fd.has_value());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(handoff_fd->get())};
+  (void)handoff_fd->release();
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  auto* shim = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(shim, nullptr);
+  EXPECT_EQ(shim_core::current(), shim);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(hal_jni_launch_state_has_attached_mapping_for_test());
+  auto host = shim_host_driver::make(host_mapping->region());
+  ASSERT_TRUE(host.has_value());
+  const auto boot = host->accept_boot_and_send_ack(123'000);
+  ASSERT_TRUE(boot.has_value());
+  EXPECT_EQ(boot->runtime, runtime_type::roborio_2);
+  EXPECT_FALSE(shim->is_connected());
+
+  ASSERT_TRUE(shim->poll().has_value());
+  EXPECT_TRUE(shim->is_connected());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniHostMappingAttach, HostPublishedClockReachesAttachedShimAfterExplicitPoll) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  auto host_mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(host_mapping.has_value());
+  auto handoff_fd = host_mapping->duplicate_fd();
+  ASSERT_TRUE(handoff_fd.has_value());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(handoff_fd->get())};
+  (void)handoff_fd->release();
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* shim = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(shim, nullptr);
+  auto host = shim_host_driver::make(host_mapping->region());
+  ASSERT_TRUE(host.has_value());
+  ASSERT_TRUE(host->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(shim->poll().has_value());
+
+  const auto clock = valid_clock_state(64'000);
+  ASSERT_TRUE(host->publish_clock_state(clock, 64'000).has_value());
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0ll);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(shim->latest_clock_state().has_value());
+
+  ASSERT_TRUE(shim->poll().has_value());
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 64'000ll);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniHostMappingAttach, AttachedShimSurvivesCallerClosingOriginalFd) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  auto host_mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(host_mapping.has_value());
+  auto handoff_fd = host_mapping->duplicate_fd();
+  ASSERT_TRUE(handoff_fd.has_value());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(handoff_fd->get())};
+  (void)handoff_fd->release();
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* shim = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(shim, nullptr);
+
+  {
+    auto close_after_init_fd = host_mapping->duplicate_fd();
+    ASSERT_TRUE(close_after_init_fd.has_value());
+  }
+
+  auto host = shim_host_driver::make(host_mapping->region());
+  ASSERT_TRUE(host.has_value());
+  ASSERT_TRUE(host->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(shim->poll().has_value());
+  ASSERT_TRUE(host->publish_clock_state(valid_clock_state(88'000), 88'000).has_value());
+  ASSERT_TRUE(shim->poll().has_value());
+  ASSERT_TRUE(shim->latest_clock_state().has_value());
+  EXPECT_EQ(shim->latest_clock_state()->sim_time_us, 88'000u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniHostMappingAttach, InvalidPresentEnvFdFailsClosedWithoutFallback) {
+  const auto expect_failed_attach = [] {
+    EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 0);
+    EXPECT_EQ(shim_core::current(), nullptr);
+    EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+    EXPECT_FALSE(hal_jni_launch_state_has_attached_mapping_for_test());
+    EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+    EXPECT_EQ(hal_jni_launch_state_region_for_test(), nullptr);
+  };
+
+  {
+    reset_hal_jni_launch_state_for_test();
+    shim_core::install_global(nullptr);
+    const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(), "not-an-fd"};
+    expect_failed_attach();
+  }
+
+  {
+    reset_hal_jni_launch_state_for_test();
+    shim_core::install_global(nullptr);
+    const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(), "-1"};
+    expect_failed_attach();
+  }
+
+  {
+    reset_hal_jni_launch_state_for_test();
+    shim_core::install_global(nullptr);
+    auto wrong_size_fd = make_wrong_size_tier1_fd();
+    ASSERT_TRUE(wrong_size_fd.valid());
+    const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                             std::to_string(wrong_size_fd.get())};
+    (void)wrong_size_fd.release();
+    expect_failed_attach();
+  }
+}
+
+TEST(HalJniHostMappingAttach, AbsentEnvPreservesFallbackInitializeBehavior) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test()};
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_EQ(shim_core::current(), fallback);
+  EXPECT_TRUE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(hal_jni_launch_state_has_attached_mapping_for_test());
+  EXPECT_FALSE(fallback->is_connected());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniHostMappingAttach, FallbackPumpsDoNotDriveEnvFdAttachedShims) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  shim_core::install_global(nullptr);
+  auto host_mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(host_mapping.has_value());
+  auto handoff_fd = host_mapping->duplicate_fd();
+  ASSERT_TRUE(handoff_fd.has_value());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(handoff_fd->get())};
+  (void)handoff_fd->release();
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* shim = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(shim, nullptr);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  EXPECT_FALSE(pump_jni_fallback_notifier_alarm(handle));
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0ll);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(hal_jni_launch_state_has_attached_mapping_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+  EXPECT_FALSE(shim->latest_clock_state().has_value());
+  EXPECT_FALSE(shim->latest_notifier_alarm_batch().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+// ============================================================================
+// Cycle 63 — JNI env-attached shim poll loop.
+// ============================================================================
+
+bool wait_until_true(std::function<bool()> predicate) {
+  constexpr int kMaxAttempts = 100'000;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
+struct attached_jni_fixture {
+  tier1::tier1_shared_mapping host_mapping;
+  shim_core* shim = nullptr;
+  shim_host_driver host;
+};
+
+attached_jni_fixture make_attached_jni_fixture(bool reset_launch_state = true) {
+  if (reset_launch_state) {
+    reset_hal_jni_launch_state_for_test();
+  }
+  shim_core::install_global(nullptr);
+  auto host_mapping = tier1::tier1_shared_mapping::create();
+  EXPECT_TRUE(host_mapping.has_value());
+  auto handoff_fd = host_mapping->duplicate_fd();
+  EXPECT_TRUE(handoff_fd.has_value());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(handoff_fd->get())};
+  (void)handoff_fd->release();
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+  auto* shim = hal_jni_launch_state_shim_for_test();
+  EXPECT_NE(shim, nullptr);
+  auto host = shim_host_driver::make(host_mapping->region());
+  EXPECT_TRUE(host.has_value());
+  return attached_jni_fixture{std::move(*host_mapping), shim, std::move(*host)};
+}
+
+void accept_boot_ack_and_wait_connected(attached_jni_fixture& fixture) {
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim != nullptr && fixture.shim->is_connected(); }));
+}
+
+std::atomic<std::uint32_t>& attached_idle_log() {
+  static std::atomic<std::uint32_t> count{0};
+  return count;
+}
+
+void record_attached_idle() {
+  attached_idle_log().fetch_add(1, std::memory_order_relaxed);
+}
+
+TEST(HalJniAttachedPollLoop, InitializeStartsPollLoopAndAcceptsBootAck) {
+  auto fixture = make_attached_jni_fixture();
+
+  EXPECT_TRUE(hal_jni_attached_poll_loop_active_for_test());
+  const std::uint64_t poll_count_before = hal_jni_attached_poll_count_for_test();
+  ASSERT_TRUE(fixture.host.accept_boot_and_send_ack(123'000).has_value());
+
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+  EXPECT_GT(hal_jni_attached_poll_count_for_test(), poll_count_before);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, HostPublishedClockReachesHalUtilThroughPollLoop) {
+  auto fixture = make_attached_jni_fixture();
+  accept_boot_ack_and_wait_connected(fixture);
+
+  ASSERT_TRUE(fixture.host.publish_clock_state(valid_clock_state(96'000), 96'000).has_value());
+
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 96'000ll; }));
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, HostPublishedNotifierAlarmWakesJavaWaitThroughPollLoop) {
+  auto fixture = make_attached_jni_fixture();
+  accept_boot_ack_and_wait_connected(fixture);
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 111'000);
+
+  auto waiter = std::async(std::launch::async, [handle] {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_TRUE(fixture.host.publish_notifier_alarm(handle, 111'000, 111'000).has_value());
+
+  using namespace std::chrono_literals;
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 111'000ll);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, FallbackInitializeDoesNotStartPollLoop) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test()};
+
+  ASSERT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 1);
+
+  auto* fallback = hal_jni_launch_state_shim_for_test();
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_TRUE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(hal_jni_attached_poll_loop_active_for_test());
+  EXPECT_EQ(hal_jni_attached_poll_count_for_test(), 0u);
+  EXPECT_FALSE(fallback->is_connected());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, FailedEnvAttachDoesNotStartPollLoop) {
+  reset_hal_jni_launch_state_for_test();
+  shim_core::install_global(nullptr);
+  auto wrong_size_fd = make_wrong_size_tier1_fd();
+  ASSERT_TRUE(wrong_size_fd.valid());
+  const scoped_env_var env{hal_jni_tier1_fd_env_var_for_test(),
+                           std::to_string(wrong_size_fd.get())};
+  (void)wrong_size_fd.release();
+
+  EXPECT_EQ(Java_edu_wpi_first_hal_HAL_initialize(nullptr, nullptr, 500, 0), 0);
+
+  EXPECT_FALSE(hal_jni_attached_poll_loop_active_for_test());
+  EXPECT_EQ(hal_jni_attached_poll_count_for_test(), 0u);
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_FALSE(hal_jni_launch_state_has_attached_mapping_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, IdleHookIsUsedWithoutMutatingCaches) {
+  reset_hal_jni_launch_state_for_test();
+  attached_idle_log().store(0, std::memory_order_relaxed);
+  set_hal_jni_attached_poll_idle_for_test(record_attached_idle);
+  auto fixture = make_attached_jni_fixture(false);
+  accept_boot_ack_and_wait_connected(fixture);
+
+  ASSERT_TRUE(wait_until_true(
+      [] { return attached_idle_log().load(std::memory_order_relaxed) > 0u; }));
+
+  EXPECT_TRUE(hal_jni_attached_poll_loop_active_for_test());
+  EXPECT_FALSE(fixture.shim->latest_clock_state().has_value());
+  EXPECT_FALSE(fixture.shim->latest_notifier_alarm_batch().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedPollLoop, ShutdownStopsPollLoopBeforeDestroyingAttachedState) {
+  auto fixture = make_attached_jni_fixture();
+  accept_boot_ack_and_wait_connected(fixture);
+  ASSERT_TRUE(hal_jni_attached_poll_loop_active_for_test());
+
+  Java_edu_wpi_first_hal_HAL_shutdown(nullptr, nullptr);
+
+  EXPECT_FALSE(hal_jni_attached_poll_loop_active_for_test());
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+  EXPECT_FALSE(hal_jni_launch_state_has_attached_mapping_for_test());
+
+  EXPECT_TRUE(fixture.host.publish_clock_state(valid_clock_state(222'000), 222'000).has_value());
+  EXPECT_EQ(Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr), 0ll);
+}
+
+TEST(HalJniAttachedPollLoop, ResetStopsPollLoopAndRestoresIdleHook) {
+  reset_hal_jni_launch_state_for_test();
+  attached_idle_log().store(0, std::memory_order_relaxed);
+  set_hal_jni_attached_poll_idle_for_test(record_attached_idle);
+  EXPECT_FALSE(hal_jni_attached_poll_idle_hook_is_default_for_test());
+  auto fixture = make_attached_jni_fixture(false);
+  ASSERT_TRUE(hal_jni_attached_poll_loop_active_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+
+  EXPECT_FALSE(hal_jni_attached_poll_loop_active_for_test());
+  EXPECT_TRUE(hal_jni_attached_poll_idle_hook_is_default_for_test());
+  EXPECT_EQ(shim_core::current(), nullptr);
+  EXPECT_EQ(hal_jni_launch_state_shim_for_test(), nullptr);
+}
+
+// ============================================================================
+// Cycle 64 — host runtime clock/notifier pump.
+// ============================================================================
+
+struct host_runtime_fixture {
+  std::unique_ptr<tier1_shared_region> region;
+  shim_core shim;
+  shim_host_runtime_driver runtime;
+};
+
+host_runtime_fixture make_host_runtime_fixture() {
+  auto region = std::make_unique<tier1_shared_region>();
+  auto backend = make_backend(*region);
+  auto shim_or = shim_core::make(std::move(backend), valid_boot_descriptor(), kBootSimTime);
+  EXPECT_TRUE(shim_or.has_value());
+  auto runtime_or = shim_host_runtime_driver::make(*region);
+  EXPECT_TRUE(runtime_or.has_value());
+  return host_runtime_fixture{
+      std::move(region),
+      std::move(*shim_or),
+      std::move(*runtime_or),
+  };
+}
+
+void accept_runtime_boot(host_runtime_fixture& fixture) {
+  ASSERT_TRUE(fixture.runtime.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.is_connected());
+}
+
+void runtime_receive_notifier_state(host_runtime_fixture& fixture, const notifier_state& state) {
+  ASSERT_TRUE(fixture.shim.send_notifier_state(state, 10'000).has_value());
+  const auto received = fixture.runtime.poll_robot_outputs();
+  ASSERT_TRUE(received.has_value());
+  ASSERT_EQ(*received, shim_host_runtime_robot_output::notifier_state_received);
+}
+
+TEST(ShimHostRuntime, PublishesDefaultClockTickFirst) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+  shim_global_install_guard guard{fixture.shim};
+
+  const auto result = fixture.runtime.pump_to(20'000);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, shim_host_runtime_pump_result::clock_published);
+  std::int32_t status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&status), 0u);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(fixture.shim.latest_clock_state().has_value());
+
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_EQ(*fixture.shim.latest_clock_state(), valid_clock_state(20'000));
+  status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&status), 20'000u);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(ShimHostRuntime, ReceivesNotifierStateOnlyThroughProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+  shim_global_install_guard guard{fixture.shim};
+
+  std::int32_t first_status = 999;
+  const auto first = HAL_InitializeNotifier(&first_status);
+  ASSERT_NE(first, 0);
+  ASSERT_EQ(first_status, kHalSuccess);
+  std::int32_t second_status = 999;
+  const auto second = HAL_InitializeNotifier(&second_status);
+  ASSERT_NE(second, 0);
+  ASSERT_EQ(second_status, kHalSuccess);
+  HAL_UpdateNotifierAlarm(first, 70'000, &first_status);
+  ASSERT_EQ(first_status, kHalSuccess);
+
+  const auto expected = fixture.shim.current_notifier_state();
+  ASSERT_TRUE(fixture.shim.flush_notifier_state(10'000).has_value());
+  const auto polled = fixture.runtime.poll_robot_outputs();
+
+  ASSERT_TRUE(polled.has_value());
+  EXPECT_EQ(*polled, shim_host_runtime_robot_output::notifier_state_received);
+  ASSERT_TRUE(fixture.runtime.latest_notifier_state().has_value());
+  EXPECT_EQ(*fixture.runtime.latest_notifier_state(), expected);
+  EXPECT_EQ(std::memcmp(&*fixture.runtime.latest_notifier_state(),
+                        &expected,
+                        sizeof(notifier_state)),
+            0);
+  EXPECT_FALSE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_FALSE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  (void)second;
+}
+
+TEST(ShimHostRuntime, DueNotifierAlarmWakesAttachedJniWaitThroughHostPump) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  auto fixture = make_attached_jni_fixture(false);
+  shim_host_runtime_driver runtime = shim_host_runtime_driver::make(fixture.host_mapping.region()).value();
+  ASSERT_TRUE(runtime.accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_TRUE(runtime.poll_robot_outputs().has_value());
+
+  auto waiter = std::async(std::launch::async, [handle] {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime.pump_to(40'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 40'000ll; }));
+  ASSERT_EQ(*runtime.pump_to(40'000), shim_host_runtime_pump_result::notifier_alarm_published);
+
+  using namespace std::chrono_literals;
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 40'000ll);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(ShimHostRuntime, InactiveCanceledAndFutureNotifierSlotsAreNotDue) {
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+
+  notifier_state state{};
+  state.count = 4;
+  state.slots[0] = valid_notifier_slot(60'000, 10, 0, 0, "inactive");
+  state.slots[1] = valid_notifier_slot(60'000, 20, 1, 1, "canceled");
+  state.slots[2] = valid_notifier_slot(60'000, 30, 1, 0, "due");
+  state.slots[3] = valid_notifier_slot(100'000, 40, 1, 0, "future");
+  runtime_receive_notifier_state(fixture, state);
+
+  ASSERT_EQ(*fixture.runtime.pump_to(60'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(60'000),
+            shim_host_runtime_pump_result::notifier_alarm_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+
+  ASSERT_TRUE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->count, 1u);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].handle, 30);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].fired_at_us, 60'000u);
+}
+
+TEST(ShimHostRuntime, NoCachedOrEmptyNotifierStateProducesNoAlarm) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+
+  ASSERT_EQ(*fixture.runtime.pump_to(20'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(20'000), shim_host_runtime_pump_result::no_due_alarm);
+  EXPECT_FALSE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  ASSERT_TRUE(fixture.shim.flush_notifier_state(30'000).has_value());
+  ASSERT_EQ(*fixture.runtime.poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+  ASSERT_TRUE(fixture.runtime.latest_notifier_state().has_value());
+  EXPECT_EQ(fixture.runtime.latest_notifier_state()->count, 0u);
+
+  ASSERT_EQ(*fixture.runtime.pump_to(40'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(40'000), shim_host_runtime_pump_result::no_due_alarm);
+  EXPECT_FALSE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(ShimHostRuntime, RepeatedPumpDoesNotRepublishSameTrigger) {
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+
+  notifier_state state{};
+  state.count = 1;
+  state.slots[0] = valid_notifier_slot(20'000, 55, 1, 0, "periodic");
+  runtime_receive_notifier_state(fixture, state);
+
+  ASSERT_EQ(*fixture.runtime.pump_to(20'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(20'000),
+            shim_host_runtime_pump_result::notifier_alarm_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(20'000), shim_host_runtime_pump_result::no_due_alarm);
+
+  state.slots[0] = valid_notifier_slot(40'000, 55, 1, 0, "periodic");
+  runtime_receive_notifier_state(fixture, state);
+  ASSERT_EQ(*fixture.runtime.pump_to(40'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_EQ(*fixture.runtime.pump_to(40'000),
+            shim_host_runtime_pump_result::notifier_alarm_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+
+  ASSERT_TRUE(fixture.shim.latest_notifier_alarm_batch().has_value());
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->count, 1u);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].handle, 55);
+  EXPECT_EQ(fixture.shim.latest_notifier_alarm_batch()->events[0].fired_at_us, 40'000u);
+}
+
+TEST(ShimHostRuntime, LaneBusyDoesNotAdvanceRuntimePhase) {
+  auto fixture = make_host_runtime_fixture();
+  accept_runtime_boot(fixture);
+
+  ASSERT_EQ(*fixture.runtime.pump_to(60'000), shim_host_runtime_pump_result::clock_published);
+  const auto busy = fixture.runtime.pump_to(80'000);
+
+  ASSERT_FALSE(busy.has_value());
+  EXPECT_EQ(busy.error().kind, tier1_transport_error_kind::lane_busy);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_EQ(fixture.shim.latest_clock_state()->sim_time_us, 60'000u);
+
+  const auto retry = fixture.runtime.pump_to(80'000);
+  ASSERT_TRUE(retry.has_value());
+  EXPECT_EQ(*retry, shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(fixture.shim.poll().has_value());
+  ASSERT_TRUE(fixture.shim.latest_clock_state().has_value());
+  EXPECT_EQ(fixture.shim.latest_clock_state()->sim_time_us, 80'000u);
+}
+
+// ============================================================================
+// Cycle 65 — timed robot smoke host runtime launcher.
+// ============================================================================
+
+TEST(TimedRobotSmokeHost, ChildHandoffFdIsTheOnlyFdMadeExecInheritable) {
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto handoff_fd = mapping->duplicate_fd();
+  ASSERT_TRUE(handoff_fd.has_value());
+
+  const auto prepared = prepare_tier1_child_handoff_fd(*handoff_fd);
+
+  ASSERT_TRUE(prepared.has_value());
+  EXPECT_EQ(prepared->fd, handoff_fd->get());
+  EXPECT_NE(::fcntl(mapping->fd(), F_GETFD) & FD_CLOEXEC, 0);
+  EXPECT_EQ(::fcntl(handoff_fd->get(), F_GETFD) & FD_CLOEXEC, 0);
+}
+
+TEST(TimedRobotSmokeHost, ChildEnvironmentContainsTheSelectedTier1Fd) {
+  const std::vector<std::string> env{
+      "PATH=/bin",
+      "ROBOSIM_TIER1_FD=stale",
+      "LD_LIBRARY_PATH=/tmp/native",
+  };
+
+  const auto child_env = build_timed_robot_child_environment(env, 42);
+
+  EXPECT_EQ(std::count(child_env.begin(), child_env.end(), "ROBOSIM_TIER1_FD=42"), 1);
+  EXPECT_EQ(std::count(child_env.begin(), child_env.end(), "ROBOSIM_TIER1_FD=stale"), 0);
+  EXPECT_EQ(std::count(child_env.begin(), child_env.end(), "PATH=/bin"), 1);
+  EXPECT_EQ(std::count(child_env.begin(), child_env.end(), "LD_LIBRARY_PATH=/tmp/native"), 1);
+}
+
+TEST(TimedRobotSmokeHost, WaitsForBootBeforePublishingClocks) {
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+
+  const auto result = runtime->step(20'000);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, timed_robot_smoke_host_step::waiting_for_boot);
+  EXPECT_EQ(mapping->region().core_to_backend.state.load(std::memory_order_acquire),
+            static_cast<std::uint32_t>(tier1_lane_state::empty));
+}
+
+TEST(TimedRobotSmokeHost, AdvancesAttachedShimClockThroughProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto robot_fd = mapping->duplicate_fd();
+  ASSERT_TRUE(robot_fd.has_value());
+  auto robot_mapping = tier1::tier1_shared_mapping::map_existing(*robot_fd);
+  ASSERT_TRUE(robot_mapping.has_value());
+  auto backend = make_backend(robot_mapping->region());
+  auto shim_or = shim_core::make(std::move(backend), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+  shim_global_install_guard guard{*shim_or};
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_TRUE(shim_or->is_connected());
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  std::int32_t status = 999;
+  EXPECT_EQ(HAL_GetFPGATime(&status), 0u);
+  EXPECT_EQ(status, kHalSuccess);
+
+  ASSERT_TRUE(shim_or->poll().has_value());
+  EXPECT_EQ(HAL_GetFPGATime(&status), 20'000u);
+  EXPECT_EQ(status, kHalSuccess);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+}
+
+TEST(TimedRobotSmokeHost, WakesAttachedNotifierThroughProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto robot_fd = mapping->duplicate_fd();
+  ASSERT_TRUE(robot_fd.has_value());
+  auto robot_mapping = tier1::tier1_shared_mapping::map_existing(*robot_fd);
+  ASSERT_TRUE(robot_mapping.has_value());
+  auto backend = make_backend(robot_mapping->region());
+  auto shim_or = shim_core::make(std::move(backend), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+  shim_global_install_guard guard{*shim_or};
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(shim_or->poll().has_value());
+
+  std::int32_t status = 999;
+  const auto handle = HAL_InitializeNotifier(&status);
+  ASSERT_NE(handle, 0);
+  ASSERT_EQ(status, kHalSuccess);
+  HAL_UpdateNotifierAlarm(handle, 20'000, &status);
+  ASSERT_EQ(status, kHalSuccess);
+  ASSERT_TRUE(shim_or->flush_notifier_state(10'000).has_value());
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  auto waiter = std::async(std::launch::async, [handle] {
+    std::int32_t wait_status = 999;
+    const auto fired_at = HAL_WaitForNotifierAlarm(handle, &wait_status);
+    EXPECT_EQ(wait_status, kHalSuccess);
+    return fired_at;
+  });
+  ASSERT_TRUE(wait_until_true([&] { return shim_or->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::notifier_alarm_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+
+  using namespace std::chrono_literals;
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 20'000u);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+}
+
+TEST(TimedRobotSmokeHost, ChildWaitStatusMapsToLauncherExitCode) {
+  EXPECT_EQ(timed_robot_child_exit_code(W_EXITCODE(17, 0)), 17);
+  EXPECT_EQ(timed_robot_child_exit_code(SIGTERM), 128 + SIGTERM);
+}
+
+// ============================================================================
+// Cycle 66 — attached smoke runtime diagnostics.
+// ============================================================================
+
+TEST(TimedRobotSmokeHostDiagnostics, WaitingForBootDoesNotIncrementCounters) {
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+
+  const auto result = runtime->step(20'000);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, timed_robot_smoke_host_step::waiting_for_boot);
+  EXPECT_EQ(runtime->counters(), timed_robot_smoke_host_counters{});
+}
+
+TEST(TimedRobotSmokeHostDiagnostics, CountersTrackAttachedClockNotifierAndNoDueProtocol) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto robot_fd = mapping->duplicate_fd();
+  ASSERT_TRUE(robot_fd.has_value());
+  auto robot_mapping = tier1::tier1_shared_mapping::map_existing(*robot_fd);
+  ASSERT_TRUE(robot_mapping.has_value());
+  auto backend = make_backend(robot_mapping->region());
+  auto shim_or = shim_core::make(std::move(backend), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+  shim_global_install_guard guard{*shim_or};
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(shim_or->poll().has_value());
+
+  std::int32_t status = 999;
+  const auto handle = HAL_InitializeNotifier(&status);
+  ASSERT_NE(handle, 0);
+  ASSERT_EQ(status, kHalSuccess);
+  HAL_UpdateNotifierAlarm(handle, 20'000, &status);
+  ASSERT_EQ(status, kHalSuccess);
+  ASSERT_TRUE(shim_or->flush_notifier_state(10'000).has_value());
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  auto waiter = std::async(std::launch::async, [handle] {
+    std::int32_t wait_status = 999;
+    const auto fired_at = HAL_WaitForNotifierAlarm(handle, &wait_status);
+    EXPECT_EQ(wait_status, kHalSuccess);
+    return fired_at;
+  });
+  ASSERT_TRUE(wait_until_true([&] { return shim_or->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::notifier_alarm_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::no_due_alarm);
+
+  using namespace std::chrono_literals;
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 20'000u);
+
+  timed_robot_smoke_host_counters expected{};
+  expected.boot_accept_count = 1;
+  expected.robot_output_count = 1;
+  expected.clock_publish_count = 1;
+  expected.notifier_alarm_publish_count = 1;
+  expected.no_due_count = 1;
+  EXPECT_EQ(runtime->counters(), expected);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+}
+
+TEST(TimedRobotSmokeHostDiagnostics, StatusFormatterIncludesAttachedProtocolCounts) {
+  timed_robot_smoke_host_counters counters{};
+  counters.boot_accept_count = 1;
+  counters.robot_output_count = 2;
+  counters.clock_publish_count = 3;
+  counters.notifier_alarm_publish_count = 4;
+  counters.no_due_count = 5;
+
+  const auto summary = format_timed_robot_smoke_host_status(42, counters);
+
+  EXPECT_NE(summary.find("ROBOSIM_TIER1_FD=42"), std::string::npos);
+  EXPECT_NE(summary.find("boot=1"), std::string::npos);
+  EXPECT_NE(summary.find("robot_outputs=2"), std::string::npos);
+  EXPECT_NE(summary.find("clocks=3"), std::string::npos);
+  EXPECT_NE(summary.find("alarms=4"), std::string::npos);
+  EXPECT_NE(summary.find("no_due=5"), std::string::npos);
+}
+
+// ============================================================================
+// Cycle 67 — attached NotifierJNI state publication.
+// ============================================================================
+
+TEST(HalJniAttachedNotifierPublication, UpdatePublishesNotifierStateToHost) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = shim_host_runtime_driver::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+  ASSERT_TRUE(runtime->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+
+  const auto received = runtime->poll_robot_outputs();
+
+  ASSERT_TRUE(received.has_value());
+  EXPECT_EQ(*received, shim_host_runtime_robot_output::notifier_state_received);
+  const auto expected = fixture.shim->current_notifier_state();
+  ASSERT_TRUE(runtime->latest_notifier_state().has_value());
+  EXPECT_EQ(*runtime->latest_notifier_state(), expected);
+  EXPECT_EQ(runtime->latest_notifier_state()->count, 1u);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].handle, handle);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].trigger_time_us, 20'000u);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].alarm_active, 1);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedNotifierPublication, CancelAndStopPublishDeactivatedNotifierState) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = shim_host_runtime_driver::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+  ASSERT_TRUE(runtime->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+
+  Java_edu_wpi_first_hal_NotifierJNI_cancelNotifierAlarm(nullptr, nullptr, handle);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+  auto expected = fixture.shim->current_notifier_state();
+  ASSERT_TRUE(runtime->latest_notifier_state().has_value());
+  EXPECT_EQ(*runtime->latest_notifier_state(), expected);
+  ASSERT_EQ(runtime->latest_notifier_state()->count, 1u);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].handle, handle);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].alarm_active, 0);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].canceled, 1);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+  Java_edu_wpi_first_hal_NotifierJNI_stopNotifier(nullptr, nullptr, handle);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+  expected = fixture.shim->current_notifier_state();
+  ASSERT_TRUE(runtime->latest_notifier_state().has_value());
+  EXPECT_EQ(*runtime->latest_notifier_state(), expected);
+  ASSERT_EQ(runtime->latest_notifier_state()->count, 1u);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].alarm_active, 0);
+  EXPECT_EQ(runtime->latest_notifier_state()->slots[0].canceled, 1);
+  ASSERT_EQ(*runtime->pump_to(40'000), shim_host_runtime_pump_result::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 40'000ll; }));
+  EXPECT_EQ(*runtime->pump_to(40'000), shim_host_runtime_pump_result::no_due_alarm);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedNotifierPublication, CleanPublishesNotifierRemoval) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = shim_host_runtime_driver::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+  ASSERT_TRUE(runtime->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+
+  Java_edu_wpi_first_hal_NotifierJNI_cleanNotifier(nullptr, nullptr, handle);
+  ASSERT_EQ(*runtime->poll_robot_outputs(),
+            shim_host_runtime_robot_output::notifier_state_received);
+
+  const auto expected = fixture.shim->current_notifier_state();
+  ASSERT_TRUE(runtime->latest_notifier_state().has_value());
+  EXPECT_EQ(*runtime->latest_notifier_state(), expected);
+  EXPECT_EQ(runtime->latest_notifier_state()->count, 0u);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedNotifierPublication, InvalidMutationDoesNotPublishNotifierState) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = shim_host_runtime_driver::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+  ASSERT_TRUE(runtime->accept_boot_and_send_ack(123'000).has_value());
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, 9999, 20'000);
+  const auto received = runtime->poll_robot_outputs();
+
+  ASSERT_FALSE(received.has_value());
+  EXPECT_EQ(received.error().kind, tier1_transport_error_kind::no_message);
+  EXPECT_FALSE(runtime->latest_notifier_state().has_value());
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedNotifierPublication, UpdateCanWakeSmokeRuntimeWithoutExplicitFlush) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = timed_robot_smoke_host_runtime::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  auto waiter = std::async(std::launch::async, [handle] {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 20'000ll; }));
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::notifier_alarm_published);
+
+  using namespace std::chrono_literals;
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 20'000ll);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(HalJniAttachedNotifierPublication, RepeatedUpdatesWakeSuccessiveSmokeTicks) {
+  reset_hal_jni_launch_state_for_test();
+  fallback_sleep_log().clear();
+  set_hal_jni_fallback_sleep_for_test(record_fallback_sleep);
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = timed_robot_smoke_host_runtime::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 20'000);
+  auto first_waiter = std::async(std::launch::async, [handle] {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 20'000ll; }));
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::notifier_alarm_published);
+  using namespace std::chrono_literals;
+  ASSERT_EQ(first_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(first_waiter.get(), 20'000ll);
+
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+  auto second_waiter = std::async(std::launch::async, [handle] {
+    return Java_edu_wpi_first_hal_NotifierJNI_waitForNotifierAlarm(nullptr, nullptr, handle);
+  });
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->pending_notifier_wait_count(handle) == 1u; }));
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(20'000),
+            timed_robot_smoke_host_step::waiting_for_notifier_trigger);
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 40'000ll; }));
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::notifier_alarm_published);
+
+  ASSERT_EQ(second_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(second_waiter.get(), 40'000ll);
+
+  timed_robot_smoke_host_counters expected{};
+  expected.boot_accept_count = 1;
+  expected.robot_output_count = 2;
+  expected.clock_publish_count = 2;
+  expected.notifier_alarm_publish_count = 2;
+  EXPECT_EQ(runtime->counters(), expected);
+  EXPECT_FALSE(hal_jni_launch_state_has_fallback_for_test());
+  EXPECT_TRUE(fallback_sleep_log().empty());
+  EXPECT_FALSE(hal_jni_fallback_last_paced_sim_time_for_test().has_value());
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+// ============================================================================
+// Cycle 68 — attached smoke host cadence waits for active notifier trigger.
+// ============================================================================
+
+TEST(TimedRobotSmokeHostCadence, FutureActiveNotifierDoesNotPublishNoDueClockChurn) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = timed_robot_smoke_host_runtime::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(20'000),
+            timed_robot_smoke_host_step::waiting_for_notifier_trigger);
+
+  EXPECT_FALSE(fixture.shim->latest_clock_state().has_value());
+  EXPECT_FALSE(fixture.shim->latest_notifier_alarm_batch().has_value());
+  timed_robot_smoke_host_counters expected{};
+  expected.boot_accept_count = 1;
+  expected.robot_output_count = 1;
+  EXPECT_EQ(runtime->counters(), expected);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(TimedRobotSmokeHostCadence, RepeatedOldTimeWaitsAreSideEffectFreeUntilTrigger) {
+  reset_hal_jni_launch_state_for_test();
+  auto fixture = make_attached_jni_fixture(false);
+  auto runtime = timed_robot_smoke_host_runtime::make(fixture.host_mapping.region());
+  ASSERT_TRUE(runtime.has_value());
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(wait_until_true([&] { return fixture.shim->is_connected(); }));
+
+  const jint handle = Java_edu_wpi_first_hal_NotifierJNI_initializeNotifier(nullptr, nullptr);
+  ASSERT_NE(handle, 0);
+  Java_edu_wpi_first_hal_NotifierJNI_updateNotifierAlarm(nullptr, nullptr, handle, 40'000);
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::robot_output_received);
+  const auto counters_after_output = runtime->counters();
+  ASSERT_EQ(*runtime->step(20'000),
+            timed_robot_smoke_host_step::waiting_for_notifier_trigger);
+  ASSERT_EQ(runtime->counters(), counters_after_output);
+  ASSERT_EQ(*runtime->step(20'000),
+            timed_robot_smoke_host_step::waiting_for_notifier_trigger);
+  ASSERT_EQ(runtime->counters(), counters_after_output);
+
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(wait_until_true(
+      [] { return Java_edu_wpi_first_hal_HALUtil_getFPGATime(nullptr, nullptr) == 40'000ll; }));
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::notifier_alarm_published);
+  ASSERT_TRUE(wait_until_true(
+      [&] { return fixture.shim->latest_notifier_alarm_batch().has_value(); }));
+  ASSERT_EQ(fixture.shim->latest_notifier_alarm_batch()->count, 1u);
+  EXPECT_EQ(fixture.shim->latest_notifier_alarm_batch()->events[0].handle, handle);
+  EXPECT_EQ(fixture.shim->latest_notifier_alarm_batch()->events[0].fired_at_us, 40'000u);
+
+  timed_robot_smoke_host_counters expected{};
+  expected.boot_accept_count = 1;
+  expected.robot_output_count = 1;
+  expected.clock_publish_count = 1;
+  expected.notifier_alarm_publish_count = 1;
+  EXPECT_EQ(runtime->counters(), expected);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(TimedRobotSmokeHostCadence,
+     MissingEmptyInactiveAndCanceledNotifierStateStillReportNoDue) {
+  reset_hal_jni_launch_state_for_test();
+  auto mapping = tier1::tier1_shared_mapping::create();
+  ASSERT_TRUE(mapping.has_value());
+  auto robot_fd = mapping->duplicate_fd();
+  ASSERT_TRUE(robot_fd.has_value());
+  auto robot_mapping = tier1::tier1_shared_mapping::map_existing(*robot_fd);
+  ASSERT_TRUE(robot_mapping.has_value());
+  auto backend = make_backend(robot_mapping->region());
+  auto shim_or = shim_core::make(std::move(backend), valid_boot_descriptor(), kBootSimTime);
+  ASSERT_TRUE(shim_or.has_value());
+  auto runtime = timed_robot_smoke_host_runtime::make(mapping->region());
+  ASSERT_TRUE(runtime.has_value());
+
+  ASSERT_EQ(*runtime->step(0), timed_robot_smoke_host_step::boot_accepted);
+  ASSERT_TRUE(shim_or->poll().has_value());
+
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(20'000), timed_robot_smoke_host_step::no_due_alarm);
+  EXPECT_EQ(runtime->counters().no_due_count, 1u);
+
+  notifier_state empty{};
+  ASSERT_TRUE(shim_or->send_notifier_state(empty, 30'000).has_value());
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(40'000), timed_robot_smoke_host_step::no_due_alarm);
+  EXPECT_EQ(runtime->counters().no_due_count, 2u);
+
+  notifier_state inactive{};
+  inactive.count = 1;
+  inactive.slots[0] = valid_notifier_slot(80'000, 11, 0, 0, "inactive");
+  ASSERT_TRUE(shim_or->send_notifier_state(inactive, 50'000).has_value());
+  ASSERT_EQ(*runtime->step(60'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(60'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(60'000), timed_robot_smoke_host_step::no_due_alarm);
+  EXPECT_EQ(runtime->counters().no_due_count, 3u);
+
+  notifier_state canceled{};
+  canceled.count = 1;
+  canceled.slots[0] = valid_notifier_slot(100'000, 22, 1, 1, "canceled");
+  ASSERT_TRUE(shim_or->send_notifier_state(canceled, 70'000).has_value());
+  ASSERT_EQ(*runtime->step(80'000), timed_robot_smoke_host_step::robot_output_received);
+  ASSERT_EQ(*runtime->step(80'000), timed_robot_smoke_host_step::clock_published);
+  ASSERT_TRUE(shim_or->poll().has_value());
+  ASSERT_EQ(*runtime->step(80'000), timed_robot_smoke_host_step::no_due_alarm);
+  EXPECT_EQ(runtime->counters().no_due_count, 4u);
+
+  reset_hal_jni_launch_state_for_test();
+}
+
+TEST(TimedRobotSmokeHostCadence, ResumeAfterRobotOutputRequiresFutureTrigger) {
+  EXPECT_FALSE(
+      timed_robot_smoke_host_resume_time_after_robot_output(std::nullopt, 40'000).has_value());
+  EXPECT_FALSE(timed_robot_smoke_host_resume_time_after_robot_output(20'000, 40'000).has_value());
+  EXPECT_FALSE(timed_robot_smoke_host_resume_time_after_robot_output(40'000, 40'000).has_value());
+
+  const auto resume_time = timed_robot_smoke_host_resume_time_after_robot_output(60'000, 40'000);
+
+  ASSERT_TRUE(resume_time.has_value());
+  EXPECT_EQ(*resume_time, 60'000u);
+}
+
+TEST(TimedRobotSmokeHostCadence, InitialRobotOutputCanReleaseWithoutFutureTrigger) {
+  EXPECT_EQ(timed_robot_smoke_host_initial_resume_time_after_robot_output(std::nullopt, 20'000),
+            20'000u);
+  EXPECT_EQ(timed_robot_smoke_host_initial_resume_time_after_robot_output(10'000, 20'000),
+            20'000u);
+  EXPECT_EQ(timed_robot_smoke_host_initial_resume_time_after_robot_output(20'000, 20'000),
+            20'000u);
+  EXPECT_EQ(timed_robot_smoke_host_initial_resume_time_after_robot_output(40'000, 20'000),
+            40'000u);
 }
 
 }  // namespace robosim::backend::shim

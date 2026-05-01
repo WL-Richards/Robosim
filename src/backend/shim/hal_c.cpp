@@ -232,7 +232,7 @@ HAL_Bool clock_state_hal_bool_read(std::int32_t* status, hal_bool clock_state::*
     return 0;
   }
   write_status(status, kHalSuccess);
-  const auto& cached = shim->latest_clock_state();
+  const auto cached = shim->latest_clock_state_snapshot();
   if (!cached.has_value()) {
     return 0;
   }

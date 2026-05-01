@@ -7,10 +7,34 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
 
 ## Headline
 
-- Full project baseline through cycle 46: **ctest 729/729 green** under
-  `build`. Cycle 46 focused common suite: **131/131 green**. Cycle 46
-  focused shim suite: **405/405 green**.
-- HAL shim through **cycle 46** (power_state read surface closed +
+- Full project baseline through cycle 68: `842/842` green under `build`.
+  Cycle 58 adds the JNI fallback notifier alarm pump and Cycle 59 adds the JNI
+  fallback clock pump. Cycle 60 adds fallback-only real-time pacing for notifier
+  alarms. Cycle 61 adds a real host-side `shim_host_driver` helper that owns
+  the `core_to_backend` endpoint for installed shims, accepts boot, sends
+  `boot_ack`, and publishes clock/notifier-alarm protocol messages without
+  touching JNI fallback state. Cycle 62 adds the JNI env-fd attach handoff:
+  when `ROBOSIM_TIER1_FD` is present, `libwpiHaljni.so` maps that host-provided
+  Tier 1 fd and installs the robot-side shim over it instead of creating the
+  fallback. Cycle 63 starts a robot-side background poll loop for env-attached
+  JNI shims so host-published boot acknowledgements, clock states, and notifier
+  alarms are received without fallback pumps or explicit in-process polls.
+  Cycle 64 adds a deterministic host runtime pump over `shim_host_driver` that
+  consumes robot-published `notifier_state`, publishes default clock ticks, and
+  publishes due notifier alarms without using the JNI fallback timing path.
+  Cycle 65 adds the timed-robot smoke host launcher, which creates the Tier 1
+  mapping, passes `ROBOSIM_TIER1_FD` to the Java child, and runs the Cycle 64
+  host runtime pump for the smoke script. Cycle 66 adds attached-runtime
+  counters, diagnostic status formatting, and a build-and-run helper for the
+  manual timed-robot smoke workflow. Cycle 67 makes attached NotifierJNI alarm
+  mutations publish `notifier_state` to the host so unmodified TimedRobot
+  scheduling can wake through the host runtime without private flush calls.
+  Cycle 68 makes the smoke runtime wait for cached future active Notifier
+  triggers instead of returning no-due churn at older timestamps, and splits
+  startup wait-release from stricter post-alarm wait-release.
+  Manual Java verification now reaches repeated `robotPeriodic()` calls in the
+  generated TimedRobot template until the smoke timeout stops it.
+- HAL shim through **cycle 68** (power_state read surface closed +
   clock_state read surface fully closed — all 7 fields wired; first
   two C HAL write surfaces landed; CAN stream RX and CAN status read
   landed; Driver Station scalar and joystick reads landed; Notifier
@@ -69,7 +93,46 @@ in-process HAL shim core. See `docs/V0_PLAN.md` for the plan and
   **`HAL_GetPortWithModule`**, **`HAL_GetLastError`** /
   **`HAL_GetErrorMessage`**, **`HAL_Report`**, and
   **`HAL_GetComments`** (cycles 42–46 dirty-worktree metadata/support
-  follow-ons). The three
+  follow-ons), plus a replaceable WPILib HAL shared artifact named
+  **`libwpiHal.so`** built from the same shim C HAL sources as the
+  static test library (cycle 47), plus the minimal WPILib C++ support
+  ABI for **`hal::HandleBase`** required by `libwpiHaljni.so` before it
+  can bind to the shim's C HAL functions (cycle 48), plus a hermetic
+  non-HALSIM HAL JNI candidate classifier that rejects desktop-simulation
+  JNI artifacts with undefined `HALSIM_*` dependencies (cycle 49), plus a
+  repo-owned **`libwpiHaljni.so`** startup artifact exporting the first
+  pre-loop WPILib Java JNI adapters with no `HALSIM_*` dependency (cycle 50).
+  Cycle 51 adds JNI-owned fallback shim creation/installation while preserving
+  C `HAL_Initialize` no-shim failure. Cycle 52 adds
+  **`DriverStationJNI.getJoystickAxes`**,
+  **`DriverStationJNI.getJoystickAxesRaw`**,
+  **`DriverStationJNI.getJoystickPOVs`**, and
+  **`DriverStationJNI.getJoystickButtons`** over the existing C HAL joystick
+  readers. Cycle 53 adds **`DriverStationJNI.getMatchInfo`** and
+  **`DriverStationJNI.nativeGetControlWord`**. Cycle 54 adds
+  **`DriverStationJNI.nativeGetAllianceStation`**. Cycle 55 adds
+  **`DriverStationJNI.sendError`**. Cycle 56 adds **NotifierJNI lifecycle/wait
+  adapters** for initialize, name, alarm update/cancel, stop, clean, and wait.
+  Cycle 57 adds **`DriverStationJNI.observeUserProgramStarting`** plus
+  disabled/autonomous/teleop/test observer JNI adapters. Cycle 58 adds the
+  fallback-owned notifier alarm pump for `NotifierJNI.waitForNotifierAlarm`.
+  Cycle 59 adds fallback-owned `clock_state` publication for
+  `HALUtil.getFPGATime` and advances fallback clock state with notifier alarms.
+  Cycle 60 paces those fallback notifier alarms against real time using an
+  injectable sleep hook for deterministic tests. Cycle 61 adds the first real
+  host-side driver helper for installed shims: explicit boot/ack, clock publish,
+  and notifier alarm publish over Tier 1/protocol, with polling still explicit.
+  Cycle 62 adds the robot-process handoff half: JNI `HAL.initialize` reads
+  `ROBOSIM_TIER1_FD`, maps the inherited Tier 1 fd, installs the backend shim
+  over that mapping, and fails closed without fallback when a present env value
+  is malformed, invalid, or unmappable. Cycle 63 adds the attached JNI receive
+  loop: successful env-fd attachment starts a background poll thread, fallback
+  and failed-attach paths do not start one, and JNI shutdown/test reset stop
+  and join it before destroying launch state. Cycle 64 adds the host runtime
+  clock/notifier pump: one message per pump call, clock-first per timestamp,
+  notifier due filtering from protocol-received `notifier_state`, trigger
+  dedup, and explicit lane-busy errors.
+  The three
   power_state float readers widen float→double via
   D-C13-FLOAT-TO-DOUBLE-CAST. With cycle 16 the **power_state read
   surface is closed** — all three float fields wired.
@@ -1006,10 +1069,539 @@ path/cache override so they never read or mutate the host's real `/etc`.
 deterministic test-hook lifecycle, and malformed-value coverage; the revised
 plan reached `ready-to-implement`.
 
+### Cycle 47 — WPILib HAL shared launch artifact
+
+The shim now builds a shared `robosim_wpi_hal` CMake target that produces a
+file named `libwpiHal.so`, matching WPILib's Linux HAL library basename. The
+existing static `robosim_backend_shim` target remains intact for the focused
+GoogleTest suite, and both targets compile from the same `shim_core.cpp` and
+`hal_c.cpp` source list so the dynamic launch artifact does not fork HAL
+behavior away from unit-tested code.
+
+Cycle 47 added CTest checks for the generated shared artifact: one verifies
+the generator-resolved target path exists and is named exactly `libwpiHal.so`;
+the other inspects the dynamic symbol table with CMake's `nm` and requires a
+representative startup/metadata/DS/Notifier/CAN/output-side symbol set to be
+present as **defined exported** symbols, rejecting undefined-only matches.
+Backend common and tier1 static libraries now build with targeted PIC so they
+can link into this shared artifact.
+
+This cycle is explicitly **not** the Java robot smoke pass. The empty
+`tools/timed-robot-template` project has been proven healthy under stock
+WPILib desktop simulation, but running it through the shim waits for the next
+cycle now that a replaceable `libwpiHal.so` exists.
+
+### Cycle 48 — WPILib `hal::HandleBase` C++ support ABI
+
+A direct Java launch of the empty `tools/timed-robot-template` jar with both
+`LD_LIBRARY_PATH` and `-Djava.library.path` putting the shim
+`build/src/backend/shim/libwpiHal.so` first initially failed before robot code
+startup because `libwpiHaljni.so` could not resolve
+`_ZTIN3hal10HandleBaseE`, the C++ RTTI symbol for `hal::HandleBase`.
+GradleRIO's normal `simulateJava` task is **not** a valid shim proof for this
+yet because its simulator child resets the native search path to the template's
+extracted JNI directory and loads the stock `libwpiHal.so`.
+
+Cycle 48 adds `hal_cpp_support.cpp`, a minimal inert `hal::HandleBase` support
+ABI source linked into both the static `robosim_backend_shim` library and the
+shared `robosim_wpi_hal` artifact. It exports the constructor, destructor,
+RTTI/typeinfo/vtable, `ResetHandles`, and `ResetGlobalHandles` symbols that
+WPILib JNI expects. The reset calls are v0 no-ops: this is a launch ABI
+boundary only, not a broad handle-resource implementation.
+
+The artifact verifier now uses `nm -D --defined-only` so it still rejects
+undefined-only matches while accepting C++ ABI object symbols such as `V`
+RTTI/vtable entries. Manual direct-Java verification now advances past the
+HandleBase RTTI failure; the new first blocker is:
+
+```text
+undefined symbol: HALSIM_CancelRoboRioVInCurrentCallback
+```
+
+That blocker comes from using WPILib's desktop-simulation JNI stack. The real
+shim path should not depend on or model HALSIM as a core requirement; the next
+launch cycle should establish a non-HALSIM robot-runtime path or isolate
+desktop-sim compatibility as a separate adapter concern.
+
+### Cycle 49 — Non-HALSIM HAL JNI launch classifier
+
+Cycle 49 adds a hermetic CMake classifier for candidate `libwpiHaljni.so`
+undefined-symbol surfaces. The classifier accepts JNI candidates that have
+normal undefined `HAL_*` dependencies and no undefined `HALSIM_*`
+dependencies, because those HAL symbols are expected to bind through the
+shim's `libwpiHal.so`. It rejects any candidate with undefined `HALSIM_*`
+symbols and reports the first HALSIM dependency.
+
+The normal CTest coverage uses committed `nm` text fixtures, not the user's
+generated `tools/timed-robot-template` project or local WPILib install, so it
+is deterministic and hermetic. A manual run against the generated empty
+TimedRobot project's current desktop JNI artifact reports:
+
+```text
+first HALSIM dependency: HALSIM_CancelAccelerometerActiveCallback
+```
+
+This confirms the Cycle 48 direct-launch result at the artifact-policy level:
+WPILib's desktop simulation JNI is not the core shim launch dependency. The
+next implementation step should provide or select a non-HALSIM JNI / launcher
+boundary so the empty TimedRobot reaches real robot-runtime `HAL_*` calls
+through the shim.
+
+### Cycle 50 — Non-HALSIM HAL JNI startup artifact
+
+Cycle 50 adds a repo-owned `robosim_wpi_hal_jni` shared target that produces
+`libwpiHaljni.so`. It is separate from the cycle-47 `libwpiHal.so` C HAL
+artifact and links against that artifact instead of the WPILib desktop
+simulation HAL. The target exports the first startup JNI methods used by
+WPILib `RobotBase.startRobot`: `HAL.initialize`, `HAL.shutdown`,
+`HAL.hasMain`, `HAL.runMain`, `HAL.exitMain`, `HAL.terminate`,
+`DriverStationJNI.refreshDSData`, `DriverStationJNI.report`,
+`NotifierJNI.setHALThreadPriority`, `HALUtil.getHALRuntimeType`, and
+`HALUtil.getFPGATime`.
+
+The JNI source uses minimal local JNI scalar/pointer aliases and does not
+depend on a JDK at CMake configure/build time. v0 returns `false` from
+`HAL.hasMain()` so WPILib uses its direct Java `runRobot` path; `runMain`,
+`exitMain`, and `terminate` are no-ops; `DriverStationJNI.report(..., String)`
+defers Java string decoding and delegates to `HAL_Report` with a null feature.
+Focused tests call the JNI functions directly without a JVM to pin these
+adapter semantics, and CTest verifies the artifact name, required exported
+symbols, and Cycle-49 classifier acceptance.
+
+Manual direct-Java verification with `build/src/backend/shim` first in both
+`LD_LIBRARY_PATH` and `java.library.path` now loads the repo-owned
+`libwpiHaljni.so` and no longer reaches HALSIM. The new first blocker is:
+
+```text
+java.lang.IllegalStateException: Failed to initialize. Terminating
+```
+
+That is expected because no launch harness installs a `shim_core` instance
+before Java calls `HAL.initialize`. The next launch cycle should add the
+smallest host-owned shim creation/installation boundary needed for the empty
+TimedRobot process.
+
+### Cycle 51 — JNI startup fallback shim installation
+
+Cycle 51 keeps the C HAL lifecycle contract intact: direct C
+`HAL_Initialize` still fails when no shim is installed. The repo-owned JNI
+startup layer now owns a fallback launch state for Java startup only. When
+`Java_edu_wpi_first_hal_HAL_initialize` runs with no installed shim, it creates
+a real `shim_core` over an owned Tier 1 region, publishes the normal boot
+envelope through `shim_core::make`, installs that shim globally, and then calls
+`HAL_Initialize`. It does **not** inject `boot_ack` or mark the shim connected.
+
+The fallback boot descriptor is deterministic v0 metadata:
+runtime roboRIO2, team number 0, vendor capabilities 0, and WPILib version
+`2026.2.1`. If a host already installed a shim, JNI initialize leaves it in
+place and creates no fallback state. JNI shutdown destroys only JNI-owned
+fallback state; host-owned shims are globally detached by existing
+`HAL_Shutdown` semantics but not destroyed.
+
+Manual direct-Java verification now advances past the previous initialize
+failure. The new first blocker is:
+
+```text
+java.lang.UnsatisfiedLinkError: 'int edu.wpi.first.hal.DriverStationJNI.getJoystickAxes(byte, float[])'
+```
+
+That is the next coherent JNI adapter slice: expose Driver Station joystick
+refresh JNI methods over the already-implemented C HAL DS readers.
+
+### Cycle 52 — Driver Station joystick refresh JNI adapters
+
+Cycle 52 adds the four per-port joystick methods that WPILib 2026.2.1 calls in
+the first loop of `DriverStation.refreshData()`:
+`DriverStationJNI.getJoystickAxes(byte, float[])`,
+`DriverStationJNI.getJoystickAxesRaw(byte, int[])`,
+`DriverStationJNI.getJoystickPOVs(byte, short[])`, and
+`DriverStationJNI.getJoystickButtons(byte, ByteBuffer)`.
+
+The adapters inherit the existing C HAL reader semantics from cycle 24:
+no-shim, empty-cache, and invalid joystick indices return zero/default
+Java-visible values. Float axes and POVs copy only the active count; raw axis
+bytes widen to nonnegative Java `int` values; joystick buttons return the
+button bitmask and write the count byte through the provided direct
+`ByteBuffer`. Cycle 52 also introduced a minimal repo-local JNI function-table
+prefix for these array/direct-buffer calls so normal CTest coverage does not
+depend on starting a JVM or finding host JDK headers.
+
+Manual direct-Java verification now advances past the joystick refresh loop.
+The new first blocker is:
+
+```text
+java.lang.UnsatisfiedLinkError: 'int edu.wpi.first.hal.DriverStationJNI.getMatchInfo(edu.wpi.first.hal.MatchInfoData)'
+```
+
+That is the next coherent JNI adapter slice: expose match-info and likely the
+adjacent control-word JNI read used immediately after it in
+`DriverStation.refreshData()`.
+
+### Cycle 53 — Driver Station match-info and control-word JNI adapters
+
+Cycle 53 adds the next adjacent Driver Station refresh JNI pair:
+`DriverStationJNI.getMatchInfo(MatchInfoData)` and
+`DriverStationJNI.nativeGetControlWord()`. Both delegate to existing C HAL
+readers. `getMatchInfo` calls Java `MatchInfoData.setData(String, String, int,
+int, int)` through the local JNI table prefix; no-shim and empty-cache paths
+still populate Java defaults while returning the C HAL status. v0 string
+construction uses `NewStringUTF`, so event names and game-specific messages are
+NUL-terminated Java strings; the game-specific message is first bounded by
+`gameSpecificMessageSize` and the fixed 64-byte field.
+
+`nativeGetControlWord()` returns the raw six-bit `HAL_ControlWord` packing used
+by WPILib's Java helper. Manual direct-Java verification now advances past
+match info and control word. The new first blocker is:
+
+```text
+java.lang.UnsatisfiedLinkError: 'int edu.wpi.first.hal.DriverStationJNI.nativeGetAllianceStation()'
+```
+
+That is the next coherent JNI adapter slice: expose the alliance-station JNI
+read used by WPILib match-data logging inside `DriverStation.refreshData()`.
+
+### Cycle 54 — Driver Station alliance-station JNI adapter
+
+Cycle 54 adds `DriverStationJNI.nativeGetAllianceStation()` as a pure scalar
+adapter over `HAL_GetAllianceStation`. Java has no status out-param for this
+native method, so no-shim and empty-cache paths collapse to the returned
+unknown-station value `0`. Cached `ds_state.station` values preserve WPILib's
+integer mapping: unknown `0`, red `1..3`, blue `4..6`.
+
+Manual direct-Java verification now advances through `DriverStation.refreshData`
+and reaches robot startup:
+
+```text
+********** Robot program starting **********
+```
+
+In the current sandbox it then reports NetworkTables server socket permission
+errors and, before cycle 55, stopped at the next missing JNI method:
+
+```text
+java.lang.UnsatisfiedLinkError: 'int edu.wpi.first.hal.DriverStationJNI.sendError(boolean, int, boolean, java.lang.String, java.lang.String, java.lang.String, boolean)'
+```
+
+Cycle 55 exposes Driver Station error reporting over the existing C HAL
+`HAL_SendError` surface.
+
+### Cycle 55 — Driver Station send-error JNI adapter
+
+Cycle 55 adds `DriverStationJNI.sendError(boolean, int, boolean, String,
+String, String, boolean)` as a JNI adapter over `HAL_SendError`. The adapter
+uses `GetStringUTFChars` / `ReleaseStringUTFChars` for the three Java string
+arguments, maps Java booleans to `HAL_Bool` 0/1, and delegates to the existing
+C HAL buffering path. It does not publish `error_message_batch` directly:
+`flush_pending_errors(sim_time_us)` remains the explicit publication boundary.
+
+Null Java strings, null envs, and minimal test envs without
+`GetStringUTFChars` pass null C pointers and inherit `HAL_SendError`'s
+empty-field behavior. The no-shim JNI path returns `kHalHandleError` and does
+not create the cycle-51 fallback shim.
+
+Manual direct-Java verification no longer reports a missing JNI symbol. In the
+current sandbox the empty TimedRobot launch prints startup, reports
+NetworkTables socket permission errors, and exits:
+
+```text
+********** Robot program starting **********
+NT: could not open persistent file '/home/lvuser/networktables.json': No such file or directory (this can be ignored if you aren't expecting persistent values)
+NT: Listening on NT3 port 1735, NT4 port 5810
+NT: NT3 server socket error: operation not permitted
+NT: NT4 server socket error: operation not permitted
+```
+
+### Cycle 56 — NotifierJNI lifecycle adapters
+
+Cycle 56 adds the remaining `NotifierJNI` lifecycle and wait adapters used by
+`TimedRobot`: `initializeNotifier`, `setNotifierName`, `updateNotifierAlarm`,
+`cancelNotifierAlarm`, `stopNotifier`, `cleanNotifier`, and
+`waitForNotifierAlarm`. These are thin JNI adapters over the existing C HAL
+Notifier surface from cycles 25-27; Java methods drop C status where no Java
+status out-param exists. `setNotifierName` uses scoped `GetStringUTFChars` /
+`ReleaseStringUTFChars` conversion and inherits C HAL empty-name behavior for
+null or minimal JNI string paths.
+
+The first manual smoke after those exports reached startup complete, then
+exposed a native shutdown race: Java reported the next missing runtime method
+through `sendError`, `HAL.shutdown` destroyed the cycle-51 JNI-owned fallback
+shim, and the Watchdog daemon was still unwinding from
+`NotifierJNI.waitForNotifierAlarm`. Cycle 56 fixes that by keeping the shared
+notifier wait state alive locally and by checking shutdown wake before touching
+the owning `shim_core` after a condition-variable wake.
+
+Manual direct-Java verification now reaches startup complete and exits without
+a native crash:
+
+```text
+********** Robot program starting **********
+NT: could not open persistent file '/home/lvuser/networktables.json': No such file or directory (this can be ignored if you aren't expecting persistent values)
+NT: Listening on NT3 port 1735, NT4 port 5810
+NT: NT3 server socket error: operation not permitted
+NT: NT4 server socket error: operation not permitted
+********** Robot program startup complete **********
+```
+
+Cycle 57 closes the next observer JNI blocker.
+
+### Cycle 57 — Driver Station observer JNI adapters
+
+Cycle 57 adds `DriverStationJNI.observeUserProgramStarting`,
+`observeUserProgramDisabled`, `observeUserProgramAutonomous`,
+`observeUserProgramTeleop`, and `observeUserProgramTest` as thin JNI adapters
+over the existing C HAL observer calls. They inherit Cycle 35 latest-wins,
+per-shim, void/no-status, and no-shim no-op behavior. They do not publish
+automatically; observer publication remains explicit through
+`flush_user_program_observer` or the Driver Station output pump.
+
+Manual direct-Java verification now reaches startup complete and stays alive
+until the smoke script timeout because no host is driving notifier alarms yet:
+
+```text
+********** Robot program starting **********
+NT: could not open persistent file '/home/lvuser/networktables.json': No such file or directory (this can be ignored if you aren't expecting persistent values)
+NT: Listening on NT3 port 1735, NT4 port 5810
+NT: NT3 server socket error: operation not permitted
+NT: NT4 server socket error: operation not permitted
+********** Robot program startup complete **********
+```
+
+That is the first smoke result where the empty TimedRobot appears to remain in
+the runtime loop instead of exiting after a missing JNI method.
+
+### Cycle 58 — JNI fallback notifier alarm pump
+
+Cycle 58 adds a fallback-owned host pump for the repo-owned Java launch path.
+When `NotifierJNI.waitForNotifierAlarm(handle)` is called against the
+cycle-51 JNI-owned fallback shim and that handle has an active alarm, the JNI
+layer sends a real inbound `notifier_alarm_batch` through the fallback
+`core_to_backend` endpoint, polls the fallback shim, and then delegates to the
+existing C `HAL_WaitForNotifierAlarm`. It does not shortcut the wait return
+value and it does not run for host-installed shims or no-shim paths.
+
+The first active fallback pump also performs the real protocol handshake needed
+for normal inbound traffic: drain the fallback boot envelope, send `boot_ack`,
+and poll the fallback shim connected. `HAL.initialize` itself still creates a
+disconnected fallback.
+
+### Cycle 59 — JNI fallback clock pump
+
+Cycle 59 adds fallback-only clock publication for Java startup. A fallback
+`HALUtil.getFPGATime()` with an empty clock cache publishes a deterministic
+`clock_state` at `20'000us` through the same fallback core endpoint and then
+delegates to C `HAL_GetFPGATime`. Cached fallback clock states are not
+overwritten by reads, and ordinary host-installed shims keep Cycle 12's
+empty-cache `0` behavior.
+
+The fallback notifier pump now publishes a matching `clock_state` at each
+alarm's `fired_at_us` before publishing the `notifier_alarm_batch`, so
+`RobotController.getFPGATime()` inside `TimedRobot.loopFunc()` observes the
+same deterministic time that woke the loop.
+
+Manual smoke now reaches the user's robot periodic methods:
+
+```text
+Robot Constructor Run!
+Robot Init Run!
+********** Robot program startup complete **********
+Disabled Init Run!
+Disabled Periodic Run!
+Robot Periodic Run!
+```
+
+The loop is not wall-clock paced yet, so the smoke script still exits via its
+timeout and can produce a large amount of repeated periodic output.
+
+### Cycle 60 — JNI fallback real-time pacing driver
+
+Cycle 60 adds fallback-only real-time pacing for the Java smoke path. The
+fallback launch state now tracks the last paced simulated timestamp. The
+Cycle-59 fallback `HALUtil.getFPGATime()` seed at `20'000us` establishes the
+origin without sleeping. Each later active fallback notifier pump sleeps for the
+positive delta between the alarm's `fired_at_us` and the last paced sim time
+before publishing the matching `clock_state` and `notifier_alarm_batch`.
+
+Pacing remains strictly fallback-owned. No-shim and host-installed shim paths do
+not sleep, do not create fallback state, and do not receive fallback clock or
+alarm traffic. Unit tests replace the production `sleep_for` function with an
+in-process recorder, so CTest asserts deltas and sleep-before-publish ordering
+without wall-clock sleeps.
+
+Manual smoke with a 1s timeout now shows normal periodic output volume:
+
+```text
+Robot Constructor Run!
+Robot Init Run!
+********** Robot program startup complete **********
+Disabled Init Run!
+Disabled Periodic Run!
+Robot Periodic Run!
+```
+
+The smoke still exits via timeout, but output is paced around the TimedRobot
+20ms period rather than flooding the terminal.
+
+### Cycle 61 — host-side shim driver
+
+Cycle 61 starts moving the runtime driver responsibility out of the JNI
+fallback path and into a real host-facing helper. `shim_host_driver` owns the
+host side of an installed shim's Tier 1 region (`core_to_backend`), drains the
+shim boot descriptor, sends `boot_ack`, and publishes host-authoritative
+`clock_state` and `notifier_alarm_batch` messages through the existing protocol.
+
+The v0 boundary is intentionally narrow. The helper does not launch another
+process, does not create shared-memory fd/env plumbing, does not sleep or pace
+time, does not poll the shim for the caller, and never creates JNI fallback
+state. Tests pin the no-shortcut contract by asserting cache/wait behavior only
+changes after `shim_core::poll()`, pre-boot publishes fail through session
+ordering, zero-count alarm batches use active-prefix bytes rather than `sizeof`,
+and lane-busy backpressure is surfaced without hidden retry.
+
+### Cycle 62 — JNI attach to host-provided Tier 1 mapping
+
+Cycle 62 adds the first real robot-process handoff path. If
+`ROBOSIM_TIER1_FD` is present during `HAL.initialize`, `libwpiHaljni.so` parses
+it as an inherited decimal file descriptor, maps it with
+`tier1_shared_mapping::map_existing`, creates the robot-side
+`backend_to_core` endpoint over that mapping, publishes the normal boot
+descriptor, installs the shim globally, and then delegates to C
+`HAL_Initialize`.
+
+The env var is fail-closed: a present malformed value, negative fd, invalid fd,
+or wrong-size mapping returns false and does not create fallback state. When the
+env var is absent, the Cycle-51 fallback path is unchanged. The attached path
+does not create a host endpoint, does not infer time, and is not eligible for
+the fallback clock/notifier pumps. Tests use `shim_host_driver` on the host
+mapping to prove boot, clock delivery after explicit poll, fd lifetime after
+caller-side close, and fallback separation.
+
+### Cycle 63 — JNI env-attached shim poll loop
+
+Cycle 63 makes the Cycle-62 attached path usable by a separate Java robot
+process. After successful `ROBOSIM_TIER1_FD` attachment, JNI startup starts a
+background receive loop that repeatedly polls the installed shim. Host
+`shim_host_driver` publications of `boot_ack`, `clock_state`, and
+`notifier_alarm_batch` now reach the robot process without fallback pumps and
+without test-side `shim_core::poll()` calls.
+
+The loop is attached-only. Absent-env fallback startup remains disconnected
+until its existing fallback pumps run, and present-but-invalid env attach still
+fails closed without creating fallback state or a thread. JNI shutdown and
+`reset_hal_jni_launch_state_for_test()` synchronously stop and join the thread
+before clearing the shim and mapped Tier 1 region. The new concurrent path
+protects poll-driven cache mutation and the clock read snapshot used by
+`HAL_GetFPGATime`/`HALUtil.getFPGATime`; notifier wait delivery remains guarded
+by the notifier queue synchronization.
+
+### Cycle 64 — host runtime clock/notifier pump
+
+Cycle 64 adds the first deterministic host runtime pump on top of
+`shim_host_driver`. The runtime accepts the normal boot/`boot_ack` handshake,
+receives robot-to-host `notifier_state` snapshots through protocol traffic, and
+publishes host-to-robot clock ticks plus due notifier alarm batches through the
+existing clock/notifier schemas.
+
+The pump sends at most one host-to-robot message per call. For a new timestamp
+it publishes a default v0 clock first (`system_active`, `system_time_valid`,
+and `rsl_state` true; the other clock fields zero). After that clock phase has
+succeeded, a later pump call for the same timestamp can publish active,
+non-canceled notifier slots whose `trigger_time_us <= sim_time_us`. Published
+`(handle, trigger_time_us)` pairs are deduplicated until the robot publishes a
+new trigger time. Missing or zero-count notifier state produces an explicit
+no-due result. Lane-busy/session failures are returned without retry or phase
+advancement.
+
+Tests cover direct in-process shim polling and an attached JNI path where the
+Cycle-63 robot-side poll loop accepts the host runtime clock/alarm messages and
+`NotifierJNI.waitForNotifierAlarm` wakes without using fallback sleep/pacing.
+
+### Cycle 65 — timed robot smoke host runtime launcher
+
+Cycle 65 wires the repo-owned timed-robot smoke path onto the real attached
+host runtime. The new `robosim_timed_robot_smoke_host` executable creates a
+host-owned Tier 1 mapping, duplicates exactly one child handoff fd, clears
+`FD_CLOEXEC` on that duplicate, sets `ROBOSIM_TIER1_FD` in the Java child, and
+execs the requested robot command. The parent keeps the host mapping, waits for
+the child's boot descriptor, sends `boot_ack`, then steps the Cycle-64 runtime
+at the TimedRobot 20ms period.
+
+The smoke runtime stepper remains nonblocking and sends no clock/notifier
+traffic before boot is accepted. After boot, each step first consumes one
+robot-to-host output message when present; otherwise it publishes at most one
+host-to-robot clock/alarm message for the current timestamp. Unit coverage pins
+fd inheritance, child environment construction, boot gating, attached clock
+delivery, attached notifier wake via protocol, child wait-status mapping, and
+the shell script's delegation to the host launcher. The fallback helpers remain
+available for no-env development launches, but `scripts/run_timed_robot_smoke.sh`
+no longer intentionally uses that path.
+
+### Cycle 66 — attached smoke runtime diagnostics
+
+Cycle 66 adds a small observable diagnostic surface for the attached timed-
+robot smoke path. `timed_robot_smoke_host_runtime` now tracks successful
+attached protocol activity: boot acceptance, robot output messages, ignored
+robot outputs, clock publications, notifier alarm publications, and no-due
+alarm phases. Waiting-for-boot iterations leave counters at zero, so diagnostics
+do not claim attached activity before the robot publishes boot.
+
+`format_timed_robot_smoke_host_status` produces the one-line human diagnostic
+used by `robosim_timed_robot_smoke_host`, including the child
+`ROBOSIM_TIER1_FD` and all runtime counters. The executable prints the status
+after fd handoff preparation, after boot acceptance, and before normal child
+exit. Timeout-killed manual smoke may not reach the normal-exit summary, so
+CTest pins the pure counter/formatter contract instead of process stderr.
+
+The new `scripts/build_and_run_timed_robot_smoke.sh` helper builds the shim
+artifacts, the smoke host, and `tools/timed-robot-template`, then delegates to
+the existing attached smoke script. CTest verifies the script statically so the
+Java/Gradle smoke remains manual.
+
+### Cycle 67 — attached NotifierJNI state publication
+
+Cycle 67 fixes the attached Java smoke stall found while adding Cycle 66
+diagnostics. The unmodified TimedRobot path schedules periodic wakeups through
+`NotifierJNI.updateNotifierAlarm`; the previous tests used explicit
+`shim.flush_notifier_state(...)`, but real Java robot code cannot call that
+private boundary. Attached JNI notifier mutations now publish the current
+`notifier_state` snapshot to the host after successful update, cancel, stop,
+and clean operations. Invalid handles do not publish compensating snapshots.
+
+This remains an attached-JNI boundary, not a C HAL behavior change. Host-
+installed/non-JNI C HAL notifier calls still use the explicit
+`flush_notifier_state` boundary, and no-env fallback launches keep their
+fallback-owned timing behavior. Tests cover exact snapshot publication,
+cancel/stop deactivation, clean removal, invalid-handle no-publish behavior,
+and a smoke-runtime wake path with no explicit test-side flush.
+
+### Cycle 68 — attached smoke host cadence waits for active Notifier triggers
+
+Cycle 68 tightens the attached timed-robot smoke runtime without changing the
+generic host pump. After the smoke runtime consumes a robot-published
+`notifier_state`, it now reports `waiting_for_notifier_trigger` if the next
+active, non-canceled trigger is in the future relative to the caller's
+`sim_time_us`. That result publishes no `clock_state`, publishes no
+`notifier_alarm_batch`, and does not increment `no_due_count`, so repeated
+old-time calls are side-effect free until the launcher advances to the trigger
+time.
+
+At the trigger time, the existing two-phase host behavior remains: first
+publish the clock, then publish the due alarm. Missing, empty, inactive, and
+canceled notifier state still use the existing clock-then-`no_due_alarm`
+behavior. The lower-level `shim_host_runtime_driver::pump_to` contract is
+unchanged; this is only the timed-robot smoke host cadence boundary.
+
+The process launcher now distinguishes startup waiting from post-alarm waiting.
+After boot, the first robot-output snapshot may release at the current sim time
+so the first clock can advance TimedRobot scheduling; after an alarm, a
+robot-output snapshot releases the wait only when it carries a strictly future
+active trigger. Manual attached smoke with a 4s timeout reaches repeated
+`robotPeriodic()` and exits with matching clock/alarm counts and zero no-due
+churn in the final diagnostic summary.
+
 ## What's next
 
 The C HAL ABI is the **largest remaining shim chunk** and is now in
-progress — cycles 12–46 wired the first read surfaces, the global shim
+progress — cycles 12–68 wired the first read surfaces, the global shim
 accessor, the first two write surfaces (`HAL_SendError` and
 `HAL_CAN_SendMessage`), CAN one-shot/stream RX, CAN status reads, and DS
 scalar and joystick/match/descriptor reads plus DS refresh/new-data
@@ -1019,8 +1611,23 @@ pump publication, `HAL_GetRuntimeType`, `HAL_GetTeamNumber`,
 `HAL_GetFPGAVersion`, `HAL_GetFPGARevision`, `HAL_GetSerialNumber`,
 `HAL_GetPort`, `HAL_GetPortWithModule`, `HAL_GetLastError`,
 `HAL_GetErrorMessage`, `HAL_Report`, `HAL_GetComments`, plus the Notifier
-control-plane/wait and lifecycle slices. Each
+control-plane/wait and lifecycle slices, a first replaceable `libwpiHal.so`
+shared launch artifact with minimal `hal::HandleBase` C++ support ABI, a
+non-HALSIM HAL JNI classifier, a first repo-owned `libwpiHaljni.so`
+startup artifact, JNI-owned fallback shim installation, the first Driver
+Station refresh/error/observer JNI adapters, and NotifierJNI lifecycle/wait
+adapters, fallback-owned timed smoke pumps/pacing, the first real
+host-side shim driver helper, the JNI env-fd handoff path for attaching a
+robot-process shim to a host-created Tier 1 mapping, the attached JNI
+background poll loop, the first host runtime clock/notifier pump, the attached
+timed-robot smoke launcher, attached smoke runtime diagnostics, and attached
+NotifierJNI notifier-state publication, plus attached smoke-host cadence
+waiting for future active Notifier triggers. Each
 remaining surface is its own TDD cycle:
+- Driver Station input/control publication from the host so the smoke can move
+  beyond disabled mode through real `ds_state` traffic.
+- Retire or quarantine Cycle 58-60 fallback timing from normal smoke
+  verification once attached-path manual coverage is stable.
 - Remaining device-family HAL surfaces such as DIO, PWM, relay, analog,
   compressor/pneumatics, power distribution, interrupts/counters/encoders, and
   serial/SPI/I2C as demanded by robot programs.

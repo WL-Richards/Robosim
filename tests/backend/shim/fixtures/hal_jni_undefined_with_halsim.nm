@@ -1,0 +1,5 @@
+                 U HAL_Initialize
+                 U HAL_GetRuntimeType
+                 U HALSIM_CancelRoboRioVInCurrentCallback
+                 U HALSIM_RegisterRoboRioVInVoltageCallback
+                 U __cxa_finalize

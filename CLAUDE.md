@@ -81,7 +81,14 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
 
 - **Sim core** — Phase A scaffold + Phase B description loader +
   protocol schema/session + Tier 1 shared-memory transport + HAL shim
-  through cycle 46 (`HAL_GetComments` after `HAL_Report`,
+  through cycle 55 (Driver Station send-error JNI adapter after
+  alliance-station JNI,
+  match-info/control-word JNI adapters,
+  joystick refresh JNI adapters,
+  JNI-owned fallback shim installation,
+  repo-owned non-HALSIM `libwpiHaljni.so` startup artifact, HAL JNI launch classifier,
+  `hal::HandleBase` C++ support ABI, and the `libwpiHal.so` shared
+  artifact; `HAL_GetComments` after `HAL_Report`,
   `HAL_GetLastError` / `HAL_GetErrorMessage`, port handles,
   `HAL_GetSerialNumber`, `HAL_GetFPGAVersion` / `HAL_GetFPGARevision`,
   `HAL_GetTeamNumber`, and `HAL_GetRuntimeType`,
@@ -119,6 +126,8 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   outputs-enabled, user-program observers, `HAL_SetJoystickOutputs`,
   explicit joystick-output snapshot publication, and explicit
   user-program observer snapshot publication, plus the DS-output pump;
+  plus first Driver Station Java refresh JNI adapters for joystick axes,
+  raw axes, POVs, buttons, match info, control word, and alliance station;
   plus the process-global accessor;
   cycle 15 fixed a pre-existing `hal_bool` signedness parity bug;
   cycle 18 pinned D-C18-UINT32-TO-INT32-CAST for the schema-vs-WPILib
@@ -130,9 +139,17 @@ For detail, read `docs/STATUS_*.md`. As of this revision:
   cycle 23 pinned DS scalar zero/default semantics and
   `HAL_ControlWord` named-bit mapping; cycle 24 pinned joystick
   struct byte-copy, ABI layout, and invalid-index zero/default
-  semantics).
-  Full project baseline **ctest 729/729** green under `build`; cycle 46
-  focused common suite **131/131** green; cycle 46 focused shim suite
+  semantics; cycle 49 pins that undefined `HALSIM_*` dependencies
+  disqualify a HAL JNI artifact from the core non-HALSIM launch path;
+  cycle 50 adds the first non-HALSIM Java startup JNI artifact; cycle 51
+  makes that JNI path create and install a real fallback shim; cycle 52
+  adds the first Driver Station joystick refresh JNI group; cycle 53 adds
+  match-info/control-word JNI adapters; cycle 54 adds alliance-station JNI;
+  cycle 55 adds send-error JNI; cycle 56 adds NotifierJNI lifecycle/wait
+  adapters and a shutdown-wait fallback lifetime fix; cycle 57 adds Driver
+  Station observer JNI adapters).
+  Full project baseline **773/773** green under `build`; cycle 57
+  focused JNI observer checks **8/8** green; cycle 48 focused shim suite
   **405/405** green. Layer
   3/4/5 not started.
 - **Visualizer** — Phases VA + VB + VC + VD all landed; v0 Edit mode

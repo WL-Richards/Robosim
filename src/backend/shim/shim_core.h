@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <span>
@@ -267,6 +268,8 @@ class shim_core {
   [[nodiscard]] bool is_shutting_down() const;
   /** Latest cached clock_state, if one has been received. */
   [[nodiscard]] const std::optional<clock_state>& latest_clock_state() const;
+  /** Thread-safe latest cached clock_state snapshot, if one has been received. */
+  [[nodiscard]] std::optional<clock_state> latest_clock_state_snapshot() const;
   /** Latest cached power_state, if one has been received. */
   [[nodiscard]] const std::optional<power_state>& latest_power_state() const;
   /** Latest cached ds_state, if one has been received. */
@@ -327,6 +330,7 @@ class shim_core {
   boot_descriptor boot_descriptor_{};
   bool connected_ = false;
   bool shutdown_observed_ = false;
+  mutable std::shared_ptr<std::mutex> cache_mutex_ = std::make_shared<std::mutex>();
   std::optional<clock_state> latest_clock_state_;
   std::optional<power_state> latest_power_state_;
   std::optional<ds_state> latest_ds_state_;
